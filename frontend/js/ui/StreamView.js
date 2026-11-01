@@ -96,6 +96,7 @@ import {
     supportsGamingMode,
 } from '../util/BrowserDetect.js';
 import { noteHevcFailed } from '../util/CodecAuto.js';
+import { noteRtpH265Failed } from '../util/RtpH265.js';
 import * as RemoteNav from './RemoteNav.js';
 import { StreamRemoteMenu } from './StreamRemoteMenu.js';
 import { RemotePointer } from '../stream/RemotePointer.js';
@@ -537,6 +538,10 @@ export function mwsrSplitLabel(view) {
 }
 
 export class StreamView {
+    /** Ticks (seconds) of RTP bytes with no frame decoded before an H.265
+     *  media track is given up on (_checkMediaNeverDecoded). */
+    static MEDIA_NEVER_DECODED_TICKS = 5;
+
     constructor(
         container,
         signalingUrl,
@@ -1640,6 +1645,10 @@ export class StreamView {
         // The host side failed under the stream (Sunshine crashed, its encoder
         // hung) — not this link.
         this.webrtc.onHostLost = () => this._handleHostLost();
+
+        // The media transport's offer names a codec this browser's RTP
+        // decoder does not list (WebRtcMedia): back in H.264, now.
+        this.webrtc.onCodecUnsupported = (codec) => this._onMediaCodecUnsupported(codec);
 
         // Physical keys currently held down (e.code → keyup payload). Used to
         // release everything when the window loses focus: the OS can steal focus
@@ -3641,7 +3650,15 @@ export class StreamView {
         // the verdict, and Auto asks it H.264 from the next launch on
         // (CodecAuto.hevcFailedHere). Not an HDR or a 4:4:4 HEVC, which fail
         // where plain HEVC may still decode.
-        if (cur === 'hevc' && !this._hdrEnabled && !this._yuv444 && target.codec === 'h264')
+        // Not on the media transport: there the browser's RTP decoder failed,
+        // not WebCodecs, and that verdict is RtpH265's (_onMediaCodecUnsupported).
+        if (
+            cur === 'hevc' &&
+            !this._hdrEnabled &&
+            !this._yuv444 &&
+            target.codec === 'h264' &&
+            this._transport !== 'webrtc-media'
+        )
             noteHevcFailed();
 
         console.warn(
@@ -5880,6 +5897,7 @@ export class StreamView {
                         this._decodeStallTicks = 0;
                     }
                 }
+                if (this._checkMediaNeverDecoded(inbound)) return;
 
                 this._lastInboundBytes = inbound.bytesReceived || 0;
                 this._lastInboundFrames = inbound.framesDecoded || 0;
@@ -5990,6 +6008,49 @@ export class StreamView {
                 // getStats can throw transiently during teardown — ignore
             }
         }, 1000);
+    }
+
+    /**
+     * A media track whose packets arrive and whose decoder never gives a
+     * frame: the browser listed H.265 for its RTP decoder (util/RtpH265.js),
+     * the host offered it, and nothing comes out — a GPU without the codec
+     * behind a browser that claims it, a driver. MEDIA_NEVER_DECODED_TICKS
+     * ticks of bytes with framesDecoded still at zero, and the stream comes
+     * back in H.264 through the codec fallback, the verdict kept for this
+     * browser. An H.264 stream has no such step: the no-video watchdog takes
+     * it down the transport chain.
+     * @param {{bytesReceived?: number, framesDecoded?: number}} inbound
+     * @returns {boolean} true when the fallback was asked
+     */
+    _checkMediaNeverDecoded(inbound) {
+        if ((inbound.framesDecoded || 0) > 0) {
+            this._mediaNeverDecodedTicks = -1; // decoded once: never again
+            return false;
+        }
+        if (this._mediaNeverDecodedTicks === -1) return false;
+        if (!((inbound.bytesReceived || 0) > 0)) return false;
+        this._mediaNeverDecodedTicks = (this._mediaNeverDecodedTicks || 0) + 1;
+        if (this._mediaNeverDecodedTicks < StreamView.MEDIA_NEVER_DECODED_TICKS) return false;
+        if (String(this.videoCodec).toLowerCase() !== 'hevc') return false;
+        console.warn(
+            '[StreamView] H.265 on the media track: bytes arrive, nothing decoded after ' +
+                this._mediaNeverDecodedTicks +
+                " s — this browser's RTP decoder does not run it, back in H.264",
+        );
+        this._onMediaCodecUnsupported('hevc');
+        return true;
+    }
+
+    /**
+     * The media transport cannot decode @p codec after all (WebRtcMedia's
+     * onCodecUnsupported, or _checkMediaNeverDecoded): remembered for this
+     * browser, so the next launches offer H.264 on that track, and the stream
+     * relaunched in H.264 through the codec fallback.
+     */
+    _onMediaCodecUnsupported(codec) {
+        if (codec !== 'hevc') return;
+        noteRtpH265Failed();
+        this._requestCodecFallback();
     }
 
     _stopMediaStatsPolling() {

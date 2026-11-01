@@ -3388,10 +3388,15 @@ export const MoonlightApp = {
         // Main10 / AV1 10-bit. The decoder colorSpace is set accordingly.
         // A native session reports what it granted: it is asked for HDR whenever
         // this screen can show it, so the request says nothing about the stream.
+        // Never on the media transport: its track carries H.264, or HEVC Main
+        // (util/RtpH265.js) — the backend drops the HDR ask there, and a view
+        // believing in HDR would walk the HDR codec chain on a fallback.
         const hdrEnabled =
-            result.native === true && typeof result.hdr === 'boolean'
-                ? result.hdr
-                : streamingSettings.hdr_enabled === true;
+            internalTransport === 'webrtc-media'
+                ? false
+                : result.native === true && typeof result.hdr === 'boolean'
+                  ? result.hdr
+                  : streamingSettings.hdr_enabled === true;
         // Audio time-stretch (WSOLA) — server kill switch (env MW_AUDIO_TIME_STRETCH).
         // Read fresh from the launch result; defaults to on when unspecified.
         const audioTimeStretch = result.audio_time_stretch !== false;

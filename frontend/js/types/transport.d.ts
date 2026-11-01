@@ -38,6 +38,8 @@ export type StreamTransport = (WebRtcDataChannel | WebRtcMedia) & {
     // (DataChannelRelay / MediaTrackRelay) just before it closes the channel.
     /** Session taken over by another device. */
     onTakeover?: (() => void) | null;
+    /** webrtc-media: the offer's only video codec is one this receiver does not list. */
+    onCodecUnsupported?: ((codec: string) => void) | null;
     /** This device's access was revoked by an admin. */
     onRevoked?: (() => void) | null;
     /** The owner ended the shared session this player was invited to. */

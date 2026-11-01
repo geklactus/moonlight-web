@@ -32,6 +32,7 @@ import {
 import { defaultIceServers } from './IceServers.js';
 import { isViewMessage } from './hostMessages.js';
 import { setAudioJitterBufferTarget } from '../util/AudioJitter.js';
+import { sdpVideoCodecs } from '../util/RtpH265.js';
 import {
     armDscpCarrier,
     dscpCarrierMode,
@@ -140,6 +141,10 @@ export class WebRtcMedia {
         this.onSessionEnded = null; // () the owner ended the session we were invited to
         this.onHostEnded = null; // () the host ended the stream on purpose (app closed there)
         this.onHostLost = null; // () the host side failed (Sunshine crashed, encoder died)
+        // (codec: 'hevc') the offer's only video codec is one this browser's
+        // RTP decoder does not list: no picture can come of it. The view
+        // relaunches in H.264 (util/RtpH265.js); unset, the answer goes anyway.
+        this.onCodecUnsupported = null;
 
         // Stats
         this.stats = { framesReceived: 0, chunksReceived: 0, framesDropped: 0, framesAssembled: 0 };
@@ -710,8 +715,10 @@ export class WebRtcMedia {
     /**
      * Validate that the browser supports the video codec advertised in the SDP.
      * Parses the m=video line and checks against RTCRtpReceiver.getCapabilities().
+     * The offer's codecs are kept in _offerCodecs for _handleSdpOffer.
      */
     _validateCodecSupport(sdp) {
+        this._offerCodecs = sdpVideoCodecs(sdp);
         try {
             const caps = RTCRtpReceiver.getCapabilities('video');
             if (!caps) {
@@ -719,13 +726,8 @@ export class WebRtcMedia {
                 return true; // Assume supported
             }
 
-            // Extract codec names from the SDP offer
-            const rtpmapRe = /a=rtpmap:\d+\s+(\w+)/gi;
-            const sdpCodecs = new Set();
-            let m;
-            while ((m = rtpmapRe.exec(sdp)) !== null) {
-                sdpCodecs.add(m[1].toUpperCase());
-            }
+            // The video codecs of the SDP offer (a=rtpmap at the video clock)
+            const sdpCodecs = new Set(this._offerCodecs);
 
             const browserCodecs = new Set();
             for (const c of caps.codecs) {
@@ -785,6 +787,21 @@ export class WebRtcMedia {
             // Validate codec support before committing
             const codecOk = this._validateCodecSupport(sdp);
             if (!codecOk) {
+                // An H.265 offer this browser's RTP decoder does not list: the
+                // host offered it on the page's own word (util/RtpH265.js), and
+                // answering it gets a track no picture will ever come on. Said
+                // to the view, which relaunches in H.264 at once rather than
+                // after the no-video watchdog; the H.264 offer goes on as before.
+                const codecs = this._offerCodecs || [];
+                if (
+                    codecs.includes('H265') &&
+                    !codecs.includes('H264') &&
+                    this.onCodecUnsupported
+                ) {
+                    console.warn("[WebRtcMedia] H.265 offered, not in this receiver's codecs");
+                    this.onCodecUnsupported('hevc');
+                    return;
+                }
                 console.warn('[WebRtcMedia] Codec not supported by browser — transport may fail');
             }
 

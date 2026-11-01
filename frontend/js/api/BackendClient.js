@@ -84,6 +84,7 @@ import {
     resolveTearing,
 } from '../util/BrowserDetect.js';
 import { currentRefreshMilliHz } from '../util/RefreshRate.js';
+import { rtpH265RequestFields } from '../util/RtpH265.js';
 import { canCropFrames } from '../stream/FrameCrop.js';
 import { STREAM_STATE_TIMEOUT_MS } from '../stream/CrashRelaunch.js';
 
@@ -417,6 +418,10 @@ export class BackendClient {
                 // carry their grid (stream/MwsrZoneBlock.js). A lab key for
                 // now (mwsrMapWanted); other hosts ignore it.
                 mwsr_map: mwsrMapWanted(),
+                // Whether this browser's own WebRTC decoder takes H.265, and
+                // in which profile: the media transport then carries HEVC
+                // instead of H.264 (util/RtpH265.js). Other transports ignore it.
+                ...rtpH265RequestFields(),
                 ...streamingSettings,
             },
             // Fail fast if the backend hangs/crashes instead of waiting for the
@@ -633,6 +638,9 @@ export class BackendClient {
         // As launchApp's: a guest's browser decodes through a gap too, and a
         // native host then gives their stream the owner's refresh wave.
         body.ride_out_loss = RIDE_OUT_LOSS && decoderRidesOutGaps();
+        // As launchApp's: the media transport carries HEVC to a guest whose
+        // browser's RTP decoder takes it (util/RtpH265.js).
+        Object.assign(body, rtpH265RequestFields());
         return this.post('/api/share/player/join', body, { timeoutMs: 25000 });
     }
     static async playerLeave() {

@@ -28,6 +28,7 @@
  *     performance stats, gaming mode
  */
 import { BackendClient } from '../api/BackendClient.js';
+import { rtpH265Capability } from '../util/RtpH265.js';
 import { Toast } from './Toast.js';
 import { t, getLanguage, setLanguage, AVAILABLE_LANGUAGES } from '../i18n/i18n.js';
 import { escapeHtml } from '../util/escapeHtml.js';
@@ -180,7 +181,11 @@ export class SettingsView {
         this._tearing = SUPPORTS_CANVAS_TEARING;
         // Worker decode mode: 'auto' (= off, default), 'on' (explicit opt-in) or 'off'.
         this._videoWorker = 'auto';
+        // The admin forced a media transport (webrtc-media-*): its track
+        // carries H.264, and HEVC where this browser's own RTP decoder takes
+        // it (_rtpH265, util/RtpH265.js) — never AV1 or PyroWave.
         this._mediaTrackOnlyH264 = false;
+        this._rtpH265 = false;
         // Video enhancement (upscale/sharpen): 'off'|'on' + algo selector, see
         // ENHANCER_CHOICES ('auto' picks by platform).
         this._videoEnhancement = 'off';
@@ -247,6 +252,7 @@ export class SettingsView {
     async start() {
         await this._loadState();
         this._codecSupport = await this._checkCodecSupport();
+        this._rtpH265 = rtpH265Capability() !== null;
         await this._loadPyrowaveHost();
         this._webgpuUsable = await this._checkWebGpuSupport();
         // The static half of the HDR gate (WebGPU adapter, 10-bit decoder); the
@@ -960,7 +966,8 @@ export class SettingsView {
 
     /**
      * Return the effective codec to display in the dropdown, considering:
-     * 1. MediaTrack transport forces H.264
+     * 1. A forced MediaTrack transport: H.264, or HEVC / Auto where this
+     *    browser's RTP decoder takes H.265 (_mediaTrackCodecAllowed)
      * 2. Browser codec support (preferred codec may be unsupported)
      * 3. Fallback chain: h264 > hevc > av1
      *
@@ -970,7 +977,8 @@ export class SettingsView {
      * elsewhere as the codec its launch falls back to (util/PyrowaveCodec.js).
      */
     _getEffectiveCodec() {
-        if (this._mediaTrackOnlyH264) return 'h264';
+        if (this._mediaTrackOnlyH264 && !this._mediaTrackCodecAllowed(this._videoCodec))
+            return 'h264';
         if (this._videoCodec === CODEC_AUTO) return CODEC_AUTO;
         if (this._videoCodec === CODEC_PYROWAVE) {
             return this._pyrowaveBlocker()
@@ -978,6 +986,18 @@ export class SettingsView {
                 : CODEC_PYROWAVE;
         }
         return this._effectiveCodecFrom(this._videoCodec);
+    }
+
+    /**
+     * Whether @p codec can be chosen while the admin forces a media transport
+     * (media_track_only_h264): H.264 always; HEVC, and Auto, where this
+     * browser's own RTP decoder takes H.265 — the track carries what the
+     * browser's WebRTC stack decodes, never AV1 or PyroWave.
+     */
+    _mediaTrackCodecAllowed(codec) {
+        if (!this._mediaTrackOnlyH264) return true;
+        if (codec === 'h264') return true;
+        return this._rtpH265 && (codec === 'hevc' || codec === CODEC_AUTO);
     }
 
     /** The fallback chain above, from @p codec (one of the browser's three). */
@@ -1227,12 +1247,15 @@ export class SettingsView {
         this._saveTimer = setTimeout(async () => {
             this._saveTimer = null;
 
-            // When MediaTrack transport is forced, only H.264 is available.
+            // When MediaTrack transport is forced, only what its track carries
+            // to this browser is available (_mediaTrackCodecAllowed).
             // Otherwise the preference, set when the menu changes: the menu
             // itself shows the effective codec, and reading it back here would
             // put a PyroWave chosen for another host, or an AV1 this browser
             // cannot decode, away at the next change of anything else.
-            const codec = this._mediaTrackOnlyH264 ? 'h264' : this._videoCodec;
+            const codec = this._mediaTrackCodecAllowed(this._videoCodec)
+                ? this._videoCodec
+                : 'h264';
             const gamingMode =
                 this.container.querySelector('#settings-gaming-mode')?.checked ?? this._gamingMode;
             const showPerf =
@@ -1527,7 +1550,7 @@ export class SettingsView {
             .map((c) => {
                 const browserDisabled =
                     c.value !== CODEC_AUTO && this._codecSupport && !this._codecSupport[c.value];
-                const mediaTrackDisabled = this._mediaTrackOnlyH264 && c.value !== 'h264';
+                const mediaTrackDisabled = !this._mediaTrackCodecAllowed(c.value);
                 // H.264 has no usable HDR path: disable it while HDR is enabled.
                 const hdrDisabledCodec = this._hdrEnabled && c.value === 'h264';
                 const disabled = browserDisabled || mediaTrackDisabled || hdrDisabledCodec;
