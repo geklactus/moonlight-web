@@ -31,7 +31,7 @@ An honest inventory of what remains, what constrains the design, and where the l
 | Constraint | Consequence |
 |---|---|
 | **`moonlight-common-c` is a process-global singleton** | One session **per process** — hence take-over semantics and deferred starts. Lifted to a pool of concurrent slots (the owner's live + standby, the invited players, devices streaming another host) by running each session in a `--stream-worker` child, which is also what makes seamless quality switching possible. |
-| **Browsers only** | Codec support is at the browser's mercy (HEVC/AV1 availability varies; MediaTrack path is H.264-only); no raw UDP from JS — everything rides WebRTC/WSS. |
+| **Browsers only** | Codec support is at the browser's mercy (HEVC/AV1 availability varies; the MediaTrack path carries H.264, and HEVC only where the browser's own WebRTC decoder lists it); no raw UDP from JS — everything rides WebRTC/WSS. |
 | **Canvas import is SDR-referred** | `importExternalTexture`/`drawImage` tone-map HDR on import; the signal survives only via `copyTo` of software-decoded frames. Hence true HDR on a canvas = **AV1, software decoded** (~10 ms more than SDR), and HDR with HEVC = the `<video>` sink, the slowest presenter, without the Enhancer ([ch. 15](15-Client-Presentation-Benchmarks.md#155-decision-4--hdr-routing)). |
 | **The `/start` response precedes ICE** | The client must own transport fallback; the server can never know a transport failed. |
 | **Self-signed cert on LAN** | A first-visit browser warning is unavoidable without a user-provided domain and certificate. |
