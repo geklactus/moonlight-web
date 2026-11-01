@@ -88,6 +88,7 @@ add_executable(run_tests
     test_mwsr_zone_block.cpp
     test_link_loss.cpp
     test_annexb_filler.cpp
+    test_media_track_codec.cpp
     test_link_freeze_log.cpp
     test_host_uplink.cpp
     test_host_upload_cap.cpp

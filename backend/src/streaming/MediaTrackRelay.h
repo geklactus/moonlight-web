@@ -18,6 +18,7 @@
 #pragma once
 
 #include "RelayBase.h"
+#include "MediaTrackCodec.h"
 #include <QByteArray>
 #include <QMutex>
 #include <QTimer>
@@ -42,12 +43,17 @@ class IMediaEngine;
 // WebRTC Media Track relay — alternative to DataChannelRelay using RTP media tracks.
 //
 // Architecture:
-//   - 1 rtc::Track for video (H.264 over RTP, hardware-decoded by browser)
+//   - 1 rtc::Track for video (H.264 or H.265 over RTP, decoded by the browser's
+//     own WebRTC stack into a <video> element)
 //   - 1 rtc::Track for audio (Opus over RTP, relayed without decoding)
 //   - 1 rtc::DataChannel for input (JSON, bidirectional, negotiated id=1)
 //
-// The H.264 RTP packetizer (H264RtpPacketizer with LongStartSequence separator)
-// handles Annex B -> RTP fragmentation automatically.
+// The track carries the codec the host negotiated: H.264 as it always did, or
+// H.265 when the browser said its RTP decoder takes it (setBrowserH265, from
+// /start's media_h265) — the session's codec policy never lets HEVC reach this
+// relay otherwise. libdatachannel's H264RtpPacketizer / H265RtpPacketizer
+// (RFC 6184 / RFC 7798) turn each Annex B access unit into RTP packets;
+// MediaTrackCodec.h holds what is decided from the bytes and the SDP.
 class MediaTrackRelay : public RelayBase
 {
     Q_OBJECT
@@ -87,6 +93,16 @@ public:
     /// clipboard) — see ClipboardBridge. Must be called before the relay is
     /// moved to its dedicated thread (Session does, right after creation).
     void setClipboardEnabled(bool enabled);
+
+    /// What the browser's own WebRTC decoder takes: H.265, and the fmtp line
+    /// its RTCRtpReceiver lists for it, repeated in the offer word for word
+    /// (MediaTrackCodec.h says why). Absent: H.264 only, as before. Must be
+    /// called before the relay is moved to its dedicated thread.
+    void setBrowserH265(bool canReceive, const std::string& fmtp)
+    {
+        m_BrowserH265 = canReceive;
+        m_H265Fmtp = fmtp;
+    }
 
     // Signals inherited from RelayBase: signalingSdpReady, signalingIceCandidate,
     // dataChannelsOpen, sessionEnded.
@@ -174,6 +190,18 @@ private:
     // dedicated thread, read from relay/libdatachannel threads afterwards.
     bool m_ClipboardEnabled = false;
     int m_FrameCount = 0;
+
+    // The video codec on the track (createTracksAndChannels decides it from
+    // the engine's negotiated format), its payload type, and what the page
+    // said about its RTP decoder. Written on the main thread before the relay
+    // moves to its thread; read from the relay, capture and libdatachannel
+    // threads afterwards.
+    bool m_BrowserH265 = false;
+    std::string m_H265Fmtp;
+    MediaTrackCodec::Codec m_VideoCodec = MediaTrackCodec::Codec::H264;
+    int m_VideoPayloadType = MediaTrackCodec::kH264PayloadType;
+    // Said once: the depacketizer's keyframe flag and the slice disagreeing.
+    bool m_KeyframeMismatchLogged = false;
 
     // P2-B: when true, onVideoFrame runs on the capture thread (DirectConnection)
     // instead of being marshaled to the Qt main thread. Set from env at construction.

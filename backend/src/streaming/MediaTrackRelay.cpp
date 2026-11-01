@@ -253,6 +253,18 @@ bool MediaTrackRelay::setRemoteDescription(const std::string& sdp)
         qWarning() << "[MediaTrackRelay] No PeerConnection for setRemoteDescription";
         return false;
     }
+    // What the browser made of the video codec offered. An answer that keeps
+    // none means no picture will reach its <video>: nothing to do here but
+    // say so — the page's codec fallback relaunches the stream in H.264.
+    if (MediaTrackCodec::answerKeeps(sdp, m_VideoCodec, m_VideoPayloadType)) {
+        qInfo() << "[MediaTrackRelay] The answer keeps" << MediaTrackCodec::sdpName(m_VideoCodec)
+                << "at PT" << m_VideoPayloadType;
+    } else {
+        qWarning() << "[MediaTrackRelay] The answer keeps no"
+                   << MediaTrackCodec::sdpName(m_VideoCodec) << "at PT" << m_VideoPayloadType
+                   << "— the browser's RTP decoder refused the codec, no picture can reach it"
+                   << "(the page's codec fallback relaunches in H.264)";
+    }
     try {
         m_Pc->setRemoteDescription(rtc::Description(sdp));
         logMicAnswer(sdp, "[MediaTrackRelay]");
@@ -341,13 +353,44 @@ void MediaTrackRelay::createTracksAndChannels()
 
     qInfo() << "[MediaTrackRelay] Creating video+audio tracks + input DataChannel";
 
-    // ── Video track (H.264, server->browser, RTP) ──────────────────────────
-    // libdatachannel generates the SDP media section (m=video) automatically.
-    // H264RtpPacketizer with LongStartSequence handles Annex B -> RTP.
-    // Payload type 96 (dynamic, standard for H.264 in WebRTC).
+    // ── Video track (H.264 or H.265, server->browser, RTP) ─────────────────
+    // libdatachannel generates the SDP media section (m=video) automatically
+    // and its packetizer turns Annex B into RTP. The codec is the one the host
+    // negotiated (known here: the browser only reaches the signaling socket
+    // once LiStartConnection has answered). H.264 at PT 96 as it always was;
+    // H.265 at PT 97 with the fmtp line the browser's RTCRtpReceiver listed,
+    // repeated as is — libwebrtc matches profile, tier and level, and answers
+    // an offer that differs on any of them with no codec (MediaTrackCodec.h).
     {
+        const int format = m_Shim ? m_Shim->negotiatedVideoFormat() : 0;
+        m_VideoCodec = MediaTrackCodec::fromVideoFormat(format);
+        if (m_VideoCodec == MediaTrackCodec::Codec::None) {
+            // AV1, or a format not known yet: neither has a place on this
+            // track. Offer H.264, as before, so the failure is a plain one.
+            qWarning() << "[MediaTrackRelay] Negotiated video format 0x"
+                       << QString::number(format, 16)
+                       << "is not one this track carries — offering H.264 as before";
+            m_VideoCodec = MediaTrackCodec::Codec::H264;
+        }
+        m_VideoPayloadType = MediaTrackCodec::payloadType(m_VideoCodec);
+        const bool hevc = m_VideoCodec == MediaTrackCodec::Codec::H265;
+        if (hevc && !m_BrowserH265) {
+            // The session's policy keeps HEVC off this transport unless the
+            // page said yes; reaching here means it was bypassed. The stream
+            // is what it is: offer it, the page falls back if it cannot.
+            qWarning() << "[MediaTrackRelay] HEVC negotiated but the page never said its RTP"
+                       << "decoder takes H.265 — offering it anyway";
+        }
+
         auto videoDesc = rtc::Description::Video("video", rtc::Description::Direction::SendOnly);
-        videoDesc.addH264Codec(96); // Uses default profile: 42e01f, packetization-mode=1
+        if (hevc) {
+            videoDesc.addH265Codec(m_VideoPayloadType,
+                                   m_H265Fmtp.empty() ? std::nullopt
+                                                      : std::optional<std::string>(m_H265Fmtp));
+        } else {
+            videoDesc.addH264Codec(
+                m_VideoPayloadType); // Uses default profile: 42e01f, packetization-mode=1
+        }
 
         // The SSRC has to be DECLARED in the media description, and before
         // addTrack() — the description is what the PeerConnection turns into
@@ -370,9 +413,19 @@ void MediaTrackRelay::createTracksAndChannels()
         m_VideoTrack = m_Pc->addTrack(videoDesc);
         if (m_VideoTrack) {
             auto rtpConfig = std::make_shared<rtc::RtpPacketizationConfig>(
-                ssrc, "video", 96, rtc::H264RtpPacketizer::ClockRate);
-            auto packetizer = std::make_shared<rtc::H264RtpPacketizer>(
-                rtc::H264RtpPacketizer::Separator::LongStartSequence, rtpConfig);
+                ssrc, "video", static_cast<uint8_t>(m_VideoPayloadType),
+                rtc::RtpPacketizer::VideoClockRate);
+            std::shared_ptr<rtc::RtpPacketizer> packetizer;
+            if (hevc) {
+                // RFC 7798: one packet per NAL unit, FU (type 49) past the
+                // MTU. Either start-code length: the H.264 path only ever saw
+                // four-byte codes, an HEVC encoder's SEI may come with three.
+                packetizer = std::make_shared<rtc::H265RtpPacketizer>(
+                    rtc::NalUnit::Separator::StartSequence, rtpConfig);
+            } else {
+                packetizer = std::make_shared<rtc::H264RtpPacketizer>(
+                    rtc::H264RtpPacketizer::Separator::LongStartSequence, rtpConfig);
+            }
             // Chain: packetizer → RtcpNackResponder → PliHandler
             //
             // The NACK history is the only thing standing between a lost RTP
@@ -418,7 +471,9 @@ void MediaTrackRelay::createTracksAndChannels()
             });
             m_VideoTrack->onClosed([this]() { qInfo() << "[MediaTrackRelay] Video Track closed"; });
 
-            qInfo() << "[MediaTrackRelay] Video track created (H.264, PT=96)";
+            qInfo() << "[MediaTrackRelay] Video track created (" << (hevc ? "H.265" : "H.264")
+                    << ", PT=" << m_VideoPayloadType << (hevc ? ", fmtp=" : "")
+                    << (hevc ? m_H265Fmtp.c_str() : "") << ")";
         } else {
             qWarning() << "[MediaTrackRelay] Failed to create video track";
         }
@@ -606,7 +661,22 @@ void MediaTrackRelay::onVideoFrame(const QByteArray& data, int frameType, int)
         return;
     }
 
-    bool isKeyframe = (frameType == 1);
+    // A keyframe by the depacketizer (FRAME_TYPE_IDR: the parameter sets that
+    // open the unit) or by its first slice (an IDR, or an HEVC IRAP: IDR_W_RADL,
+    // IDR_N_LP, CRA — MediaTrackCodec.h). Either says so and it is one: the
+    // browser's decoder reads the slice, and a keyframe sent as a delta would
+    // be held behind the gate below while the picture it carries is exactly
+    // what reopens it.
+    const bool hevc = m_VideoCodec == MediaTrackCodec::Codec::H265;
+    const bool flagged = (frameType == 1);
+    const bool irap = MediaTrackCodec::startsWithKeyframe(
+        reinterpret_cast<const uint8_t*>(data.constData()), static_cast<size_t>(data.size()), hevc);
+    const bool isKeyframe = flagged || irap;
+    if (flagged != irap && !m_KeyframeMismatchLogged) {
+        m_KeyframeMismatchLogged = true;
+        qInfo() << "[MediaTrackRelay] Keyframe flag and slice disagree (flagged=" << flagged
+                << "irap=" << irap << (hevc ? "HEVC" : "H.264") << ") — taken as a keyframe";
+    }
 
     // Serialize the video send path with stop() and sendBufferedKeyframe().
     // In direct mode this runs on the capture thread; the lock guarantees the

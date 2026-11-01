@@ -106,6 +106,17 @@ public:
         m_OriginalCodec = originalCodec;
     }
 
+    /// What the browser's own WebRTC decoder takes on the media track: H.265,
+    /// and the fmtp line its RTCRtpReceiver lists for it (/start's media_h265
+    /// and media_h265_fmtp, sanitized there). Absent — an older page, a guest's
+    /// older player page — the track carries H.264 only, as before. Read by
+    /// applyMediaTrackCodecPolicy() at start().
+    void setMediaTrackH265(bool browserH265, const QString& fmtp)
+    {
+        m_MediaH265 = browserH265;
+        m_MediaH265Fmtp = fmtp;
+    }
+
     void setExplicitWsUrl(const QString& url) { m_ExplicitWsUrl = url; }
 
     /// Where the streaming client sits, classified from the browser's own
@@ -484,6 +495,12 @@ private:
     bool m_CodecOverridden = false;
     /// The original codec selected by the user, before override.
     VideoCodec m_OriginalCodec = VideoCodec::Auto;
+    /// See setMediaTrackH265.
+    bool m_MediaH265 = false;
+    QString m_MediaH265Fmtp;
+    /// The codec the media track carries for this browser: H.264, or HEVC
+    /// where its RTP decoder takes it. Called by start() on that transport.
+    void applyMediaTrackCodecPolicy();
     QString m_StunServer = "stun:stream.moonlightweb.top:3478";
     /// Per-browser uniqueid for Sunshine launch/cancel; empty → shared id.
     QString m_ClientUniqueId;

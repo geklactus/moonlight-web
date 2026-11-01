@@ -21,6 +21,7 @@
 #include "MicUplink.h"
 #include "DataChannelRelay.h"
 #include "MediaTrackRelay.h"
+#include "MediaTrackCodec.h"
 #include "SignalingServer.h"
 #include "StreamRelay.h"
 #include "MoonlightShim.h"
@@ -95,20 +96,10 @@ StreamSession::StreamSession(NvComputer* host, int appId, NvHTTP* http, Response
     m_Config.codec = videoCodec;
     qInfo() << "[Session] Video codec preference set to" << static_cast<int>(videoCodec);
 
-    // WebRTC MediaTrack transport carries video over a native RTP video track that
-    // libdatachannel only packetizes as H.264 (MediaTrackRelay::createTracksAndChannels
-    // uses H264RtpPacketizer, PT=96). Sunshine must therefore encode H.264, otherwise
-    // it negotiates its preferred HEVC and the browser's <video> decoder receives HEVC
-    // NAL units on an H.264-declared track — the stream never starts. Force H.264 here
-    // when the user picked HEVC/AV1/Auto and record the override so the frontend is told
-    // the original selection (onShimConnectionStarted reports codecOverridden/originalCodec).
-    if (m_Transport == "webrtc-media" && videoCodec != VideoCodec::H264) {
-        m_CodecOverridden = true;
-        m_OriginalCodec = videoCodec;
-        m_Config.codec = VideoCodec::H264;
-        qInfo() << "[Session] webrtc-media transport — forcing H.264 (original codec:"
-                << static_cast<int>(videoCodec) << ")";
-    }
+    // The WebRTC MediaTrack transport carries video on a native RTP track the
+    // browser's own decoder plays: H.264 as it always did, or HEVC where that
+    // decoder takes it — which only setMediaTrackH265() can say, after this.
+    // applyMediaTrackCodecPolicy() settles it at start().
 
     // YUV 4:4:4 chroma: adds the YUV444 profile flags to the negotiated formats
     // (full chroma resolution, higher bandwidth). Off by default.
@@ -136,6 +127,56 @@ StreamSession::~StreamSession()
     if (m_LaunchReply) m_LaunchReply->deleteLater();
 }
 
+void StreamSession::applyMediaTrackCodecPolicy()
+{
+    // What the browser asked for, Auto resolved the way the transport chain
+    // resolved it (main.cpp filterTransportsByCodec): HEVC when the host
+    // encodes it and the browser's RTP decoder takes it, H.264 otherwise.
+    const VideoCodec asked = m_Config.codec;
+    const bool hostHevc = m_Host && (m_Host->serverCodecModeSupport & SCM_MASK_HEVC) != 0;
+    VideoCodec effective = asked;
+    if (asked == VideoCodec::Auto)
+        effective = (m_MediaH265 && hostHevc) ? VideoCodec::HEVC : VideoCodec::H264;
+
+    if (effective == VideoCodec::HEVC && m_MediaH265) {
+        // Asked explicitly — Auto's own list would do, but the intent is on
+        // record. Main profile only: the page named the profile its receiver
+        // takes (profile-id=1), and neither HDR (Main10) nor 4:4:4 (RExt) is
+        // negotiated with a browser's RTP decoder — HDR stays with the
+        // DataChannel transports, where the page tone-maps it itself.
+        m_Config.codec = VideoCodec::HEVC;
+        if (m_Config.hdrEnabled) {
+            qInfo() << "[Session] webrtc-media transport — HDR not asked: the media track"
+                    << "carries HEVC Main only";
+            m_Config.hdrEnabled = false;
+        }
+        if (m_Config.chroma == ChromaSampling::C444) {
+            qInfo() << "[Session] webrtc-media transport — 4:4:4 not asked: the media track"
+                    << "carries HEVC Main only";
+            m_Config.chroma = ChromaSampling::C420;
+        }
+        qInfo() << "[Session] webrtc-media transport — HEVC on the media track (the browser's"
+                << "RTP decoder takes it; fmtp:" << m_MediaH265Fmtp << ")";
+        return;
+    }
+
+    // As before: the track carries H.264 to this browser. Sunshine would
+    // otherwise negotiate its preferred HEVC (or AV1) and the browser's
+    // <video> decoder would receive it on an H.264-declared track — the
+    // stream never starts. The override is recorded so the page is told the
+    // original selection (onShimConnectionStarted: codecOverridden,
+    // originalCodec).
+    if (asked != VideoCodec::H264) {
+        m_CodecOverridden = true;
+        m_OriginalCodec = asked;
+        m_Config.codec = VideoCodec::H264;
+        qInfo() << "[Session] webrtc-media transport — forcing H.264 (original codec:"
+                << static_cast<int>(asked) << "; the browser's RTP decoder"
+                << (m_MediaH265 ? "takes H.265 but the host does not encode it)"
+                                : "lists no H.265)");
+    }
+}
+
 void StreamSession::start()
 {
     if (!m_Host) {
@@ -158,6 +199,10 @@ void StreamSession::start()
         deleteLater();
         return;
     }
+
+    // The media track's codec, now that the page has said what its RTP
+    // decoder takes (setMediaTrackH265): before the host is asked anything.
+    if (m_Transport == "webrtc-media") applyMediaTrackCodecPolicy();
 
     // Generate per-session encryption keys
     m_Config.generateKeys();
@@ -882,6 +927,9 @@ void StreamSession::onLaunchResult(bool ok, const BackendError& err, const Media
         relay->setClipboardEnabled(clipboardLocal);
         relay->setInputPolicy(m_InputPolicy);
         relay->setMicUplink(m_Mic);
+        // The browser's word on H.265, for the offer (applyMediaTrackCodecPolicy
+        // only lets HEVC through on it).
+        relay->setBrowserH265(m_MediaH265, m_MediaH265Fmtp.toStdString());
 
         // SignalingServer: WebSocket for SDP/ICE exchange only.
         auto* signaling = new SignalingServer(relay, m_WsPort, m_ServerHost, nullptr);

@@ -635,6 +635,9 @@ int runStreamWorker(QCoreApplication& app)
     // Absent (an older parent, a guest) → no microphone.
     session->setMicRequested(cfg["mic"].toBool(false));
     session->setMicDevice(cfg["micDevice"].toString());
+    // The browser's RTP decoder takes H.265, and its fmtp line (sanitized by
+    // the parent). Absent (an older parent) → H.264 only on the media track.
+    session->setMediaTrackH265(cfg["mediaH265"].toBool(false), cfg["mediaH265Fmtp"].toString());
     // Absent (an older parent) → off, which is exactly today's behaviour.
     session->setRideOutLoss(cfg["rideOutLoss"].toBool(false));
     // Absent (an older parent, a guest) → the engine's own repairs.

@@ -110,6 +110,7 @@
 #include "Limelight.h" // SCM_* codec-support masks
 #include "streaming/DataChannelRelay.h"
 #include "streaming/MediaTrackRelay.h"
+#include "streaming/MediaTrackCodec.h"
 #include "streaming/StreamRelay.h"
 #include "streaming/TransportPriorities.h"
 #include "streaming/ConsoleSession.h"
@@ -1271,14 +1272,16 @@ static bool hostSupportsCodec(NvComputer* h, VideoCodec c)
 //
 // Rules:
 //   - H.264 works on all transports.
-//   - HEVC and AV1 are skipped for MediaTrack modes (<video> element codec
-//     support varies across browsers; DataChannel WebCodecs is more reliable).
+//   - HEVC rides the MediaTrack modes only where the browser said its own RTP
+//     decoder takes H.265 (@p mediaH265, from /start's media_h265 — the
+//     <video> element decodes with the browser's WebRTC stack, not WebCodecs);
+//     AV1 never does (MediaTrackCodec.h).
 //   - If the host doesn't support the selected codec, try H.264 instead (if the
 //     host supports it).
 //
 // Shared by the owner's /start and a player's join so both walk the same chain.
 static QStringList filterTransportsByCodec(const QStringList& transports, VideoCodec codec,
-                                           NvComputer* h)
+                                           NvComputer* h, bool mediaH265)
 {
     // Determine effective codec (resolve Auto → HEVC if host supports)
     VideoCodec effective = codec;
@@ -1301,11 +1304,13 @@ static QStringList filterTransportsByCodec(const QStringList& transports, VideoC
 
     QStringList result;
     for (const auto& t : transports) {
-        if ((effective == VideoCodec::AV1 || effective == VideoCodec::HEVC) &&
-            t.startsWith("webrtc-media")) {
-            qInfo() << "[Auto] Skipping" << t << "(MediaTrack only supports H.264, codec is"
-                    << static_cast<int>(effective) << ")";
-            continue; // Skip non-H.264 codecs on MediaTrack
+        if (t.startsWith("webrtc-media") && !MediaTrackCodec::carries(effective, mediaH265)) {
+            qInfo() << "[Auto] Skipping" << t << "(the media track cannot carry"
+                    << AppSettings::videoCodecToString(effective)
+                    << (effective == VideoCodec::HEVC
+                            ? "to this browser: its RTP decoder lists no H.265)"
+                            : "— codec of the DataChannel transports)");
+            continue;
         }
         // Note: with video enhancement ON, MediaTrack is NOT skipped — it is
         // kept as a last resort (ordered last by TransportPriorities) and
@@ -3282,6 +3287,15 @@ int main(int argc, char* argv[])
         if (body.contains("video_codec"))
             reqCodec = AppSettings::videoCodecFromString(body["video_codec"].toString());
 
+        // What the browser's own WebRTC decoder takes on the media track
+        // (frontend util/RtpH265.js): H.265, with the fmtp line its
+        // RTCRtpReceiver lists for it — the offer must repeat it word for
+        // word, so it is kept only when it is one (MediaTrackCodec.h). Absent
+        // (an older page): H.264 only on that track, as before.
+        const bool reqMediaH265 = body["media_h265"].toBool(false);
+        const QString reqMediaH265Fmtp = QString::fromStdString(
+            MediaTrackCodec::sanitizeFmtp(body["media_h265_fmtp"].toString().toStdString()));
+
         bool reqGamingMode =
             body.contains("gaming_mode") ? body["gaming_mode"].toBool() : appSettings.gamingMode();
 
@@ -3420,7 +3434,8 @@ int main(int argc, char* argv[])
                 << "codec=" << AppSettings::videoCodecToString(reqCodec)
                 << "gaming=" << reqGamingMode << "bitrate=" << reqBitrate << "height=" << reqHeight
                 << "fps=" << reqFps << "yuv444=" << reqYuv444 << "hdr=" << reqHdr
-                << "videoEnhancement=" << reqVideoEnhancement << "mic=" << reqMic;
+                << "videoEnhancement=" << reqVideoEnhancement << "mic=" << reqMic
+                << "mediaH265=" << reqMediaH265;
 
         // Determine signaling host from the browser's Host header.
         // Works for both LAN (localhost:443) and remote access via moonlightweb.top.
@@ -3511,8 +3526,9 @@ int main(int argc, char* argv[])
         //   - explicit X  → X first; if X is a "-udp" mode, its "-tcp" sibling is
         //                   promoted to second (prefer the same transport family
         //                   before switching), then the rest of the auto order.
-        QStringList autoOrder = filterTransportsByCodec(
-            TransportPriorities::orderedTransports(reqVideoEnhancement), reqCodec, host);
+        QStringList autoOrder =
+            filterTransportsByCodec(TransportPriorities::orderedTransports(reqVideoEnhancement),
+                                    reqCodec, host, reqMediaH265);
 
         QStringList transportChain;
         if (transportMode == "auto") {
@@ -3774,6 +3790,8 @@ int main(int argc, char* argv[])
             s->setMuteHostAudio(reqMuteHost);
             s->setMicRequested(reqMic);
             s->setMicDevice(appSettings.micDevice());
+            // What the browser's RTP decoder takes on the media track.
+            s->setMediaTrackH265(reqMediaH265, reqMediaH265Fmtp);
             s->setClientUniqueId(reqClientUniqueId);
             // The browser opts in: it decodes through a gap rather than asking
             // for a keyframe, which is what makes intra-refresh worth its cost.
@@ -3861,11 +3879,11 @@ int main(int argc, char* argv[])
             VideoCodec effectiveCodec = reqCodec;
             bool codecOverridden = false;
             VideoCodec originalCodec = VideoCodec::Auto;
-            if (internalTransport == "webrtc-media" &&
-                (effectiveCodec == VideoCodec::HEVC || effectiveCodec == VideoCodec::AV1)) {
+            if (internalTransport == "webrtc-media" && effectiveCodec != VideoCodec::Auto &&
+                !MediaTrackCodec::carries(effectiveCodec, reqMediaH265)) {
                 qInfo() << "[Session] MediaTrack attempt but codec is"
                         << AppSettings::videoCodecToString(effectiveCodec)
-                        << "- forcing H.264 (MediaTrack only supports H.264)";
+                        << "- forcing H.264 (the media track cannot carry it to this browser)";
                 originalCodec = effectiveCodec;
                 effectiveCodec = VideoCodec::H264;
                 codecOverridden = true;
@@ -3905,6 +3923,10 @@ int main(int argc, char* argv[])
             cfg["codec"] = static_cast<int>(effectiveCodec);
             cfg["codecOverridden"] = codecOverridden;
             cfg["originalCodec"] = static_cast<int>(originalCodec);
+            // What the browser's RTP decoder takes on the media track, and the
+            // fmtp line the offer repeats (setMediaTrackH265).
+            cfg["mediaH265"] = reqMediaH265;
+            cfg["mediaH265Fmtp"] = reqMediaH265Fmtp;
             cfg["gamingMode"] = reqGamingMode;
             // The router hole ("upnpPublicIp"/"upnpExternalPort") is added
             // below, once the allocator has answered: a mapping only serves a
@@ -4643,17 +4665,18 @@ int main(int argc, char* argv[])
         // established — connection failures are only observable on the client.
         // ═════════════════════════════════════════════════════════════════════
         {
-            // MediaTrack only carries H.264 → force it if the user selected
-            // HEVC/AV1 (MediaTrackRelay cannot encode those).
+            // The media track carries H.264, and HEVC only to a browser whose
+            // RTP decoder takes it → force H.264 otherwise (AV1 never rides
+            // it). Auto is the session's to settle (applyMediaTrackCodecPolicy).
             VideoCodec effectiveCodec = reqCodec;
             bool codecOverridden = false;
             VideoCodec originalCodec = VideoCodec::Auto;
 
-            if (internalTransport == "webrtc-media" &&
-                (effectiveCodec == VideoCodec::HEVC || effectiveCodec == VideoCodec::AV1)) {
+            if (internalTransport == "webrtc-media" && effectiveCodec != VideoCodec::Auto &&
+                !MediaTrackCodec::carries(effectiveCodec, reqMediaH265)) {
                 qInfo() << "[Session] MediaTrack attempt but codec is"
                         << AppSettings::videoCodecToString(effectiveCodec)
-                        << "- forcing H.264 (MediaTrack only supports H.264)";
+                        << "- forcing H.264 (the media track cannot carry it to this browser)";
                 originalCodec = effectiveCodec;
                 effectiveCodec = VideoCodec::H264;
                 codecOverridden = true;
@@ -5521,13 +5544,19 @@ int main(int argc, char* argv[])
         const bool h264 = QJsonDocument::fromJson(req.body).object().value(
                               QStringLiteral("codec")) == QStringLiteral("h264");
         const VideoCodec codec = h264 ? VideoCodec::H264 : VideoCodec::Auto;
+        // What the guest's browser's RTP decoder takes on the media track,
+        // said the way the owner's /start says it (media_h265, media_h265_fmtp).
+        const QJsonObject joinBody = QJsonDocument::fromJson(req.body).object();
+        const bool mediaH265 = joinBody.value(QStringLiteral("media_h265")).toBool(false);
+        const QString mediaH265Fmtp = QString::fromStdString(MediaTrackCodec::sanitizeFmtp(
+            joinBody.value(QStringLiteral("media_h265_fmtp")).toString().toStdString()));
 
         // Players always get the enhancement-aware ordering: their profile
         // runs SGSR1 until it proves too expensive (frontend governor). The
         // H.264 rungs are the same list with the MediaTrack ones appended, so
         // an index into one names the same transport in the other.
-        QStringList chain =
-            filterTransportsByCodec(TransportPriorities::orderedTransports(true), codec, host);
+        QStringList chain = filterTransportsByCodec(TransportPriorities::orderedTransports(true),
+                                                    codec, host, mediaH265);
         // Same rule as the owner's chain: through the rendezvous there is no
         // TLS connection of ours to carry the wss rung.
         if (req.viaTunnel) chain.removeAll(QStringLiteral("wss"));
@@ -5619,6 +5648,8 @@ int main(int argc, char* argv[])
         cfg["codec"] = static_cast<int>(codec);
         cfg["codecOverridden"] = false;
         cfg["originalCodec"] = static_cast<int>(VideoCodec::Auto);
+        cfg["mediaH265"] = mediaH265;
+        cfg["mediaH265Fmtp"] = mediaH265Fmtp;
         cfg["gamingMode"] = true;
         // The router hole ("upnpPublicIp"/"upnpExternalPort") is added below,
         // once the allocator has answered — the slot's own, as for the owner.
