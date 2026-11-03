@@ -86,7 +86,19 @@ public:
     ///
     BackendCapabilities capabilities() const override
     {
-        return BackendCapabilities{/*multiUser*/ true, /*provisioning*/ false, /*lobbies*/ true};
+        BackendCapabilities caps{/*multiUser*/ true, /*provisioning*/ false, /*lobbies*/ true};
+        // Wolf keeps a session's app running when its Moonlight client goes: a
+        // disconnect or a TERMINATION packet is a PauseStreamEvent (control.cpp),
+        // the pipelines end, the container stays, and the next launch of the same
+        // app resumes it. Only /cancel stops it — Wolf's cancel handler fires
+        // StopStreamEvent and the Docker runner stops the container with a 2 s
+        // grace. So on Wolf a stream end must not cancel, exactly as on Sunshine:
+        // with this false, a closed tab, a lost link and every quality relaunch
+        // sent /cancel, and the game was killed and started over each time (a
+        // Wolf host, 02/11/2026: four times in three minutes). The viewer's
+        // "Quit the app when the stream stops" setting still asks for the cancel.
+        caps.resumableApps = true;
+        return caps;
     }
 
     void ensurePaired(BackendVoidCallback cb) override;
