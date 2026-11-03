@@ -203,6 +203,14 @@ MediaTrackRelay::MediaTrackRelay(IMediaEngine* engine, QObject* parent)
     m_StatsTimer = new QTimer(this);
     m_StatsTimer->setInterval(1000); // matches moonlight-qt's stats window flip
     connect(m_StatsTimer, &QTimer::timeout, this, &MediaTrackRelay::onStatsTimerTick);
+
+    // A browser that went and did not come back ends the stream as before.
+    m_ReattachWindow =
+        std::make_unique<mw::reattach::Window>(this, mw::reattach::kWindowMs, [this]() {
+            qInfo() << "[MediaTrackRelay] No reattach within" << mw::reattach::kWindowMs / 1000
+                    << "s — ending the stream";
+            endSession("the browser did not come back");
+        });
 }
 
 void MediaTrackRelay::setClipboardEnabled(bool enabled)
@@ -298,9 +306,11 @@ void MediaTrackRelay::setupPeerConnection(const rtc::Configuration& config)
 
     PacketMarking::apply();
     m_Pc = std::make_shared<rtc::PeerConnection>(config);
+    const uint64_t gen = ++m_PeerGen;
 
     // --- Local description callback ---
-    m_Pc->onLocalDescription([this](const rtc::Description& sdp) {
+    m_Pc->onLocalDescription([this, gen](const rtc::Description& sdp) {
+        if (gen != m_PeerGen.load()) return;
         qInfo() << "[MediaTrackRelay] Local SDP generated, type="
                 << QString::fromStdString(sdp.typeString())
                 << "hasAudioOrVideo=" << sdp.hasAudioOrVideo()
@@ -309,12 +319,15 @@ void MediaTrackRelay::setupPeerConnection(const rtc::Configuration& config)
     });
 
     // --- Local ICE candidate callback ---
-    m_Pc->onLocalCandidate([this](const rtc::Candidate& candidate) {
+    m_Pc->onLocalCandidate([this, gen](const rtc::Candidate& candidate) {
+        if (gen != m_PeerGen.load()) return;
         emitLocalCandidate(candidate, "[MediaTrackRelay]");
     });
 
     // --- State change callback ---
-    m_Pc->onStateChange([this](rtc::PeerConnection::State state) {
+    m_Pc->onStateChange([this, gen](rtc::PeerConnection::State state) {
+        // A replaced PeerConnection says Closed as it goes: not ours any more.
+        if (gen != m_PeerGen.load()) return;
         qInfo() << "[MediaTrackRelay] PC state changed to" << static_cast<int>(state);
         if (state == rtc::PeerConnection::State::Connected) {
             qInfo() << "[MediaTrackRelay] PeerConnection connected";
@@ -330,6 +343,13 @@ void MediaTrackRelay::setupPeerConnection(const rtc::Configuration& config)
         } else if (state == rtc::PeerConnection::State::Disconnected ||
                    state == rtc::PeerConnection::State::Failed ||
                    state == rtc::PeerConnection::State::Closed) {
+            if (m_Stopping.load()) return;
+            // The stream ran: the host session stays, the page may come back.
+            if (m_EverConnected.load()) {
+                QMetaObject::invokeMethod(
+                    this, [this, gen]() { onPeerLost(gen); }, Qt::QueuedConnection);
+                return;
+            }
             if (!m_Stopping.exchange(true)) {
                 m_Connected = false;
                 qInfo() << "[MediaTrackRelay] PC disconnected/failed/closed";
@@ -538,9 +558,12 @@ void MediaTrackRelay::createTracksAndChannels()
 
         m_InputDc = m_Pc->createDataChannel("input", inputConfig);
         if (m_InputDc) {
-            m_InputDc->onOpen([this]() {
+            const uint64_t gen = m_PeerGen.load();
+            m_InputDc->onOpen([this, gen]() {
+                if (gen != m_PeerGen.load()) return;
                 qInfo() << "[MediaTrackRelay] Input DataChannel open";
                 m_Connected = true;
+                m_EverConnected = true;
                 emit dataChannelsOpen();
 
                 if (m_ClipboardEnabled) {
@@ -567,6 +590,11 @@ void MediaTrackRelay::createTracksAndChannels()
                         if (m_StatsTimer) {
                             m_StatsTimer->start();
                             qInfo() << "[MediaTrackRelay] Stats timer started (2s interval)";
+                        }
+                        if (m_Reattaching) {
+                            m_Reattaching = false;
+                            qInfo() << "[MediaTrackRelay] Reattached: the browser is back after"
+                                    << m_ReattachWindow->close() << "ms on the same host session";
                         }
                     },
                     Qt::QueuedConnection);
@@ -873,21 +901,62 @@ void MediaTrackRelay::onShimConnectionTerminated(int errorCode)
     // the host side failing (Sunshine crashed, its encoder hung the GPU, the
     // native engine died): the browser link is fine, so say which side went.
     sendExitNotice(errorCode == ML_ERROR_GRACEFUL_TERMINATION ? "host-ended" : "host-lost");
-    if (!m_Stopping.exchange(true)) {
-        m_Connected = false;
-        emit sessionEnded();
-    }
+    endSession("the host connection ended");
 }
 
 void MediaTrackRelay::endFromSignaling()
 {
     // No exit notice: there is no channel to the page yet, only the signalling
     // socket, which is the side that gave up.
+    endSession("signalling gave up");
+}
+
+void MediaTrackRelay::endSession(const char* why)
+{
+    if (m_ReattachWindow) m_ReattachWindow->close();
     if (!m_Stopping.exchange(true)) {
         m_Connected = false;
         if (m_IceCheckTimer) m_IceCheckTimer->stop();
+        qInfo() << "[MediaTrackRelay] Session ends:" << why;
         emit sessionEnded();
     }
+}
+
+// ── Reattach ──────────────────────────────────────────────────────────────────
+
+void MediaTrackRelay::onPeerLost(uint64_t gen)
+{
+    if (gen != m_PeerGen.load() || m_Stopping.load()) return;
+    qInfo() << "[MediaTrackRelay] PeerConnection lost after the stream ran — keeping the host"
+            << "session, waiting up to" << mw::reattach::kWindowMs / 1000
+            << "s for the page to reattach";
+    closePeer();
+    m_Reattaching = false;
+    m_ReattachWindow->open();
+}
+
+bool MediaTrackRelay::beginReattach()
+{
+    if (m_Stopping.load() || !m_EverConnected.load()) return false;
+    // The page may notice a dead path before we do: libjuice only gives up on
+    // a pair after its consent timeout (30 s).
+    if (m_Pc) {
+        qInfo() << "[MediaTrackRelay] Reattach: the page is back before its old PeerConnection"
+                << "went here — dropping it";
+        closePeer();
+    }
+    m_ReattachWindow->open();
+    m_Reattaching = true;
+    qInfo() << "[MediaTrackRelay] Reattach: building a new PeerConnection for the page";
+    return true;
+}
+
+void MediaTrackRelay::sendToClient(const QByteArray& json)
+{
+    if (m_Stopping.load() || !m_InputDc || !m_InputDc->isOpen()) return;
+    try {
+        m_InputDc->send(std::string(json.constData(), json.size()));
+    } catch (const std::exception&) {}
 }
 
 // ── Input handling (from libdatachannel callback, marshaled to main thread) ──
@@ -1172,6 +1241,16 @@ void MediaTrackRelay::onIceCheckTimeout()
         if (state == rtc::PeerConnection::State::Connected) return;
     }
 
+    if (m_Reattaching) {
+        // No transport fallback for a stream that already runs: the page may
+        // try again while the window lasts.
+        qWarning() << "[MediaTrackRelay] Reattach: ICE did not connect within" << m_IceTimeoutMs
+                   << "ms — dropping this attempt";
+        m_Reattaching = false;
+        closePeer();
+        return;
+    }
+
     qWarning() << "[MediaTrackRelay] ICE timeout — PC did not reach Connected within"
                << m_IceTimeoutMs << "ms."
                << "Emitting iceTimedOut().";
@@ -1259,26 +1338,41 @@ void MediaTrackRelay::stop()
 
     // The microphone's device first: nothing more will come for it.
     stopMic();
+    if (m_ReattachWindow) m_ReattachWindow->close();
+    m_Reattaching = false;
 
-    // Stop timers
-    if (m_IceCheckTimer) {
-        m_IceCheckTimer->stop();
-    }
-    if (m_StatsTimer) {
-        m_StatsTimer->stop();
-    }
+    closePeer();
+
+    qInfo() << "[MediaTrackRelay::stop] EXIT";
+}
+
+void MediaTrackRelay::closePeer()
+{
+    // From here on the old PeerConnection's callbacks are no longer ours.
+    ++m_PeerGen;
+
+    if (m_IceCheckTimer) m_IceCheckTimer->stop();
+    if (m_StatsTimer) m_StatsTimer->stop();
 
     m_Connected = false;
     {
         // Serialize with the (possibly concurrent) capture-thread send path.
+        // The next track starts on a keyframe, with its own RTP clock.
         std::lock_guard<std::mutex> lk(m_VideoMutex);
         m_BufferedKeyframe.clear();
         m_HaveBufferedKeyframe = false;
         m_DeltaAfterBufferedKeyframe = false;
-        m_SentKeyframeOnTrack = false;
+        closeDeltaGate("browser PeerConnection closed");
+        m_HaveFirstFrameTime = false;
     }
+    {
+        std::lock_guard<std::mutex> lk(m_AudioMutex);
+        m_AudioRtpTs = 0;
+    }
+    m_LastPacketsLostReported = 0;
+    m_LastClientStatsSnapshot = -1;
 
-    // Reset IDR throttle state for the next session
+    // Reset IDR throttle state for the next PeerConnection
     m_IdrCooldownMs.store(kIdrCooldownBaseMs, std::memory_order_release);
     m_LastIdrRequestMs.store(0, std::memory_order_release);
     m_IdrOutstanding.store(false, std::memory_order_release);
@@ -1331,8 +1425,6 @@ void MediaTrackRelay::stop()
         } catch (...) {}
         m_Pc.reset();
     }
-
-    qInfo() << "[MediaTrackRelay::stop] EXIT";
 }
 
 void MediaTrackRelay::requestIdrFrame()
