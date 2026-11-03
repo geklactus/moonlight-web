@@ -3769,6 +3769,23 @@ export const MoonlightApp = {
         // The flag still records that a transport failed: the launch_failed
         // branch above walks on rather than giving up once it is set.
         const iceTimedOut = /ice timeout/i.test(String(reason));
+        // A stream that had been playing for a while and then lost its link is
+        // a new network event (a phone changing radios), not this transport
+        // failing to work here: it gets the same one silent retry, on the rung
+        // it was on, as a fresh launch would. Without this the retry was spent
+        // once per launch, and a second hiccup an hour later walked the stream
+        // down the chain to a worse transport, a third further still.
+        const sv = this.streamView;
+        const playedFor = sv && sv._connectedAt ? performance.now() - sv._connectedAt : 0;
+        if (playedFor >= 60000 && !decoderFail && !iceTimedOut) {
+            console.warn(
+                `[MW] Transport ${chain[cur]} lost its link after ${Math.round(playedFor / 1000)} s of play ` +
+                    `(${reason}) — retrying it (silent)`,
+            );
+            this._firstTransportRetried = true;
+            this._relaunchTransport(cur);
+            return;
+        }
         if (cur === 0 && iceTimedOut) this._firstTransportRetried = true;
         if (cur === 0 && !this._firstTransportRetried && !decoderFail && !iceTimedOut) {
             this._firstTransportRetried = true;

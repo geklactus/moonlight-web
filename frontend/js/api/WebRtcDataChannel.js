@@ -244,6 +244,11 @@ export class WebRtcDataChannel {
         // pre-ice-config default, and what an older host implies.
         this._iceTimeout = null;
         this.ICE_TIMEOUT_MS = 3000;
+        // See "A link that drops for a moment" below.
+        this.DISCONNECT_GRACE_MS = 5000;
+        this._disconnectTimer = null;
+        this._disconnectedAt = 0;
+        this.linkQuietUntil = 0;
 
         // ICE state tracking — used to distinguish premature WS close
         // (before ICE) from graceful WS close after ICE connected but
@@ -601,6 +606,62 @@ export class WebRtcDataChannel {
     }
 
     /** Cancel the ICE connection timeout timer. */
+    // ── A link that drops for a moment ─────────────────────────────────────
+    //
+    // 'disconnected' is ICE's transient state: no answer to its consent checks
+    // for a few seconds. On a phone it is what a radio hiccup looks like (LTE
+    // to 5G, a cell handover, Wi-Fi roaming), and the path often comes back by
+    // itself: the state goes to 'connected' again and the stream carries on.
+    // Ending the stream at 'disconnected' turned every such hiccup into a full
+    // relaunch (a new peer connection, a new host session, a keyframe wait).
+    // So a stream that was up gets DISCONNECT_GRACE_MS to come back; 'failed',
+    // or the grace running out, still ends it as before. While the link is down
+    // and for a while after (linkQuietUntil), StreamView's congestion monitor
+    // stands down: the starvation it would count is the outage, not congestion.
+    _startDisconnectGrace() {
+        if (this._disconnectTimer || this._stopping) return;
+        this._disconnectedAt = performance.now();
+        this.linkQuietUntil = Infinity;
+        console.warn(
+            '[WebRTC] ICE disconnected — waiting up to ' +
+                this.DISCONNECT_GRACE_MS / 1000 +
+                ' s for the path to come back',
+        );
+        this._disconnectTimer = setTimeout(() => {
+            this._disconnectTimer = null;
+            if (this._stopping || !this.pc) return;
+            const st = this.pc.iceConnectionState;
+            if (st === 'connected' || st === 'completed') return;
+            console.warn('[WebRTC] ICE still ' + st + ' after the grace — ending the stream');
+            this._endLinkQuiet();
+            this._clearWsCloseTimer();
+            this._onError('ICE ' + st);
+        }, this.DISCONNECT_GRACE_MS);
+    }
+
+    _clearDisconnectGrace() {
+        if (this._disconnectTimer) {
+            clearTimeout(this._disconnectTimer);
+            this._disconnectTimer = null;
+        }
+    }
+
+    /** The link answered again within the grace: the stream carries on. */
+    _endDisconnectGrace() {
+        if (!this._disconnectTimer) return;
+        this._clearDisconnectGrace();
+        console.log(
+            '[WebRTC] ICE back after ' +
+                Math.round(performance.now() - this._disconnectedAt) +
+                ' ms — the stream carries on',
+        );
+        this._endLinkQuiet();
+    }
+
+    _endLinkQuiet() {
+        this.linkQuietUntil = performance.now() + 10000;
+    }
+
     _clearIceTimer() {
         if (this._iceTimeout) {
             clearTimeout(this._iceTimeout);
@@ -683,6 +744,7 @@ export class WebRtcDataChannel {
         this._closed = true;
         this._stopping = true;
         console.log('[WebRTC] Closing...');
+        this._clearDisconnectGrace();
 
         // Stop the cleanup timer in ALL modes — the WSS early-return below
         // used to leak it, leaving a zombie interval running forever.
@@ -995,7 +1057,12 @@ export class WebRtcDataChannel {
                 this._clearIceTimer();
                 // Clear fallback request timer — ICE came up
                 this._clearFallbackRequestTimer();
+                // A drop that came back within its grace: nothing to relaunch.
+                this._endDisconnectGrace();
                 // DataChannels should open shortly via SCTP
+            } else if (state === 'disconnected' && this._iceConnected && !this._stopping) {
+                // ICE WAS connected: a moment's drop gets its grace (see below).
+                this._startDisconnectGrace();
             } else if (state === 'disconnected' || state === 'failed') {
                 if (!this._stopping) {
                     if (!this._iceConnected) {
@@ -1010,7 +1077,9 @@ export class WebRtcDataChannel {
                             this._requestWsFallback(state);
                         }
                     } else {
-                        // ICE WAS connected before — real disconnection.
+                        // ICE WAS connected before and has now failed.
+                        this._clearDisconnectGrace();
+                        this._endLinkQuiet();
                         // Cancel ICE timeout — ICE already failed
                         this._clearIceTimer();
                         // If we were waiting for DCs after WS close, the ICE
