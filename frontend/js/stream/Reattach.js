@@ -25,8 +25,8 @@
  * keeps its Moonlight session and waits REATTACH_WINDOW_MS for this page to
  * build a new PeerConnection, proving it is the page that started the stream
  * with the token /start gave it (backend ReattachGate.h). The view, its
- * decoder surface, the pads and the HID devices all stay; only the transport
- * object is new. Anything that goes wrong falls back to how a lost link has
+ * decoder (or the <video> element), the pads and the HID devices all stay;
+ * only the transport object is new. Anything that goes wrong falls back to how a lost link has
  * always ended.
  */
 
@@ -34,12 +34,20 @@
  *  the round trip, so the page never knocks on a door that just closed. */
 export const REATTACH_WINDOW_MS = 18000;
 
+/** Attempts per lost link before it ends as before, and the pause between. */
+export const REATTACH_TRIES = 2;
+export const REATTACH_RETRY_MS = 250;
+
 /**
  * After a network change, how long the page lets ICE show whether the path
  * survived before it reattaches without waiting for the link to be called
  * dead.
  */
 export const NETWORK_SETTLE_MS = 1000;
+
+/** The view's transports that may reattach: both WebRTC ones ('webrtc' is the
+ *  DataChannel transport). Never 'wss', whose worker ends with its socket. */
+export const REATTACH_TRANSPORTS = ['webrtc-media', 'webrtc'];
 
 /**
  * Whether a link that went may be reattached rather than relaunched.
@@ -50,7 +58,7 @@ export const NETWORK_SETTLE_MS = 1000;
  */
 export function canReattach(s) {
     return (
-        s.transport === 'webrtc-media' &&
+        REATTACH_TRANSPORTS.includes(s.transport) &&
         typeof s.token === 'string' &&
         s.token.length > 0 &&
         s.everConnected &&
@@ -59,6 +67,20 @@ export function canReattach(s) {
         !s.takenOver &&
         !s.quitting
     );
+}
+
+/**
+ * What of the browser's connection says it moved to another network. Chrome's
+ * NetworkInformation fires 'change' each time its bandwidth or round-trip
+ * ESTIMATE moves — several times a minute on a steady link — so only the
+ * kind of network (`type`, where the browser tells it) and its class
+ * (`effectiveType`) count, besides the window's 'online'.
+ * @param {{type?: string, effectiveType?: string}|null|undefined} connection
+ * @returns {string}
+ */
+export function networkKey(connection) {
+    if (!connection) return '';
+    return (connection.type || '') + '/' + (connection.effectiveType || '');
 }
 
 /**

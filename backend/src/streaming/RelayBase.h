@@ -170,8 +170,8 @@ public:
     // ── Reattach (ReattachGate.h) ─────────────────────────────────────────────
 
     /// Whether a new browser PeerConnection may take over this stream: one has
-    /// connected before and the stream is still up. Only the media transport
-    /// does it for now; the others end with their PeerConnection as before.
+    /// connected before and the stream is still up. Both WebRTC relays do it;
+    /// the WebSocket one (StreamRelay) ends with its socket as before.
     virtual bool canReattach() const { return false; }
 
     /// Drops the current PeerConnection, if any, and readies the relay for a
