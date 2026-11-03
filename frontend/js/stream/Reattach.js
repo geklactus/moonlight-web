@@ -66,6 +66,20 @@ export function canReattach(s) {
 }
 
 /**
+ * What of the browser's connection says it moved to another network. Chrome's
+ * NetworkInformation fires 'change' each time its bandwidth or round-trip
+ * ESTIMATE moves — several times a minute on a steady link — so only the
+ * kind of network (`type`, where the browser tells it) and its class
+ * (`effectiveType`) count, besides the window's 'online'.
+ * @param {{type?: string, effectiveType?: string}|null|undefined} connection
+ * @returns {string}
+ */
+export function networkKey(connection) {
+    if (!connection) return '';
+    return (connection.type || '') + '/' + (connection.effectiveType || '');
+}
+
+/**
  * Whether ICE says the path is not there right now — the states in which a
  * network change means the old pair is gone rather than merely shaken.
  * @param {string|undefined} iceState

@@ -33,7 +33,7 @@ vi.mock('../js/util/pairingCrypto.js', async (orig) => ({
 
 const { WebRtcMedia } = await import('../js/api/WebRtcMedia.js');
 const { WebRtcDataChannel } = await import('../js/api/WebRtcDataChannel.js');
-const { NETWORK_SETTLE_MS, REATTACH_WINDOW_MS, canReattach, pathDown } =
+const { NETWORK_SETTLE_MS, REATTACH_WINDOW_MS, canReattach, networkKey, pathDown } =
     await import('../js/stream/Reattach.js');
 
 describe('Reattach: when a lost link may be reattached', () => {
@@ -70,6 +70,17 @@ describe('Reattach: when a lost link may be reattached', () => {
     it('waits less than the worker does', () => {
         expect(REATTACH_WINDOW_MS).toBeLessThan(20000);
         expect(REATTACH_WINDOW_MS).toBeGreaterThan(10000);
+    });
+
+    it("names a network by its kind, not by the browser's estimates", () => {
+        expect(networkKey({ type: 'wifi', effectiveType: '4g', downlink: 9.5, rtt: 50 })).toBe(
+            networkKey({ type: 'wifi', effectiveType: '4g', downlink: 1.2, rtt: 300 }),
+        );
+        expect(networkKey({ type: 'wifi', effectiveType: '4g' })).not.toBe(
+            networkKey({ type: 'cellular', effectiveType: '4g' }),
+        );
+        expect(networkKey({ effectiveType: '4g' })).not.toBe(networkKey({ effectiveType: '3g' }));
+        expect(networkKey(undefined)).toBe('');
     });
 
     it('reads a path as gone in the states where ICE has lost it', () => {

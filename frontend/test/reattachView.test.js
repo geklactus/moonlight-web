@@ -378,3 +378,45 @@ describe('StreamView: a link that goes on the DataChannel transport', () => {
         expect(sv.onLinkLost).toHaveBeenCalledTimes(1);
     });
 });
+
+describe('StreamView: which network events count', () => {
+    let conn;
+    beforeEach(() => {
+        conn = { type: 'wifi', effectiveType: '4g', downlink: 10, rtt: 40 };
+        Object.defineProperty(navigator, 'connection', { value: conn, configurable: true });
+    });
+    afterEach(() => {
+        delete navigator.connection;
+    });
+
+    const view = () => {
+        const sv = {
+            _networkKey: 'wifi/4g',
+            _noteNetworkChange: vi.fn(),
+            _onConnectionEvent: P._onConnectionEvent,
+        };
+        return sv;
+    };
+
+    it('ignores an estimate moving', () => {
+        const sv = view();
+        conn.downlink = 1.5;
+        conn.rtt = 400;
+        sv._onConnectionEvent(new Event('change'));
+        expect(sv._noteNetworkChange).not.toHaveBeenCalled();
+    });
+
+    it('takes a new kind of network, once', () => {
+        const sv = view();
+        conn.type = 'cellular';
+        sv._onConnectionEvent(new Event('change'));
+        sv._onConnectionEvent(new Event('change'));
+        expect(sv._noteNetworkChange).toHaveBeenCalledTimes(1);
+    });
+
+    it("always takes the window's online", () => {
+        const sv = view();
+        sv._onConnectionEvent(new Event('online'));
+        expect(sv._noteNetworkChange).toHaveBeenCalledTimes(1);
+    });
+});
