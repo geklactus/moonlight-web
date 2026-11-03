@@ -1304,8 +1304,8 @@ void StreamSession::onShimConnectionStarted()
         // the path against its own origin, and the tunnel carries the socket.
         result["signalingUrl"] = m_TunnelArrival ? m_Signaling->wsPath() : m_Signaling->wsUrl();
         // What lets this page take the stream back when its PeerConnection has
-        // to be rebuilt (ReattachGate.h). Only the media transport does it.
-        if (m_Transport == "webrtc-media") result["reattachToken"] = m_Signaling->reattachToken();
+        // to be rebuilt (ReattachGate.h): both WebRTC transports, never wss.
+        result["reattachToken"] = m_Signaling->reattachToken();
     } else {
         result["signalingUrl"] = QString();
     }

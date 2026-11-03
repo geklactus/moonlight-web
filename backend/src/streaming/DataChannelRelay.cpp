@@ -697,6 +697,14 @@ DataChannelRelay::DataChannelRelay(IMediaEngine* engine, QObject* parent)
     m_StatsTimer = new QTimer(this);
     m_StatsTimer->setInterval(1000); // 1s interval — matches moonlight-qt's stats window flip
     connect(m_StatsTimer, &QTimer::timeout, this, &DataChannelRelay::onStatsTimerTick);
+
+    // A browser that went and did not come back ends the stream as before.
+    m_ReattachWindow =
+        std::make_unique<mw::reattach::Window>(this, mw::reattach::kWindowMs, [this]() {
+            qInfo() << "[DataChannelRelay] No reattach within" << mw::reattach::kWindowMs / 1000
+                    << "s — ending the stream";
+            endSession("the browser did not come back");
+        });
 }
 
 void DataChannelRelay::setClipboardEnabled(bool enabled)
@@ -1063,6 +1071,7 @@ void DataChannelRelay::setupPeerConnection(const rtc::Configuration& config)
 
     PacketMarking::apply();
     m_Pc = std::make_shared<rtc::PeerConnection>(pcConfig);
+    const uint64_t gen = ++m_PeerGen;
 
     // `sctpss=` (plan Wi-Fi W2.3): the host's small messages on the input
     // channel wait behind the video's 16 KB chunks inside usrsctp. Its stream
@@ -1078,19 +1087,23 @@ void DataChannelRelay::setupPeerConnection(const rtc::Configuration& config)
     }
 
     // --- Local description callback ---
-    m_Pc->onLocalDescription([this](const rtc::Description& sdp) {
+    m_Pc->onLocalDescription([this, gen](const rtc::Description& sdp) {
+        if (gen != m_PeerGen.load()) return;
         qInfo() << "[DataChannelRelay] Local SDP generated, type="
                 << QString::fromStdString(sdp.typeString());
         emit signalingSdpReady(std::string(sdp));
     });
 
     // --- Local ICE candidate callback ---
-    m_Pc->onLocalCandidate([this](const rtc::Candidate& candidate) {
+    m_Pc->onLocalCandidate([this, gen](const rtc::Candidate& candidate) {
+        if (gen != m_PeerGen.load()) return;
         emitLocalCandidate(candidate, "[DataChannelRelay]");
     });
 
     // --- State change callback ---
-    m_Pc->onStateChange([this](rtc::PeerConnection::State state) {
+    m_Pc->onStateChange([this, gen](rtc::PeerConnection::State state) {
+        // A replaced PeerConnection says Closed as it goes: not ours any more.
+        if (gen != m_PeerGen.load()) return;
         // This callback runs on a libdatachannel thread. QTimer is thread-affine
         // and signal-driven teardown must happen on the Qt main thread, so
         // marshal everything that touches Qt objects (avoids the
@@ -1109,6 +1122,13 @@ void DataChannelRelay::setupPeerConnection(const rtc::Configuration& config)
         } else if (state == rtc::PeerConnection::State::Disconnected ||
                    state == rtc::PeerConnection::State::Failed ||
                    state == rtc::PeerConnection::State::Closed) {
+            if (m_Stopping.load()) return;
+            // The stream ran: the host session stays, the page may come back.
+            if (m_EverConnected.load()) {
+                QMetaObject::invokeMethod(
+                    this, [this, gen]() { onPeerLost(gen); }, Qt::QueuedConnection);
+                return;
+            }
             if (!m_Stopping.exchange(true)) {
                 m_Connected = false;
                 qInfo() << "[DataChannelRelay] PC disconnected/failed/closed";
@@ -1137,6 +1157,8 @@ void DataChannelRelay::createDataChannels()
     if (!m_Pc) return;
 
     qInfo() << "[DataChannelRelay] Creating DataChannels";
+    // The PeerConnection these channels and tracks belong to (see m_PeerGen).
+    const uint64_t gen = m_PeerGen.load();
 
     // ORDER IS LOAD-BEARING: every addTrack() MUST come before the first
     // createDataChannel(). libdatachannel generates the offer on its own, and
@@ -1195,9 +1217,8 @@ void DataChannelRelay::createDataChannels()
                 qInfo() << "[DataChannelRelay] Audio offered sendrecv (MW_DSCP_CARRIER bench key)";
             }
 
-            m_AudioTrack->onOpen([this]() { qInfo() << "[DataChannelRelay] Audio Track open"; });
-            m_AudioTrack->onClosed(
-                [this]() { qInfo() << "[DataChannelRelay] Audio Track closed"; });
+            m_AudioTrack->onOpen([]() { qInfo() << "[DataChannelRelay] Audio Track open"; });
+            m_AudioTrack->onClosed([]() { qInfo() << "[DataChannelRelay] Audio Track closed"; });
             qInfo() << "[DataChannelRelay] Audio track created (Opus, PT=111)";
         } else {
             qWarning() << "[DataChannelRelay] Failed to create audio track";
@@ -1274,13 +1295,23 @@ void DataChannelRelay::createDataChannels()
             this);
     }
     if (m_VideoDc) {
-        m_VideoDc->onOpen([this]() {
+        m_VideoDc->onOpen([this, gen]() {
+            if (gen != m_PeerGen.load()) return;
             qInfo() << "[DataChannelRelay] Video DataChannel open";
             // If a keyframe arrived before the DC was ready, send it now.
             // Must marshal to main thread because sendFragmented() may access
-            // Qt objects owned by the main thread.
+            // Qt objects owned by the main thread. After a reattach, a fresh
+            // keyframe is asked for besides (onReattachedVideoOpen).
             QMetaObject::invokeMethod(
-                this, [this]() { sendBufferedKeyframe(); }, Qt::QueuedConnection);
+                this,
+                [this, gen]() {
+                    if (gen != m_PeerGen.load()) return;
+                    if (m_PeerDetached.load())
+                        onReattachedVideoOpen();
+                    else
+                        sendBufferedKeyframe();
+                },
+                Qt::QueuedConnection);
         });
         m_VideoDc->onClosed([this]() { qInfo() << "[DataChannelRelay] Video DataChannel closed"; });
     }
@@ -1331,9 +1362,11 @@ void DataChannelRelay::createDataChannels()
 
     m_InputDc = m_Pc->createDataChannel("input", inputConfig);
     if (m_InputDc) {
-        m_InputDc->onOpen([this]() {
+        m_InputDc->onOpen([this, gen]() {
+            if (gen != m_PeerGen.load()) return;
             qInfo() << "[DataChannelRelay] Input DataChannel open";
             m_Connected = true;
+            m_EverConnected = true;
             if (!m_SctpAtOpenSet.load()) {
                 m_SctpAtOpen = mw::sctp::readCounters();
                 m_SctpAtOpenSet.store(true);
@@ -1373,14 +1406,19 @@ void DataChannelRelay::createDataChannels()
                         m_StatsTimer->start();
                         qInfo() << "[DataChannelRelay] Stats timer started (2s interval)";
                     }
+                    if (m_Reattaching) {
+                        m_Reattaching = false;
+                        qInfo() << "[DataChannelRelay] Reattached: the browser is back after"
+                                << m_ReattachWindow->close() << "ms on the same host session";
+                    }
                 },
                 Qt::QueuedConnection);
         });
         m_InputDc->onClosed([this]() { qInfo() << "[DataChannelRelay] Input DataChannel closed"; });
 
         // Input messages arrive from browser on this channel
-        m_InputDc->onMessage([this](const std::variant<rtc::binary, rtc::string>& msg) {
-            if (!std::holds_alternative<rtc::string>(msg)) return;
+        m_InputDc->onMessage([this, gen](const std::variant<rtc::binary, rtc::string>& msg) {
+            if (!std::holds_alternative<rtc::string>(msg) || gen != m_PeerGen.load()) return;
             // Taken first, before any lock or parse: a stamped message reports
             // this as its arrival.
             const int64_t recvUs = steadyUs();
@@ -1416,8 +1454,8 @@ void DataChannelRelay::createDataChannels()
         hidConfig.reliability.maxRetransmits = 0;
         m_HidDc = m_Pc->createDataChannel("hid", hidConfig);
         if (m_HidDc) {
-            m_HidDc->onMessage([this](const std::variant<rtc::binary, rtc::string>& msg) {
-                if (!std::holds_alternative<rtc::binary>(msg)) return;
+            m_HidDc->onMessage([this, gen](const std::variant<rtc::binary, rtc::string>& msg) {
+                if (!std::holds_alternative<rtc::binary>(msg) || gen != m_PeerGen.load()) return;
                 const rtc::binary& frame = std::get<rtc::binary>(msg);
                 std::lock_guard<std::mutex> lk(m_InputMutex);
                 if (m_Stopping.load() || !m_InputPolicy.hid) return;
@@ -1462,8 +1500,12 @@ void DataChannelRelay::createDataChannels()
                 x ^= x << 17;
                 b = static_cast<uint8_t>(x);
             }
-            m_UltraDc->onOpen([this]() { m_UltraOpen.store(true); });
-            m_UltraDc->onClosed([this]() { m_UltraOpen.store(false); });
+            m_UltraDc->onOpen([this, gen]() {
+                if (gen == m_PeerGen.load()) m_UltraOpen.store(true);
+            });
+            m_UltraDc->onClosed([this, gen]() {
+                if (gen == m_PeerGen.load()) m_UltraOpen.store(false);
+            });
             qWarning().noquote() << "[DataChannelRelay] bench Ultra synthetic on DC#5:"
                                  << m_UltraSynthKb << "KiB per video frame,"
                                  << (m_UltraUnordered ? "unordered, no retransmission"
@@ -1492,7 +1534,8 @@ void DataChannelRelay::createDataChannels()
         m_FloodDc = m_Pc->createDataChannel("flood", floodConfig);
         if (m_FloodDc) {
             m_Flood = std::make_unique<SctpFlood>(m_FloodDc, m_FloodKbps, m_FloodBytes);
-            m_FloodDc->onOpen([this]() {
+            m_FloodDc->onOpen([this, gen]() {
+                if (gen != m_PeerGen.load()) return;
                 qInfo() << "[DataChannelRelay] Flood DataChannel open (bench)";
                 if (m_Flood && !m_Stopping.load()) m_Flood->start();
             });
@@ -1845,21 +1888,88 @@ void DataChannelRelay::onShimConnectionTerminated(int errorCode)
     // the host side failing (Sunshine crashed, its encoder hung the GPU, the
     // native engine died): the browser link is fine, so say which side went.
     sendExitNotice(errorCode == ML_ERROR_GRACEFUL_TERMINATION ? "host-ended" : "host-lost");
-    if (!m_Stopping.exchange(true)) {
-        m_Connected = false;
-        emit sessionEnded();
-    }
+    endSession("the host connection ended");
 }
 
 void DataChannelRelay::endFromSignaling()
 {
     // No exit notice: there is no channel to the page yet, only the signalling
     // socket, which is the side that gave up.
+    endSession("signalling gave up");
+}
+
+void DataChannelRelay::endSession(const char* why)
+{
+    if (m_ReattachWindow) m_ReattachWindow->close();
     if (!m_Stopping.exchange(true)) {
         m_Connected = false;
         if (m_IceCheckTimer) m_IceCheckTimer->stop();
+        qInfo() << "[DataChannelRelay] Session ends:" << why;
         emit sessionEnded();
     }
+}
+
+// --- Reattach (ReattachGate.h) ---
+
+void DataChannelRelay::onPeerLost(uint64_t gen)
+{
+    if (gen != m_PeerGen.load() || m_Stopping.load()) return;
+    qInfo() << "[DataChannelRelay] PeerConnection lost after the stream ran — keeping the host"
+            << "session, waiting up to" << mw::reattach::kWindowMs / 1000
+            << "s for the page to reattach";
+    closePeer();
+    m_PeerDetached = true;
+    m_Reattaching = false;
+    m_ReattachWindow->open();
+}
+
+bool DataChannelRelay::beginReattach()
+{
+    if (m_Stopping.load() || !m_EverConnected.load()) return false;
+    // The page may notice a dead path before we do: libjuice only gives up on
+    // a pair after its consent timeout (30 s).
+    if (m_Pc) {
+        qInfo() << "[DataChannelRelay] Reattach: the page is back before its old PeerConnection"
+                << "went here — dropping it";
+        closePeer();
+    }
+    m_PeerDetached = true;
+    m_ReattachWindow->open();
+    m_Reattaching = true;
+    qInfo() << "[DataChannelRelay] Reattach: building a new PeerConnection for the page";
+    return true;
+}
+
+void DataChannelRelay::onReattachedVideoOpen()
+{
+    // Whatever the gap left in the buffer is at best seconds old, and the
+    // throttle may have backed off while no channel could take a keyframe:
+    // start it over, show the buffered keyframe if there is one (it keeps the
+    // delta gate shut: m_AwaitingIdr), and ask for a fresh one at once.
+    {
+        std::lock_guard<std::mutex> lk(m_VideoMutex);
+        m_PeerDetached = false;
+        m_AwaitingIdr = true;
+        m_IdrWaitsForDrain = false;
+        m_IdrOutstanding = false;
+        m_IdrCooldownMs = kIdrCooldownBaseMs;
+        m_IdrCooldownTimer.invalidate();
+    }
+    sendBufferedKeyframe();
+    std::lock_guard<std::mutex> lk(m_VideoMutex);
+    if (m_AwaitingIdr) {
+        qInfo() << "[DataChannelRelay] Reattach: video path open — asking for a fresh keyframe";
+        sendIdrRequestThrottled();
+    }
+}
+
+void DataChannelRelay::sendToClient(const QByteArray& json)
+{
+    std::lock_guard<std::mutex> lk(m_InputMutex);
+    if (m_Stopping.load() || !m_InputDc || !m_InputDc->isOpen()) return;
+    try {
+        m_InputDc->send(std::string(json.constData(), json.size()));
+    } catch (const std::exception&) {}
 }
 
 // --- Input handling ---
@@ -3130,18 +3240,42 @@ void DataChannelRelay::stop()
 
     // The microphone's device first: nothing more will come for it.
     stopMic();
+    if (m_ReattachWindow) m_ReattachWindow->close();
+    m_Reattaching = false;
 
-    // Stop ICE timeout timer
-    if (m_IceCheckTimer) {
-        m_IceCheckTimer->stop();
+    closePeer();
+
+    if (m_Loss.active())
+        qInfo() << "[DataChannelRelay] bench losses:" << m_Loss.dropped() << "video messages in"
+                << m_Loss.losses() << "losses this session";
+
+    // Stop the sender thread AFTER closing the DataChannels (closePeer): a send
+    // that is blocked on a full SCTP buffer errors out promptly once the
+    // channel closes, so join() can't stall the /quit path. The worker holds
+    // its own shared_ptr to the (now closed) channel, so the in-flight send is
+    // exception-safe.
+    if (m_Sender) {
+        m_Sender->stop();
     }
 
-    // Stop stats timer
-    if (m_StatsTimer) {
-        m_StatsTimer->stop();
-    }
+    qInfo() << "[DataChannelRelay::stop] EXIT";
+}
 
-    // Close DataChannels
+void DataChannelRelay::closePeer()
+{
+    // What a PeerConnection owns, and goes with it. Kept across a reattach,
+    // because they belong to the host session or to the whole session's
+    // record: the media engine and its direct sink, the sender thread (each
+    // job names its channel), the frame id sequence and its frame-number ring
+    // (the page resets its gap detection on a new transport), the frame log,
+    // usrsctp's counters at the first open, the HEVC patch flag (same SPS).
+
+    // From here on the old PeerConnection's callbacks are no longer ours.
+    ++m_PeerGen;
+
+    if (m_IceCheckTimer) m_IceCheckTimer->stop();
+    if (m_StatsTimer) m_StatsTimer->stop();
+
     auto closeDc = [](std::shared_ptr<rtc::DataChannel>& dc, const char* name) {
         if (dc) {
             qInfo() << "[DataChannelRelay] Closing" << name << "DataChannel";
@@ -3152,35 +3286,51 @@ void DataChannelRelay::stop()
         }
     };
 
-    // Video state and the video DC go under the video lock: in direct mode a
-    // frame may be halfway through onVideoFrame on the capture thread right
-    // now, and it must find either an open channel or a null one — never a
-    // channel being reset under it. m_Stopping is already true, so the next
-    // frame to take the lock leaves at once.
+    // Video state, the video DC and the RTP video tracks go under the video
+    // lock: a frame may be halfway through handleVideoFrame on the capture
+    // thread, and it must find either an open path or none.
     {
         std::lock_guard<std::mutex> lk(m_VideoMutex);
 
-        // Reset backpressure counters and IDR state for next session
+        // Drop counters and the IDR throttle: per connection, and a backed-off
+        // cooldown would hold the next connection's first keyframe.
         m_DeltaDroppedCount = 0;
         m_NamedDeltaDropCount = 0;
         m_KeyframeBackpressureWarnings = 0;
         m_BackpressureDropCount = 0;
         m_AwaitingIdrDropCount = 0;
         m_LastDecodeLatencyUs.store(0, std::memory_order_release);
-        m_AwaitingIdr = false;
-        m_IdrCooldownTimer.invalidate(); // Reset throttle state
+        m_IdrCooldownTimer.invalidate();
         m_IdrCooldownMs = kIdrCooldownBaseMs;
         m_IdrOutstanding = false;
-
-        // Clear buffered keyframe (if any)
+        m_IdrWaitsForDrain = false;
+        // The next channel's first frame must be a keyframe: deltas from here
+        // reference frames that channel never carried.
+        m_AwaitingIdr = true;
+        // A keyframe held for the old channel is no use to the next, whose
+        // own wait starts now (sendBufferedKeyframe keeps what arrives later).
         m_BufferedKeyframe.clear();
         m_BufferedKeyframePresUs = -1;
         m_HaveBufferedKeyframe = false;
         m_NewKeyframeArrived = false;
+        // The SCTP backlog was the old association's.
+        m_Backlog.reset();
 
         m_Connected = false;
-
         closeDc(m_VideoDc, "video");
+
+        // The bench's RTP video road (U1.4): the answer decides again.
+        m_RtpVideoAccepted.store(false);
+        m_UltraRtpAccepted.store(false);
+        m_RtpVideoSentKeyframe = false;
+        for (auto* track : {&m_VideoTrack, &m_UltraTrack}) {
+            if (*track) {
+                try {
+                    (*track)->close();
+                } catch (...) {}
+                track->reset();
+            }
+        }
     }
 
     closeDc(m_InputDc, "input");
@@ -3205,21 +3355,26 @@ void DataChannelRelay::stop()
         m_Flood->stop();
         m_Flood.reset();
     }
-    if (m_Loss.active())
-        qInfo() << "[DataChannelRelay] bench losses:" << m_Loss.dropped() << "video messages in"
-                << m_Loss.losses() << "losses this session";
 
     // Direct input: a message may be halfway through injection on a
-    // libdatachannel thread. Wait it out — m_Stopping is set, so the next one
-    // to take the lock leaves at once — before the caller goes on to stop the
-    // engine the message is injecting into. Taken with no other relay lock
-    // held (see the ordering note on m_InputMutex).
+    // libdatachannel thread. Wait it out — the channel is closed and the
+    // generation moved, so the next one leaves at once — before the caller
+    // goes on. Taken with no other relay lock held (see the ordering note on
+    // m_InputMutex).
     if (m_DirectInput) {
         std::lock_guard<std::mutex> lk(m_InputMutex);
     }
 
+    // The link report's state was the old path's: its silence across the gap
+    // is the reattach, not a link freeze, and its SCTP and RTT readings start
+    // over with the new association.
+    m_LastLinkstatsMs = 0;
+    m_LinkSctpSet = false;
+    m_SrttMs.store(-1);
+
     // Close the audio track under the audio send lock, so an in-flight audio
-    // sendFrame finishes before the track is destroyed.
+    // sendFrame finishes before the track is destroyed. The next track has a
+    // new SSRC and starts its own RTP clock.
     {
         std::lock_guard<std::mutex> lk(m_AudioMutex);
         if (m_AudioTrack) {
@@ -3229,6 +3384,7 @@ void DataChannelRelay::stop()
             } catch (...) {}
             m_AudioTrack.reset();
         }
+        m_AudioRtpTs = 0;
     }
     // The bench's silent video section: nothing was ever sent on it.
     if (m_RxBufTrack) {
@@ -3236,14 +3392,6 @@ void DataChannelRelay::stop()
             m_RxBufTrack->close();
         } catch (...) {}
         m_RxBufTrack.reset();
-    }
-
-    // Stop the sender thread AFTER closing the DataChannels: a send that is
-    // blocked on a full SCTP buffer errors out promptly once the channel closes,
-    // so join() can't stall the /quit path. The worker holds its own shared_ptr
-    // to the (now closed) channel, so the in-flight send is exception-safe.
-    if (m_Sender) {
-        m_Sender->stop();
     }
 
     // Close PeerConnection
@@ -3254,8 +3402,6 @@ void DataChannelRelay::stop()
         } catch (...) {}
         m_Pc.reset();
     }
-
-    qInfo() << "[DataChannelRelay::stop] EXIT";
 }
 
 void DataChannelRelay::requestIdrFrame()
@@ -3281,6 +3427,10 @@ void DataChannelRelay::requestIdrOnDrain()
 void DataChannelRelay::sendIdrRequestThrottled()
 {
     if (m_Stopping.load() || !m_Shim) return;
+
+    // Between two PeerConnections nobody would see the keyframe, and one that
+    // is not sent counts against the cooldown: the new video path asks.
+    if (m_PeerDetached.load()) return;
 
     // The gate is dropping keyframes until the buffer moves; the drain asks.
     if (m_IdrWaitsForDrain) return;
@@ -3309,6 +3459,16 @@ void DataChannelRelay::onIceCheckTimeout()
 {
     if (m_Stopping.load()) return;
     if (m_Connected) return; // Safety: should not happen since we cancel on Connected
+
+    if (m_Reattaching) {
+        // No transport fallback for a stream that already runs: the page may
+        // try again while the window lasts.
+        qWarning() << "[DataChannelRelay] Reattach: ICE did not connect within" << m_IceTimeoutMs
+                   << "ms — dropping this attempt";
+        m_Reattaching = false;
+        closePeer();
+        return;
+    }
 
     qWarning() << "[DataChannelRelay] ICE timeout — PC did not reach Connected within"
                << m_IceTimeoutMs << "ms."
@@ -3342,6 +3502,7 @@ bool DataChannelRelay::rtpVideoActive() const
 void DataChannelRelay::createRtpVideoTracks()
 {
     if (m_RtpVideoSpec.isEmpty() || !m_Pc || !m_Shim) return;
+    const uint64_t gen = m_PeerGen.load();
     // `native:h264+hevc;other:h264`: the section of this host's type.
     QStringList named;
     const QString wanted =
@@ -3377,11 +3538,16 @@ void DataChannelRelay::createRtpVideoTracks()
         auto cfg = std::make_shared<rtc::RtpPacketizationConfig>(
             ssrc, "vaudio", static_cast<uint8_t>(pt), rtc::OpusRtpPacketizer::DefaultClockRate);
         m_VideoTrack->setMediaHandler(std::make_shared<rtc::OpusRtpPacketizer>(cfg));
-        m_VideoTrack->onOpen([this]() {
+        m_VideoTrack->onOpen([this, gen]() {
             qInfo() << "[DataChannelRelay] RTP video track open (audio road)";
             QMetaObject::invokeMethod(
                 this,
-                [this]() {
+                [this, gen]() {
+                    if (gen != m_PeerGen.load()) return;
+                    if (m_PeerDetached.load()) {
+                        onReattachedVideoOpen();
+                        return;
+                    }
                     sendBufferedKeyframe();
                     std::lock_guard<std::mutex> lk(m_VideoMutex);
                     if (!m_RtpVideoSentKeyframe) sendIdrRequestThrottled();
@@ -3426,11 +3592,16 @@ void DataChannelRelay::createRtpVideoTracks()
         });
         nack->addToChain(pli);
         m_VideoTrack->setMediaHandler(packetizer);
-        m_VideoTrack->onOpen([this]() {
+        m_VideoTrack->onOpen([this, gen]() {
             qInfo() << "[DataChannelRelay] RTP video track open";
             QMetaObject::invokeMethod(
                 this,
-                [this]() {
+                [this, gen]() {
+                    if (gen != m_PeerGen.load()) return;
+                    if (m_PeerDetached.load()) {
+                        onReattachedVideoOpen();
+                        return;
+                    }
                     sendBufferedKeyframe();
                     std::lock_guard<std::mutex> lk(m_VideoMutex);
                     if (!m_RtpVideoSentKeyframe) sendIdrRequestThrottled();
