@@ -421,6 +421,18 @@ void SignalingServer::onNewWsConnection()
                 << m_UpnpExternalPort;
     }
 
+    // A stream that already ran: this socket is its page coming back, and must
+    // say so with its token before anything is built (ReattachGate.h).
+    if (m_Relay->canReattach()) {
+        m_ReattachConfig = std::make_unique<rtc::Configuration>(config);
+        m_ReattachIsInternet = isInternet;
+        m_ReattachGate.expect();
+        qInfo() << "[SignalingServer] Client connected to a running stream — waiting for its"
+                << "reattach";
+        emit clientConnected();
+        return;
+    }
+
     // Prepare the PeerConnection + DataChannels
     // This will trigger signalingSdpReady with the SDP offer to send to browser
     m_Relay->prepare(config, isInternet);
@@ -441,6 +453,23 @@ void SignalingServer::onWsTextMessage(const QString& message)
 
     QJsonObject msg = doc.object();
     QString type = msg["type"].toString();
+
+    if (m_ReattachGate.expecting()) {
+        const auto verdict = m_ReattachGate.offer(type, msg["token"].toString());
+        if (verdict != mw::reattach::Gate::Verdict::Accepted) {
+            refuseReattach(QString::fromLatin1(mw::reattach::Gate::describe(verdict)));
+            return;
+        }
+        if (!m_ReattachConfig || !m_Relay->beginReattach()) {
+            refuseReattach(QStringLiteral("the stream can no longer take a browser"));
+            return;
+        }
+        m_ReattachInFlight = true;
+        qInfo() << "[SignalingServer] Reattach accepted — preparing a new PeerConnection";
+        m_Relay->prepare(*m_ReattachConfig, m_ReattachIsInternet);
+        m_ReattachConfig.reset();
+        return;
+    }
 
     // In WS fallback mode, text messages from the browser carry input commands
     // (keydown, mousemove, etc.) instead of signaling (sdp, ice).
@@ -596,6 +625,10 @@ void SignalingServer::onWsDisconnected()
 
     bool wasComplete = m_SignalingComplete;
     m_SignalingComplete = false;
+    if (m_ReattachGate.expecting()) {
+        m_ReattachGate.cancel();
+        m_ReattachConfig.reset();
+    }
 
     qInfo() << "[SignalingServer::onWsDisconnected] Emitting clientDisconnected";
     emit clientDisconnected();
@@ -985,6 +1018,18 @@ void SignalingServer::abortSignaling(const QString& reason)
     emit sessionEnded();
 }
 
+void SignalingServer::refuseReattach(const QString& reason)
+{
+    // Not abortSignaling(): that ends the session, and a stranger's socket must
+    // not end someone's running stream.
+    qWarning() << "[SignalingServer] Reattach refused:" << reason;
+    m_ReattachConfig.reset();
+    if (m_WsClient && m_WsClient->isValid()) {
+        m_WsClient->close(QWebSocketProtocol::CloseCodePolicyViolated,
+                          QStringLiteral("reattach refused"));
+    }
+}
+
 void SignalingServer::sendSignedOffer()
 {
     if (m_PendingOffer.empty()) return;
@@ -1120,6 +1165,16 @@ void SignalingServer::onDataChannelsOpen()
 {
     qInfo() << "[SignalingServer] DataChannels are open (SCTP established)";
     m_DataChannelsOpen = true;
+
+    if (m_ReattachInFlight) {
+        // The token that brought the page back is spent; it gets the next one
+        // over the channel that just opened.
+        m_ReattachInFlight = false;
+        const QJsonObject next{{QStringLiteral("type"), QStringLiteral("reattach-token")},
+                               {QStringLiteral("token"), m_ReattachGate.rotate()}};
+        m_Relay->sendToClient(QJsonDocument(next).toJson(QJsonDocument::Compact));
+        qInfo() << "[SignalingServer] Reattach complete — the page has its next token";
+    }
 
     // The browser side will close the signaling WS once it detects
     // all DCs are open.  From this point on, WS closure is expected

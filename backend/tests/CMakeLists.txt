@@ -95,6 +95,7 @@ add_executable(run_tests
     test_rxbuf_section.cpp
     test_capture_key.cpp
     test_signaling_wait.cpp
+    test_reattach_gate.cpp
     test_single_session_hosts.cpp
     test_stream_ends.cpp
     test_host_lag_tracker.cpp

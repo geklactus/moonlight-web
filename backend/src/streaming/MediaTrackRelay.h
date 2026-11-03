@@ -18,6 +18,7 @@
 #pragma once
 
 #include "RelayBase.h"
+#include "ReattachGate.h"
 #include <QByteArray>
 #include <QMutex>
 #include <QTimer>
@@ -82,6 +83,10 @@ public:
 
     IMediaEngine* mediaEngine() const override { return m_Shim; }
 
+    bool canReattach() const override { return m_EverConnected.load() && !m_Stopping.load(); }
+    bool beginReattach() override;
+    void sendToClient(const QByteArray& json) override;
+
     /// Enable bidirectional text clipboard sync. Only called with true when
     /// the streamed host is this machine (the backend clipboard IS the host
     /// clipboard) — see ClipboardBridge. Must be called before the relay is
@@ -118,6 +123,18 @@ private:
     void onKeyboardMousePolicyChanged() override { sendInputCaps(); }
 
     void setupPeerConnection(const rtc::Configuration& config);
+
+    /// Tears down the browser side only — channels, tracks, PeerConnection and
+    /// their per-connection state — leaving the media engine and the host
+    /// session alone. stop() and a reattach both go through it.
+    void closePeer();
+
+    /// The PeerConnection of generation `gen` went after the stream had run:
+    /// drop it and wait for the page to reattach (relay thread).
+    void onPeerLost(uint64_t gen);
+
+    /// Ends the stream as a lost PeerConnection always did.
+    void endSession(const char* why);
     void createTracksAndChannels();
     void onInputMessage(const std::string& message);
 
@@ -169,6 +186,17 @@ private:
 
     std::atomic<bool> m_Connected{false};
     std::atomic<bool> m_Stopping{false};
+
+    // ── Reattach ────────────────────────────────────────────────────────────
+    // Each PeerConnection gets a generation; callbacks of an older one (its
+    // Closed, a late candidate) find a newer number here and do nothing.
+    std::atomic<uint64_t> m_PeerGen{0};
+    // A browser connected once: a lost PeerConnection waits for a reattach
+    // instead of ending the stream.
+    std::atomic<bool> m_EverConnected{false};
+    // A new PeerConnection is being built for a page that came back.
+    bool m_Reattaching = false;
+    std::unique_ptr<mw::reattach::Window> m_ReattachWindow;
     // Bidirectional clipboard sync (only when the streamed host is this
     // machine). Written once on the main thread before the relay moves to its
     // dedicated thread, read from relay/libdatachannel threads afterwards.
