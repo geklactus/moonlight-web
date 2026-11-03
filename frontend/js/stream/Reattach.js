@@ -34,6 +34,10 @@
  *  the round trip, so the page never knocks on a door that just closed. */
 export const REATTACH_WINDOW_MS = 18000;
 
+/** Attempts per lost link before it ends as before, and the pause between. */
+export const REATTACH_TRIES = 2;
+export const REATTACH_RETRY_MS = 250;
+
 /**
  * After a network change, how long the page lets ICE show whether the path
  * survived before it reattaches without waiting for the link to be called
