@@ -3121,8 +3121,18 @@ export class StreamView {
      */
     _recordCongestionEvent(reason) {
         if (!this.onCongestion || this._quitting || this._manualQuitting) return;
+        // A hidden page is not a congested link: a phone in the background
+        // freezes the page, frames wait in the channel and land in one burst
+        // on thaw, as frame gaps, backend drops and reference-invalid retries
+        // — four of them in a few seconds, which read as sustained congestion
+        // and relaunched a clean stream one rung down (02/11/2026, Android,
+        // 4 s in the background: the ladder moved a 720p stream to the media
+        // transport at half its bitrate). Nothing measured while hidden, or
+        // in the first seconds back, is the link's doing.
+        if (document.visibilityState === 'hidden') return;
         const now = performance.now();
         if (now - this._startTime < 10000) return;
+        if (this._resumedAt && now - this._resumedAt < 10000) return;
         // Every recorded signal (not just sustained detections) is reported so
         // the app can measure quiet time for the automatic quality upgrade.
         if (typeof this.onCongestionSignal === 'function') this.onCongestionSignal();
@@ -6115,6 +6125,10 @@ export class StreamView {
     _resyncAfterHidden() {
         if (!this.connected) return;
         console.log('[StreamView] Back from the background — timing re-primed, pads repeated');
+        // What the congestion monitor counted while we were away was the
+        // freeze, not the link (see _recordCongestionEvent).
+        this._congEvents.length = 0;
+        this._resumedAt = performance.now();
         this._stallDetector.reset();
         this._clearPacingTimer();
         if (this._framePacer) this._framePacer.reset();
