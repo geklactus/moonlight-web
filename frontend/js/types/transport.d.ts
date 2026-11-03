@@ -22,6 +22,10 @@ export type StreamTransport = (WebRtcDataChannel | WebRtcMedia) & {
     setVideoElement?: (videoEl: HTMLVideoElement) => void;
     /** Adaptive playout delay, driven by `JitterController`. */
     setVideoJitterBufferTarget?: (ms: number) => void;
+    /** The browser's network changed: give the link up now if its path went. */
+    noteNetworkChange?: () => void;
+    /** The host's next reattach token (stream/Reattach.js). */
+    onReattachToken?: ((token: string) => void) | null;
 
     // ── DataChannel / WSS only ───────────────────────────────────────────────
     /** Reassembled Annex B frame ready for `VideoDecoder`. */
