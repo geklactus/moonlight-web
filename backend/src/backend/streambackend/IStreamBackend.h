@@ -133,8 +133,10 @@ struct BackendCapabilities
     // launch of the same app joins it again — Moonlight's own model: Stop
     // disconnects, "Quit app" is a separate, explicit action. True for a plain
     // GameStream host (Sunshine and its forks), which runs one app at a time and
-    // names it in serverinfo (`currentgame`). False where the app is not ours to
-    // keep: Wolf reaps its sessions, the native host has displays, not apps.
+    // names it in serverinfo (`currentgame`), and for Wolf, which pauses a
+    // session whose client went and resumes it on the next launch (its
+    // container is stopped only by /cancel). False where the app is not ours
+    // to keep: the native host has displays, not apps.
     bool resumableApps = false;
     // Which app runs is a per-device answer: each device has a seat of its own
     // (MultiSeat), so the host-wide `currentgame` the poll reads means nothing,
