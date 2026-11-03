@@ -147,7 +147,13 @@ import { CadenceStepper, autostepEnabled, stepMemory } from '../stream/CadenceSt
 import { LatencyProbe } from '../stream/LatencyProbe.js';
 import { InputUplink } from '../stream/InputUplink.js';
 import { LINK_STALL_MS, LINK_STALL_PROBE_MS } from '../stream/CrashRelaunch.js';
-import { REATTACH_WINDOW_MS, canReattach, networkKey } from '../stream/Reattach.js';
+import {
+    REATTACH_RETRY_MS,
+    REATTACH_TRIES,
+    REATTACH_WINDOW_MS,
+    canReattach,
+    networkKey,
+} from '../stream/Reattach.js';
 import { t } from '../i18n/i18n.js';
 import { VdGpuApartWatch, takeVdGpuApartNotice } from '../util/vdGpuApartNotice.js';
 
@@ -593,6 +599,9 @@ export class StreamView {
         this._reattachStartedAt = 0;
         /** @type {(() => void)|null} the picture-back log, on the DataChannel transport */
         this._reattachPictureBack = null;
+        /** @type {any} the first transport, whose settings each attempt copies */
+        this._reattachFrom = null;
+        this._reattachTries = 0;
         // ── Player mode (invited guest) ─────────────────────────────────────
         // A player's view is the same stream pipeline with the owner's controls
         // taken away: Stop becomes Leave (their leaving must not end the game),
@@ -5482,7 +5491,19 @@ export class StreamView {
      */
     _reattachTransport(why) {
         if (this._reattaching) {
-            // The new connection failed in its turn.
+            // The new connection failed in its turn. Once, it may be the
+            // moment rather than the path (seen: a new PeerConnection failing
+            // 14 ms in, cause unconfirmed): the host's window is still open
+            // and the token unspent, so try again before giving up.
+            const failed = /** @type {any} */ (this.webrtc);
+            for (const cb of ['onOpen', 'onClose', 'onError', 'onReattachToken']) failed[cb] = null;
+            if (this._reattachTries < REATTACH_TRIES) {
+                console.warn('[StreamView] Reattach attempt failed (' + why + ') — once more');
+                failed.markStopping();
+                failed.close();
+                setTimeout(() => this._buildReattachTransport(), REATTACH_RETRY_MS);
+                return true;
+            }
             this._abandonReattach('the new connection failed: ' + why);
             return true;
         }
@@ -5539,30 +5560,38 @@ export class StreamView {
                 ),
             REATTACH_WINDOW_MS,
         );
+        // What the next transports copy from the first (see its constructor).
+        this._reattachFrom = old;
+        this._reattachTries = 0;
         // Once the old transport's own teardown has run.
-        setTimeout(() => {
-            if (!this._reattaching || this._quitting || this._manualQuitting) return;
-            const Transport = this._transport === 'webrtc-media' ? WebRtcMedia : WebRtcDataChannel;
-            const next = /** @type {any} */ (
-                new Transport(this.signalingUrl, { reattachToken: this._reattachToken })
-            );
-            // What the view set on the first transport (see its constructor).
-            for (const key of [
-                '_chainFallback',
-                '_unpairedGuest',
-                'audioElement',
-                'mic',
-                'rideOutLoss',
-                'healsByInvalidation',
-                'rideOutFrames',
-            ])
-                if (old[key] !== undefined) next[key] = old[key];
-            if (typeof next.setVideoElement === 'function') next.setVideoElement(this.videoEl);
-            this.webrtc = /** @type {StreamTransport} */ (next);
-            this._wireTransportMessages();
-            this.setupWebRtc();
-        }, 0);
+        setTimeout(() => this._buildReattachTransport(), 0);
         return true;
+    }
+
+    /** One attempt: a new transport to the same worker, with the token. */
+    _buildReattachTransport() {
+        if (!this._reattaching || this._quitting || this._manualQuitting) return;
+        this._reattachTries++;
+        const old = this._reattachFrom;
+        const Transport = this._transport === 'webrtc-media' ? WebRtcMedia : WebRtcDataChannel;
+        const next = /** @type {any} */ (
+            new Transport(this.signalingUrl, { reattachToken: this._reattachToken })
+        );
+        // What the view set on the first transport (see its constructor).
+        for (const key of [
+            '_chainFallback',
+            '_unpairedGuest',
+            'audioElement',
+            'mic',
+            'rideOutLoss',
+            'healsByInvalidation',
+            'rideOutFrames',
+        ])
+            if (old[key] !== undefined) next[key] = old[key];
+        if (typeof next.setVideoElement === 'function') next.setVideoElement(this.videoEl);
+        this.webrtc = /** @type {StreamTransport} */ (next);
+        this._wireTransportMessages();
+        this.setupWebRtc();
     }
 
     /**
@@ -5595,6 +5624,7 @@ export class StreamView {
         this._reattachTimer = null;
         this._reattachToken = null;
         this._reattachPictureBack = null;
+        this._reattachFrom = null;
         const transport = this.webrtc;
         if (transport) {
             transport.onOpen = null;

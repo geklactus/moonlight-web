@@ -40,7 +40,7 @@ vi.mock('../js/api/WebRtcDataChannel.js', () => ({
 
 const { StreamView } = await import('../js/ui/StreamView.js');
 const P = StreamView.prototype;
-const { REATTACH_WINDOW_MS } = await import('../js/stream/Reattach.js');
+const { REATTACH_RETRY_MS, REATTACH_WINDOW_MS } = await import('../js/stream/Reattach.js');
 
 /** The transport a view starts with. */
 function firstTransport() {
@@ -113,6 +113,7 @@ function reattachView(overrides = {}) {
         _reportConnectionFailed: P._reportConnectionFailed,
         _reattachTransport: P._reattachTransport,
         _abandonReattach: P._abandonReattach,
+        _buildReattachTransport: P._buildReattachTransport,
         _reprimeAfterReattach: P._reprimeAfterReattach,
         _wireTransportMessages: P._wireTransportMessages,
         _noteNetworkChange: P._noteNetworkChange,
@@ -202,18 +203,37 @@ describe('StreamView: a link that goes on the media transport', () => {
         expect(built[1].options).toEqual({ reattachToken: 'tok1' });
     });
 
-    it('hands the loss on as before when the new transport fails', () => {
+    it('tries once more when the new transport fails, with the same token', () => {
         const sv = reattachView();
         loseLink(sv.webrtc);
         vi.advanceTimersByTime(0);
-        const next = built[0];
-        loseLink(next);
+        const first = built[0];
+        loseLink(first);
+        expect(first.close).toHaveBeenCalled();
+        expect(sv.onLinkLost).not.toHaveBeenCalled();
+        vi.advanceTimersByTime(REATTACH_RETRY_MS);
+        expect(built).toHaveLength(2);
+        expect(built[1].options).toEqual({ reattachToken: 'tok0' });
+        built[1].onOpen();
+        expect(sv._reattaching).toBe(false);
+        vi.advanceTimersByTime(REATTACH_WINDOW_MS * 2);
+        expect(sv.onLinkLost).not.toHaveBeenCalled();
+    });
+
+    it('hands the loss on as before when the second attempt fails too', () => {
+        const sv = reattachView();
+        loseLink(sv.webrtc);
+        vi.advanceTimersByTime(0);
+        loseLink(built[0]);
+        vi.advanceTimersByTime(REATTACH_RETRY_MS);
+        const second = built[1];
+        loseLink(second);
         vi.runAllTimers();
-        expect(next.markStopping).toHaveBeenCalled();
-        expect(next.close).toHaveBeenCalled();
+        expect(second.markStopping).toHaveBeenCalled();
+        expect(second.close).toHaveBeenCalled();
         expect(sv.onLinkLost).toHaveBeenCalledTimes(1);
-        expect(sv._reattachToken).toBe(null); // no second try on a spent token
-        expect(built).toHaveLength(1);
+        expect(sv._reattachToken).toBe(null);
+        expect(built).toHaveLength(2);
     });
 
     it('hands the loss on as before when the worker does not answer in time', () => {
