@@ -3497,6 +3497,9 @@ export const MoonlightApp = {
             // What the host knows this stream by: asked how it ended once its
             // link goes (_onLiveLinkLost).
             streamId: typeof result.stream_id === 'string' ? result.stream_id : '',
+            // Lets the view rebuild its PeerConnection under the same stream
+            // when its path changes (stream/Reattach.js). Media transport only.
+            reattachToken: typeof result.reattachToken === 'string' ? result.reattachToken : '',
         };
         // The degradation ladder stands down for the native host — see
         // _onStreamCongested.

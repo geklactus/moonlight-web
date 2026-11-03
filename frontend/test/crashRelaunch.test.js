@@ -146,6 +146,8 @@ function linkView(overrides = {}) {
         setStatus: vi.fn(),
         quit: vi.fn(async () => {}),
         _reportConnectionFailed: StreamView.prototype._reportConnectionFailed,
+        // No reattach token here: the link goes on to the app as it always did.
+        _reattachTransport: StreamView.prototype._reattachTransport,
         _handOffLinkLoss: StreamView.prototype._handOffLinkLoss,
         _linkLostDefault: StreamView.prototype._linkLostDefault,
         ...overrides,
