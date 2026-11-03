@@ -165,6 +165,24 @@ describe('WebRtcMedia: reattaching', () => {
         t.close();
     });
 
+    it('cuts the disconnect grace short after a network change', () => {
+        const t = new WebRtcMedia('wss://host/ws');
+        const onError = vi.fn();
+        t.onError = onError;
+        t.connect();
+        sockets[0].onopen();
+        t.connected = true;
+        t._iceConnected = true;
+        peers[0].iceConnectionState = 'disconnected';
+        peers[0].oniceconnectionstatechange(); // the grace starts
+        t.noteNetworkChange();
+        vi.advanceTimersByTime(NETWORK_SETTLE_MS);
+        expect(onError).toHaveBeenCalledTimes(1);
+        expect(NETWORK_SETTLE_MS).toBeLessThan(t.DISCONNECT_GRACE_MS);
+        vi.advanceTimersByTime(t.DISCONNECT_GRACE_MS);
+        expect(onError).toHaveBeenCalledTimes(1); // the grace's own end went with the close
+    });
+
     it('ignores a network change before it connected or once closed', () => {
         const t = new WebRtcMedia('wss://host/ws');
         const onError = vi.fn();
