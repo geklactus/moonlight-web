@@ -32,6 +32,7 @@ vi.mock('../js/util/pairingCrypto.js', async (orig) => ({
 }));
 
 const { WebRtcMedia } = await import('../js/api/WebRtcMedia.js');
+const { WebRtcDataChannel } = await import('../js/api/WebRtcDataChannel.js');
 const { NETWORK_SETTLE_MS, REATTACH_WINDOW_MS, canReattach, pathDown } =
     await import('../js/stream/Reattach.js');
 
@@ -46,13 +47,13 @@ describe('Reattach: when a lost link may be reattached', () => {
         quitting: false,
     };
 
-    it('on the media transport, with a token, once the stream ran', () => {
+    it('on either WebRTC transport, with a token, once the stream ran', () => {
         expect(canReattach(base)).toBe(true);
+        expect(canReattach({ ...base, transport: 'webrtc' })).toBe(true); // DataChannel
     });
 
     it('never otherwise', () => {
         for (const change of [
-            { transport: 'webrtc' },
             { transport: 'wss' },
             { token: null },
             { token: '' },
@@ -81,8 +82,13 @@ describe('Reattach: when a lost link may be reattached', () => {
     });
 });
 
-describe('WebRtcMedia: reattaching', () => {
+describe.each([
+    ['WebRtcMedia', WebRtcMedia],
+    ['WebRtcDataChannel', WebRtcDataChannel],
+])('%s: reattaching', (_name, Transport) => {
     let peers;
+    /** A signalling message from the host. */
+    const hostSays = (msg) => sockets[0].onmessage({ data: JSON.stringify(msg) });
     beforeEach(() => {
         sockets.length = 0;
         peers = [];
@@ -107,7 +113,7 @@ describe('WebRtcMedia: reattaching', () => {
     });
 
     it('says reattach, with its token, before anything else', () => {
-        const t = new WebRtcMedia('wss://host/ws', { reattachToken: 'tok0' });
+        const t = new Transport('wss://host/ws', { reattachToken: 'tok0' });
         t.connect();
         sockets[0].onopen();
         expect(JSON.parse(sockets[0].sent[0])).toEqual({ type: 'reattach', token: 'tok0' });
@@ -115,19 +121,21 @@ describe('WebRtcMedia: reattaching', () => {
     });
 
     it('says nothing of the kind on a first connection', () => {
-        const t = new WebRtcMedia('wss://host/ws');
+        const t = new Transport('wss://host/ws');
         t.connect();
         sockets[0].onopen();
+        hostSays({ type: 'ice-config', iceServers: [] });
         expect(sockets[0].sent.map((m) => JSON.parse(m).type)).not.toContain('reattach');
         t.close();
     });
 
     it("hands the host's next token up", () => {
-        const t = new WebRtcMedia('wss://host/ws');
+        const t = new Transport('wss://host/ws');
         const got = vi.fn();
         t.onReattachToken = got;
         t.connect();
         sockets[0].onopen();
+        hostSays({ type: 'ice-config', iceServers: [] });
         t.dataChannels.input.onmessage({
             data: JSON.stringify({ type: 'reattach-token', token: 'tok1' }),
         });
@@ -136,11 +144,12 @@ describe('WebRtcMedia: reattaching', () => {
     });
 
     it('gives the link up after a network change that took the path', () => {
-        const t = new WebRtcMedia('wss://host/ws');
+        const t = new Transport('wss://host/ws');
         const onError = vi.fn();
         t.onError = onError;
         t.connect();
         sockets[0].onopen();
+        hostSays({ type: 'ice-config', iceServers: [] });
         t.connected = true;
         t.noteNetworkChange();
         peers[0].iceConnectionState = 'disconnected';
@@ -152,11 +161,12 @@ describe('WebRtcMedia: reattaching', () => {
     });
 
     it('keeps a link whose path survived the change', () => {
-        const t = new WebRtcMedia('wss://host/ws');
+        const t = new Transport('wss://host/ws');
         const onError = vi.fn();
         t.onError = onError;
         t.connect();
         sockets[0].onopen();
+        hostSays({ type: 'ice-config', iceServers: [] });
         t.connected = true;
         peers[0].iceConnectionState = 'connected';
         t.noteNetworkChange();
@@ -184,11 +194,12 @@ describe('WebRtcMedia: reattaching', () => {
     });
 
     it('ignores a network change before it connected or once closed', () => {
-        const t = new WebRtcMedia('wss://host/ws');
+        const t = new Transport('wss://host/ws');
         const onError = vi.fn();
         t.onError = onError;
         t.connect();
         sockets[0].onopen();
+        hostSays({ type: 'ice-config', iceServers: [] });
         peers[0].iceConnectionState = 'disconnected';
         t.noteNetworkChange(); // not connected yet: the connection chain owns it
         vi.advanceTimersByTime(NETWORK_SETTLE_MS * 2);
