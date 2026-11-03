@@ -27,7 +27,7 @@
 #include <functional>
 #include <utility>
 
-/// Reattaching the browser to a running stream (media transport).
+/// Reattaching the browser to a running stream (both WebRTC transports).
 ///
 /// When the browser's path changes (Wi-Fi to cellular, a new IP), its
 /// PeerConnection cannot follow: libjuice refuses an ICE restart. Until now the
