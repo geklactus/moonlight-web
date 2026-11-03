@@ -3142,6 +3142,10 @@ export class StreamView {
         const now = performance.now();
         if (now - this._startTime < 10000) return;
         if (this._resumedAt && now - this._resumedAt < 10000) return;
+        // A link that dropped for a moment (the transport's disconnect grace):
+        // what stalls while it is down, and for a while after, is the outage,
+        // not congestion — a relaunch one rung down would not help it.
+        if (this.webrtc && now < (this.webrtc.linkQuietUntil || 0)) return;
         // Every recorded signal (not just sustained detections) is reported so
         // the app can measure quiet time for the automatic quality upgrade.
         if (typeof this.onCongestionSignal === 'function') this.onCongestionSignal();
@@ -5492,6 +5496,9 @@ export class StreamView {
             // decoder/renderer, quit() is about to tear everything down.
             if (this._quitting || this._manualQuitting) return;
             this.connected = true;
+            // When this leg came up: the app tells a stream that had been
+            // playing for a while from one that never worked (_onTransportFailed).
+            if (!this._connectedAt) this._connectedAt = performance.now();
             // Transport established at least once → past the connection-failure
             // window. Later failures are mid-stream disconnects, not fallbacks.
             this._everConnected = true;

@@ -172,6 +172,11 @@ export class WebRtcMedia {
 
         // ICE state tracking
         this._iceConnected = false;
+        // See "A link that drops for a moment" below.
+        this.DISCONNECT_GRACE_MS = 5000;
+        this._disconnectTimer = null;
+        this._disconnectedAt = 0;
+        this.linkQuietUntil = 0;
 
         // Grace period for WS close after ICE connected
         this._wsCloseTimer = null;
@@ -347,6 +352,62 @@ export class WebRtcMedia {
     }
 
     /** Cancel any scheduled WS close timer. */
+    // ── A link that drops for a moment ─────────────────────────────────────
+    //
+    // 'disconnected' is ICE's transient state: no answer to its consent checks
+    // for a few seconds. On a phone it is what a radio hiccup looks like (LTE
+    // to 5G, a cell handover, Wi-Fi roaming), and the path often comes back by
+    // itself: the state goes to 'connected' again and the stream carries on.
+    // Ending the stream at 'disconnected' turned every such hiccup into a full
+    // relaunch (a new peer connection, a new host session, a keyframe wait).
+    // So a stream that was up gets DISCONNECT_GRACE_MS to come back; 'failed',
+    // or the grace running out, still ends it as before. While the link is down
+    // and for a while after (linkQuietUntil), StreamView's congestion monitor
+    // stands down: the starvation it would count is the outage, not congestion.
+    _startDisconnectGrace() {
+        if (this._disconnectTimer || this._stopping) return;
+        this._disconnectedAt = performance.now();
+        this.linkQuietUntil = Infinity;
+        console.warn(
+            '[WebRtcMedia] ICE disconnected — waiting up to ' +
+                this.DISCONNECT_GRACE_MS / 1000 +
+                ' s for the path to come back',
+        );
+        this._disconnectTimer = setTimeout(() => {
+            this._disconnectTimer = null;
+            if (this._stopping || !this.pc) return;
+            const st = this.pc.iceConnectionState;
+            if (st === 'connected' || st === 'completed') return;
+            console.warn('[WebRtcMedia] ICE still ' + st + ' after the grace — ending the stream');
+            this._endLinkQuiet();
+            this._clearWsCloseTimer();
+            this._onError('ICE ' + st);
+        }, this.DISCONNECT_GRACE_MS);
+    }
+
+    _clearDisconnectGrace() {
+        if (this._disconnectTimer) {
+            clearTimeout(this._disconnectTimer);
+            this._disconnectTimer = null;
+        }
+    }
+
+    /** The link answered again within the grace: the stream carries on. */
+    _endDisconnectGrace() {
+        if (!this._disconnectTimer) return;
+        this._clearDisconnectGrace();
+        console.log(
+            '[WebRtcMedia] ICE back after ' +
+                Math.round(performance.now() - this._disconnectedAt) +
+                ' ms — the stream carries on',
+        );
+        this._endLinkQuiet();
+    }
+
+    _endLinkQuiet() {
+        this.linkQuietUntil = performance.now() + 10000;
+    }
+
     _clearWsCloseTimer() {
         if (this._wsCloseTimer) {
             clearTimeout(this._wsCloseTimer);
@@ -365,6 +426,7 @@ export class WebRtcMedia {
         this._closed = true;
         this._stopping = true;
         console.log('[WebRtcMedia] Closing...');
+        this._clearDisconnectGrace();
 
         this._clearWsCloseTimer();
 
@@ -503,8 +565,15 @@ export class WebRtcMedia {
             console.log('[WebRtcMedia] ICE state:', state);
             if (state === 'connected' || state === 'completed') {
                 this._iceConnected = true;
+                // A drop that came back within its grace: nothing to relaunch.
+                this._endDisconnectGrace();
+            } else if (state === 'disconnected' && this._iceConnected && !this._stopping) {
+                // ICE WAS connected: a moment's drop gets its grace (see below).
+                this._startDisconnectGrace();
             } else if (state === 'disconnected' || state === 'failed') {
                 if (!this._stopping) {
+                    this._clearDisconnectGrace();
+                    if (this._iceConnected) this._endLinkQuiet();
                     this._clearWsCloseTimer();
                     this._onError('ICE ' + state);
                 }
