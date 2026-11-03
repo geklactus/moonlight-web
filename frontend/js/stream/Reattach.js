@@ -25,8 +25,8 @@
  * keeps its Moonlight session and waits REATTACH_WINDOW_MS for this page to
  * build a new PeerConnection, proving it is the page that started the stream
  * with the token /start gave it (backend ReattachGate.h). The view, its
- * decoder surface, the pads and the HID devices all stay; only the transport
- * object is new. Anything that goes wrong falls back to how a lost link has
+ * decoder (or the <video> element), the pads and the HID devices all stay;
+ * only the transport object is new. Anything that goes wrong falls back to how a lost link has
  * always ended.
  */
 
@@ -41,6 +41,10 @@ export const REATTACH_WINDOW_MS = 18000;
  */
 export const NETWORK_SETTLE_MS = 1000;
 
+/** The view's transports that may reattach: both WebRTC ones ('webrtc' is the
+ *  DataChannel transport). Never 'wss', whose worker ends with its socket. */
+export const REATTACH_TRANSPORTS = ['webrtc-media', 'webrtc'];
+
 /**
  * Whether a link that went may be reattached rather than relaunched.
  * @param {{transport: string, token: string|null, everConnected: boolean,
@@ -50,7 +54,7 @@ export const NETWORK_SETTLE_MS = 1000;
  */
 export function canReattach(s) {
     return (
-        s.transport === 'webrtc-media' &&
+        REATTACH_TRANSPORTS.includes(s.transport) &&
         typeof s.token === 'string' &&
         s.token.length > 0 &&
         s.everConnected &&
