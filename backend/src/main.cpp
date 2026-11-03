@@ -4238,10 +4238,24 @@ int main(int argc, char* argv[])
                         sessionMetrics.reportEnd(*sessionFacts, static_cast<int>(ms / 1000));
                         *sessionStartedAt = 0;
                     }
-                    // Unconditional, unlike the /cancel below: a co-op session is
-                    // this seat's alone, so closing it never takes the app away
-                    // from a sibling slot the way a shared-app /cancel would.
-                    reapCoopSession(hostUuidCopy, *coopSessionId);
+                    // Where the app outlives the stream, nothing is cancelled:
+                    // the viewer resumes it from its card, or quits it there —
+                    // unless they asked for the app to close with the stream.
+                    const bool keepApp = backendResumable && !quitAppOnEnd;
+                    // A co-op session is this seat's alone, so closing it never
+                    // takes the app away from a sibling slot the way a shared-app
+                    // /cancel would — but it takes it away from THIS viewer: on
+                    // Wolf the session is the game's container, and its stop
+                    // (sessions/stop) kills the game (SIGKILL after 2 s). Where
+                    // the app outlives the stream it stays for the resume, like
+                    // the /cancel below; a quit that asks for the app to close
+                    // goes through /cancel, which ends the session too.
+                    if (keepApp) {
+                        qInfo() << "[main] Co-op session" << *coopSessionId
+                                << "kept on the host for a later resume";
+                    } else {
+                        reapCoopSession(hostUuidCopy, *coopSessionId);
+                    }
                     // Pathological probe outcome: the LIVE stream died within
                     // ~3s of a standby launch — the host "took over" instead of
                     // adding a session. Remember no-dual for this host.
@@ -4271,10 +4285,6 @@ int main(int argc, char* argv[])
                     // drops the cancel (dropPendingHostCancel); a browser that
                     // does not come back still gets its app closed.
                     const bool siblingLive = anyOtherSlotLive(reqSlot, hostUuidCopy);
-                    // Where the app outlives the stream, nothing is cancelled:
-                    // the viewer resumes it from its card, or quits it there —
-                    // unless they asked for the app to close with the stream.
-                    const bool keepApp = backendResumable && !quitAppOnEnd;
                     // Each device on its own seat: the other devices streaming
                     // this host are on other seats, and the app to quit is on
                     // this device's — through the backend, never the machine.
