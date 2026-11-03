@@ -141,6 +141,11 @@ public:
         });
     }
 
+    // The timer's slot holds `this`: a copy would share the timer and leave the
+    // slot pointing at the original. The timer itself belongs to `context`.
+    Window(const Window&) = delete;
+    Window& operator=(const Window&) = delete;
+
     /// Opens the window unless it already is (a second attempt keeps the first
     /// deadline). Returns whether it was opened now.
     bool open()
