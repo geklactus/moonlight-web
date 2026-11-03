@@ -148,7 +148,7 @@ import { CadenceStepper, autostepEnabled, stepMemory } from '../stream/CadenceSt
 import { LatencyProbe } from '../stream/LatencyProbe.js';
 import { InputUplink } from '../stream/InputUplink.js';
 import { LINK_STALL_MS, LINK_STALL_PROBE_MS } from '../stream/CrashRelaunch.js';
-import { REATTACH_WINDOW_MS, canReattach } from '../stream/Reattach.js';
+import { REATTACH_WINDOW_MS, canReattach, networkKey } from '../stream/Reattach.js';
 import { t } from '../i18n/i18n.js';
 import { VdGpuApartWatch, takeVdGpuApartNotice } from '../util/vdGpuApartNotice.js';
 
@@ -5638,6 +5638,20 @@ export class StreamView {
         if (!this._handOffLinkLoss(new Error(why))) this._linkLostDefault();
     }
 
+    /**
+     * The window's 'online' or the connection's 'change'. Only a different
+     * kind of network counts: an estimate moving is not one (stream/Reattach.js).
+     * @param {Event} e
+     */
+    _onConnectionEvent(e) {
+        if (e && e.type === 'change') {
+            const key = networkKey(/** @type {any} */ (navigator).connection);
+            if (key === this._networkKey) return;
+            this._networkKey = key;
+        }
+        this._noteNetworkChange();
+    }
+
     /** The browser's network changed: let the transport check its path now. */
     _noteNetworkChange() {
         if (this._quitting || this._reattaching || !this.webrtc) return;
@@ -9026,7 +9040,8 @@ export class StreamView {
         this._loadKeyboardLayoutMap();
         // A new network (Wi-Fi to cellular): the media transport checks its
         // path at once instead of waiting for ICE to call it dead.
-        this._onNetworkChange = () => this._noteNetworkChange();
+        this._networkKey = networkKey(/** @type {any} */ (navigator).connection);
+        this._onNetworkChange = (/** @type {Event} */ e) => this._onConnectionEvent(e);
         window.addEventListener('online', this._onNetworkChange);
         /** @type {any} */ (navigator).connection?.addEventListener?.(
             'change',
