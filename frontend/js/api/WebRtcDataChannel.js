@@ -43,6 +43,7 @@ import { closeHidChannel, createHidChannel, sendHidFrame } from '../hid/hidWire.
 import { setAudioJitterBufferTarget } from '../util/AudioJitter.js';
 import { armDscpCarrier, dscpCarrierMode, prepareDscpCarrier } from '../util/DscpCarrier.js';
 import { MIC_SOCKET_BACKLOG } from '../audio/MicSocketSender.js';
+import { NETWORK_SETTLE_MS, pathDown } from '../stream/Reattach.js';
 
 /**
  * Describe a WebSocket close code for diagnostic logging.
@@ -116,6 +117,8 @@ export class WebRtcDataChannel {
      * @param {boolean} [options.wssFragmented] - In WSS mode, expect the 17-byte
      *   fragmentation header (DataChannel protocol) instead of the legacy
      *   2-byte one.
+     * @param {string} [options.reattachToken] - Take over a stream that keeps
+     *   running (stream/Reattach.js) instead of opening a new one.
      */
     constructor(signalingUrl, options = {}) {
         this.signalingUrl = signalingUrl;
@@ -170,6 +173,12 @@ export class WebRtcDataChannel {
         this.onSessionEnded = null; // () the owner ended the session we were invited to
         this.onHostEnded = null; // () the host ended the stream on purpose (app closed there)
         this.onHostLost = null; // () the host side failed (Sunshine crashed, encoder died)
+        this.onReattachToken = null; // (token) the next reattach's token (stream/Reattach.js)
+
+        // Set when this transport reattaches to a running stream: the first
+        // signalling message, before the PeerConnection is offered.
+        this._reattachToken = options.reattachToken || null;
+        this._networkSettleTimer = null;
 
         // Stats
         this.stats = {
@@ -429,6 +438,10 @@ export class WebRtcDataChannel {
             // ── Normal WebRTC mode: wait for SDP offer ──────────────────────────
             this.signalingWs.onopen = () => {
                 this._wsHadOpen = true;
+                if (this._reattachToken) {
+                    console.log('[WebRTC] Reattaching to the running stream');
+                    this._sendSignaling({ type: 'reattach', token: this._reattachToken });
+                }
                 console.log('[WebRTC] Signaling WS connected, waiting for ICE config...');
                 // MW-BIND-v1: announce our key and nonce. The host holds its SDP
                 // offer until this arrives, since its signature covers the nonce.
@@ -673,6 +686,22 @@ export class WebRtcDataChannel {
     }
 
     /** Mark as stopping without closing — suppresses "closed unexpectedly" noise. */
+    /**
+     * The browser's network changed (StreamView listens). If ICE then shows the
+     * old path gone, the link is given up now rather than when the browser
+     * calls it dead, and the view reattaches.
+     */
+    noteNetworkChange() {
+        if (this._stopping || !this.connected || !this.pc) return;
+        if (this._networkSettleTimer) clearTimeout(this._networkSettleTimer);
+        this._networkSettleTimer = setTimeout(() => {
+            this._networkSettleTimer = null;
+            if (this._stopping || !this.pc) return;
+            const state = this.pc.iceConnectionState;
+            if (pathDown(state)) this._onError('network changed (ICE ' + state + ')');
+        }, NETWORK_SETTLE_MS);
+    }
+
     markStopping() {
         this._stopping = true;
     }
@@ -684,6 +713,10 @@ export class WebRtcDataChannel {
         this._stopping = true;
         console.log('[WebRTC] Closing...');
 
+        if (this._networkSettleTimer) {
+            clearTimeout(this._networkSettleTimer);
+            this._networkSettleTimer = null;
+        }
         // Stop the cleanup timer in ALL modes — the WSS early-return below
         // used to leak it, leaving a zombie interval running forever.
         if (this._cleanupTimer) {
@@ -1151,6 +1184,9 @@ export class WebRtcDataChannel {
                         if (this.onHostEnded) this.onHostEnded();
                     } else if (msg.type === 'host-lost') {
                         if (this.onHostLost) this.onHostLost();
+                    } else if (msg.type === 'reattach-token') {
+                        if (this.onReattachToken && typeof msg.token === 'string')
+                            this.onReattachToken(msg.token);
                     } else {
                         console.log('[WebRTC] Input DC message:', msg);
                     }

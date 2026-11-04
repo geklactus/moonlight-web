@@ -18,6 +18,7 @@
 #pragma once
 
 #include "RelayBase.h"
+#include "ReattachGate.h"
 #include "HostLagTracker.h"
 #include "HostUploadCap.h"
 #include "HostUplink.h"
@@ -148,6 +149,10 @@ public:
 
     IMediaEngine* mediaEngine() const override { return m_Shim; }
 
+    bool canReattach() const override { return m_EverConnected.load() && !m_Stopping.load(); }
+    bool beginReattach() override;
+    void sendToClient(const QByteArray& json) override;
+
     /// Enable bidirectional text clipboard sync. Only called with true when
     /// the streamed host is this machine (the backend clipboard IS the host
     /// clipboard) — see ClipboardBridge. Must be called before the relay is
@@ -238,6 +243,23 @@ private:
 
     void setupPeerConnection(const rtc::Configuration& config);
     void createDataChannels();
+
+    /// Tears down the browser side only — the PeerConnection, its channels and
+    /// tracks, and the per-connection state listed in the .cpp — leaving the
+    /// media engine, the sender thread and the host session alone. stop() and
+    /// a reattach both go through it. On the relay thread.
+    void closePeer();
+
+    /// The PeerConnection of generation `gen` went after the stream ran: drop
+    /// it and wait for the page to reattach (relay thread).
+    void onPeerLost(uint64_t gen);
+
+    /// Ends the stream as a lost PeerConnection always did.
+    void endSession(const char* why);
+
+    /// The new PeerConnection's video path is open after a reattach: a fresh
+    /// keyframe, asked now, on a reset throttle (relay thread).
+    void onReattachedVideoOpen();
     // @p recvUs: the host's steady clock (µs) when the message came off the
     // channel; 0 for "now". Echoed to the client for a stamped message.
     void onInputMessage(const std::string& message, int64_t recvUs = 0);
@@ -539,6 +561,24 @@ private:
 
     std::atomic<bool> m_Connected{false};
     std::atomic<bool> m_Stopping{false};
+
+    // ── Reattach (ReattachGate.h; the same scheme as MediaTrackRelay) ──────
+    // Each PeerConnection gets a generation; callbacks of an older one (its
+    // Closed, a late candidate, a channel's open) find a newer number here and
+    // do nothing.
+    std::atomic<uint64_t> m_PeerGen{0};
+    // A browser connected once: a lost PeerConnection waits for a reattach
+    // instead of ending the stream.
+    std::atomic<bool> m_EverConnected{false};
+    // Between two PeerConnections: no keyframe is asked for (there is nobody
+    // to show it to, and every request that produces no sent keyframe doubles
+    // the throttle's cooldown), until the new video path opens. Read on the
+    // capture thread under m_VideoMutex, hence atomic.
+    std::atomic<bool> m_PeerDetached{false};
+    // A new PeerConnection is being built for a page that came back (relay
+    // thread).
+    bool m_Reattaching = false;
+    std::unique_ptr<mw::reattach::Window> m_ReattachWindow;
     // usrsctp's counters when the channels opened, so the destructor can
     // report the session's own. Written once in onOpen, then the flag is raised.
     mw::sctp::Counters m_SctpAtOpen{};

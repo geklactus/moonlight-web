@@ -19,6 +19,7 @@
 
 #include "InputPolicy.h"
 
+#include <QByteArray>
 #include <QJsonObject>
 #include <QObject>
 #include <memory>
@@ -165,6 +166,20 @@ public:
     /// whether the frames come from a remote GameStream host or from this
     /// machine's own screen is not its concern.
     virtual IMediaEngine* mediaEngine() const = 0;
+
+    // ── Reattach (ReattachGate.h) ─────────────────────────────────────────────
+
+    /// Whether a new browser PeerConnection may take over this stream: one has
+    /// connected before and the stream is still up. Both WebRTC relays do it;
+    /// the WebSocket one (StreamRelay) ends with its socket as before.
+    virtual bool canReattach() const { return false; }
+
+    /// Drops the current PeerConnection, if any, and readies the relay for a
+    /// new prepare() under the same host session. On the relay's thread.
+    virtual bool beginReattach() { return false; }
+
+    /// A control message for the page on the input channel, when it is open.
+    virtual void sendToClient(const QByteArray& json) { Q_UNUSED(json); }
 
 signals:
     /// Local SDP description (offer) ready to send to the browser.

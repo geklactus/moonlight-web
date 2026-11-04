@@ -18,6 +18,7 @@
 #pragma once
 
 #include "server/NetClassify.h"
+#include "ReattachGate.h"
 
 #include <QObject>
 #include <QWebSocketServer>
@@ -66,6 +67,10 @@ public:
     /// resolve it against its own origin (see StreamSession::setTunnelArrival).
     QString wsPath() const { return m_WsPath; }
     quint16 port() const { return m_WsPort; }
+
+    /// What the page that started this stream presents to reattach to it
+    /// (ReattachGate.h). Handed out in /start's reply; replaced after each use.
+    QString reattachToken() const { return m_ReattachGate.token(); }
 
     /// Returns the WebSocket URL for browser connections.
     /// If an override URL is set (e.g. for a public tunnel), returns that instead.
@@ -287,6 +292,18 @@ private:
     /// Refuse the connection and say why. Closes the WS without ever reaching
     /// setRemoteDescription, so no DTLS state exists when we give up.
     void abortSignaling(const QString& reason);
+
+    // ── Reattach (ReattachGate.h) ─────────────────────────────────────────
+    /// A socket that came while the stream runs: closed, the stream untouched.
+    void refuseReattach(const QString& reason);
+    mw::reattach::Gate m_ReattachGate;
+    /// The connection's ICE setup, kept until the reattach message lets the
+    /// relay build its new PeerConnection with it.
+    std::unique_ptr<rtc::Configuration> m_ReattachConfig;
+    bool m_ReattachIsInternet = false;
+    /// A reattach went through on this socket; the token turns over once its
+    /// channels are open.
+    bool m_ReattachInFlight = false;
 
     /// How long the signed offer waits for the browser's hello before giving up.
     static constexpr int kHelloTimeoutMs = 15000;

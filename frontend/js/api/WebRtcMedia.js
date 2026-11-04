@@ -30,6 +30,7 @@ import {
     isBindRefusedClose,
 } from '../util/pairingCrypto.js';
 import { defaultIceServers } from './IceServers.js';
+import { NETWORK_SETTLE_MS, pathDown } from '../stream/Reattach.js';
 import { isViewMessage } from './hostMessages.js';
 import { setAudioJitterBufferTarget } from '../util/AudioJitter.js';
 import {
@@ -106,6 +107,8 @@ export class WebRtcMedia {
      * @param {HTMLVideoElement} [options.videoElement] - <video> element for rendering.
      * @param {HTMLAudioElement} [options.audioElement] - <audio> element for the
      *   native RTP Opus track. Normally assigned by StreamView after construction.
+     * @param {string} [options.reattachToken] - Take over a stream that keeps
+     *   running (stream/Reattach.js) instead of opening a new one.
      */
     constructor(signalingUrl, options = {}) {
         this.signalingUrl = signalingUrl;
@@ -140,6 +143,12 @@ export class WebRtcMedia {
         this.onSessionEnded = null; // () the owner ended the session we were invited to
         this.onHostEnded = null; // () the host ended the stream on purpose (app closed there)
         this.onHostLost = null; // () the host side failed (Sunshine crashed, encoder died)
+        this.onReattachToken = null; // (token) the next reattach's token (stream/Reattach.js)
+
+        // Set when this transport reattaches to a running stream: the first
+        // signalling message, before the PeerConnection is offered.
+        this._reattachToken = options.reattachToken || null;
+        this._networkSettleTimer = null;
 
         // Stats
         this.stats = { framesReceived: 0, chunksReceived: 0, framesDropped: 0, framesAssembled: 0 };
@@ -229,6 +238,10 @@ export class WebRtcMedia {
 
         this.signalingWs.onopen = () => {
             this._wsHadOpen = true;
+            if (this._reattachToken) {
+                console.log('[WebRtcMedia] Reattaching to the running stream');
+                this._sendSignaling({ type: 'reattach', token: this._reattachToken });
+            }
             console.log('[WebRtcMedia] Signaling WS connected, waiting for SDP offer...');
             this._createPeerConnection();
             // MW-BIND-v1: announce our key and nonce. The host holds its SDP
@@ -349,6 +362,22 @@ export class WebRtcMedia {
         }
     }
 
+    /**
+     * The browser's network changed (StreamView listens). If ICE then shows the
+     * old path gone, the link is given up now rather than when the browser
+     * calls it dead, and the view reattaches.
+     */
+    noteNetworkChange() {
+        if (this._stopping || !this.connected || !this.pc) return;
+        if (this._networkSettleTimer) clearTimeout(this._networkSettleTimer);
+        this._networkSettleTimer = setTimeout(() => {
+            this._networkSettleTimer = null;
+            if (this._stopping || !this.pc) return;
+            const state = this.pc.iceConnectionState;
+            if (pathDown(state)) this._onError('network changed (ICE ' + state + ')');
+        }, NETWORK_SETTLE_MS);
+    }
+
     /** Mark as stopping without closing — suppresses "closed unexpectedly" noise. */
     markStopping() {
         this._stopping = true;
@@ -362,6 +391,10 @@ export class WebRtcMedia {
         console.log('[WebRtcMedia] Closing...');
 
         this._clearWsCloseTimer();
+        if (this._networkSettleTimer) {
+            clearTimeout(this._networkSettleTimer);
+            this._networkSettleTimer = null;
+        }
 
         // Stop cleanup timer
         if (this._cleanupTimer) {
@@ -665,6 +698,9 @@ export class WebRtcMedia {
                         if (this.onHostEnded) this.onHostEnded();
                     } else if (msg.type === 'host-lost') {
                         if (this.onHostLost) this.onHostLost();
+                    } else if (msg.type === 'reattach-token') {
+                        if (this.onReattachToken && typeof msg.token === 'string')
+                            this.onReattachToken(msg.token);
                     } else {
                         console.log('[WebRtcMedia] Input DC message:', msg);
                     }

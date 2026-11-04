@@ -54,6 +54,7 @@ void run_reference_repairs_tests();
 void run_rxbuf_section_tests();
 void run_capture_key_tests();
 void run_signaling_wait_tests();
+void run_reattach_gate_tests();
 void run_single_session_hosts_tests();
 void run_stream_ends_tests();
 void run_host_lag_tracker_tests();
@@ -130,6 +131,7 @@ int main(int argc, char** argv)
     run_rxbuf_section_tests();
     run_capture_key_tests();
     run_signaling_wait_tests();
+    run_reattach_gate_tests();
     run_single_session_hosts_tests();
     run_stream_ends_tests();
     run_host_lag_tracker_tests();
