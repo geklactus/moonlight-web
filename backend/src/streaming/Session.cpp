@@ -1303,6 +1303,9 @@ void StreamSession::onShimConnectionStarted()
         // machine's local port — a door that answers nowhere. The page resolves
         // the path against its own origin, and the tunnel carries the socket.
         result["signalingUrl"] = m_TunnelArrival ? m_Signaling->wsPath() : m_Signaling->wsUrl();
+        // What lets this page take the stream back when its PeerConnection has
+        // to be rebuilt (ReattachGate.h): both WebRTC transports, never wss.
+        result["reattachToken"] = m_Signaling->reattachToken();
     } else {
         result["signalingUrl"] = QString();
     }

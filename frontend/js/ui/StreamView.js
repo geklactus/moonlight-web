@@ -148,6 +148,13 @@ import { CadenceStepper, autostepEnabled, stepMemory } from '../stream/CadenceSt
 import { LatencyProbe } from '../stream/LatencyProbe.js';
 import { InputUplink } from '../stream/InputUplink.js';
 import { LINK_STALL_MS, LINK_STALL_PROBE_MS } from '../stream/CrashRelaunch.js';
+import {
+    REATTACH_RETRY_MS,
+    REATTACH_TRIES,
+    REATTACH_WINDOW_MS,
+    canReattach,
+    networkKey,
+} from '../stream/Reattach.js';
 import { t } from '../i18n/i18n.js';
 import { VdGpuApartWatch, takeVdGpuApartNotice } from '../util/vdGpuApartNotice.js';
 
@@ -585,6 +592,21 @@ export class StreamView {
         // What the host knows this stream by (/start's stream_id): the page
         // asks it how the stream ended once the link goes (_handOffLinkLoss).
         this.streamId = typeof opts.streamId === 'string' ? opts.streamId : '';
+        // What lets this page take the stream back when its PeerConnection has
+        // to be rebuilt (stream/Reattach.js); the host hands a new one after
+        // each reattach. Media transport only.
+        this._reattachToken =
+            typeof opts.reattachToken === 'string' && opts.reattachToken
+                ? opts.reattachToken
+                : null;
+        this._reattaching = false;
+        this._reattachTimer = null;
+        this._reattachStartedAt = 0;
+        /** @type {(() => void)|null} the picture-back log, on the DataChannel transport */
+        this._reattachPictureBack = null;
+        /** @type {any} the first transport, whose settings each attempt copies */
+        this._reattachFrom = null;
+        this._reattachTries = 0;
         // ── Player mode (invited guest) ─────────────────────────────────────
         // A player's view is the same stream pipeline with the owner's controls
         // taken away: Stop becomes Leave (their leaving must not end the game),
@@ -1626,25 +1648,8 @@ export class StreamView {
         this._gamepadDialog = null;
         this._padBtn = null;
 
-        // Forward stats/pong messages from backend to the stats overlay system.
         // Set before setupWebRtc() so it's active when connect() is called.
-        this.webrtc.onStats = (msg) => this._handleStatsMessage(msg);
-
-        // Session taken over by another device → graceful cyberpunk exit.
-        this.webrtc.onTakeover = () => this._handleTakeover();
-
-        // Device access revoked by the admin → same forced-exit path.
-        this.webrtc.onRevoked = () => this._handleRevoked();
-
-        // The owner stopped the session a player was invited to.
-        this.webrtc.onSessionEnded = () => this._handleSessionEnded();
-
-        // The host ended the stream on purpose (the app was closed there).
-        this.webrtc.onHostEnded = () => this._handleHostEnded();
-
-        // The host side failed under the stream (Sunshine crashed, its encoder
-        // hung) — not this link.
-        this.webrtc.onHostLost = () => this._handleHostLost();
+        this._wireTransportMessages();
 
         // The media transport's offer names a codec this browser's RTP
         // decoder does not list (WebRtcMedia): back in H.264, now.
@@ -3139,6 +3144,8 @@ export class StreamView {
         // transport at half its bitrate). Nothing measured while hidden, or
         // in the first seconds back, is the link's doing.
         if (document.visibilityState === 'hidden') return;
+        // A reattach's freeze is not the link's congestion: no ladder step.
+        if (this._reattaching) return;
         const now = performance.now();
         if (now - this._startTime < 10000) return;
         if (this._resumedAt && now - this._resumedAt < 10000) return;
@@ -5469,11 +5476,216 @@ export class StreamView {
     _checkLinkStall(now = performance.now()) {
         if (!this._firstFrameRendered || this._standby || this._quitting) return;
         if (this._manualQuitting || this._takenOver || this._linkLossHandedOff) return;
+        if (this._reattaching) return;
         if (typeof this.onLinkStall !== 'function' || !(this._lastRxAt > 0)) return;
         if (now - this._lastRxAt < LINK_STALL_MS) return;
         if (now - this._lastStallProbeAt < LINK_STALL_PROBE_MS) return;
         this._lastStallProbeAt = now;
         this.onLinkStall();
+    }
+
+    /** The host's messages on the transport — again for a reattached one. */
+    _wireTransportMessages() {
+        // Forward stats/pong messages from backend to the stats overlay system.
+        this.webrtc.onStats = (msg) => this._handleStatsMessage(msg);
+
+        // Session taken over by another device → graceful cyberpunk exit.
+        this.webrtc.onTakeover = () => this._handleTakeover();
+
+        // Device access revoked by the admin → same forced-exit path.
+        this.webrtc.onRevoked = () => this._handleRevoked();
+
+        // The owner stopped the session a player was invited to.
+        this.webrtc.onSessionEnded = () => this._handleSessionEnded();
+
+        // The host ended the stream on purpose (the app was closed there).
+        this.webrtc.onHostEnded = () => this._handleHostEnded();
+
+        // The host side failed under the stream (Sunshine crashed, its encoder
+        // hung) — not this link.
+        this.webrtc.onHostLost = () => this._handleHostLost();
+
+        // The next reattach's token, once this one has been spent.
+        this.webrtc.onReattachToken = (token) => {
+            this._reattachToken = token;
+        };
+    }
+
+    /**
+     * The link went after the stream ran. On the media transport the host keeps
+     * the stream for a while (stream/Reattach.js): build a new PeerConnection to
+     * it under this same view instead of ending. Returns true when it took the
+     * ending over — reattaching, or having given a reattach up and handed the
+     * loss on as before.
+     * @param {string} why
+     * @returns {boolean}
+     */
+    _reattachTransport(why) {
+        if (this._reattaching) {
+            // The new connection failed in its turn. Once, it may be the
+            // moment rather than the path (seen: a new PeerConnection failing
+            // 14 ms in, cause unconfirmed): the host's window is still open
+            // and the token unspent, so try again before giving up.
+            const failed = /** @type {any} */ (this.webrtc);
+            for (const cb of ['onOpen', 'onClose', 'onError', 'onReattachToken']) failed[cb] = null;
+            if (this._reattachTries < REATTACH_TRIES) {
+                console.warn('[StreamView] Reattach attempt failed (' + why + ') — once more');
+                failed.markStopping();
+                failed.close();
+                setTimeout(() => this._buildReattachTransport(), REATTACH_RETRY_MS);
+                return true;
+            }
+            this._abandonReattach('the new connection failed: ' + why);
+            return true;
+        }
+        const ok = canReattach({
+            transport: this._transport,
+            token: this._reattachToken,
+            everConnected: this._everConnected,
+            reattaching: this._reattaching,
+            standby: this._standby,
+            takenOver: this._takenOver,
+            quitting: this._quitting || this._manualQuitting,
+        });
+        if (!ok) return false;
+
+        this._reattaching = true;
+        this._reattachStartedAt = performance.now();
+        console.warn('[StreamView] Link lost (' + why + ') — reattaching to the running stream');
+        this.setStatus('connecting', 'Reconnecting...');
+
+        const old = /** @type {any} */ (this.webrtc);
+        // Its last callbacks (the onClose after this onError, a frame still
+        // being reassembled) are not ours any more, and its close() must leave
+        // the last picture on screen.
+        for (const cb of [
+            'onOpen',
+            'onClose',
+            'onError',
+            'onReattachToken',
+            'onVideo',
+            'onVideoPart',
+            'onFrameLoss',
+            'onIdrRequested',
+            'onAudio',
+        ])
+            old[cb] = null;
+        old.videoElement = null;
+        // Restarted on the new connection's open, with its own counters.
+        this._stopMediaStatsPolling();
+        if (this._transport !== 'webrtc-media') {
+            // The decoder keeps its configuration but not its reference: the
+            // new channel starts on a keyframe, and a delta before it would
+            // decode against a picture of the old one. The frame ids go on
+            // from where the host is, past the frames the gap swallowed, which
+            // are not the network's loss: gap detection starts over.
+            this._referenceValid = false;
+            if (this._videoWorker) this._videoWorker.postMessage({ type: 'frameloss' });
+            this._lastFrameId = -1;
+        }
+
+        this._reattachTimer = setTimeout(
+            () =>
+                this._abandonReattach(
+                    'no new connection within ' + REATTACH_WINDOW_MS / 1000 + ' s',
+                ),
+            REATTACH_WINDOW_MS,
+        );
+        // What the next transports copy from the first (see its constructor).
+        this._reattachFrom = old;
+        this._reattachTries = 0;
+        // Once the old transport's own teardown has run.
+        setTimeout(() => this._buildReattachTransport(), 0);
+        return true;
+    }
+
+    /** One attempt: a new transport to the same worker, with the token. */
+    _buildReattachTransport() {
+        if (!this._reattaching || this._quitting || this._manualQuitting) return;
+        this._reattachTries++;
+        const old = this._reattachFrom;
+        const Transport = this._transport === 'webrtc-media' ? WebRtcMedia : WebRtcDataChannel;
+        const next = /** @type {any} */ (
+            new Transport(this.signalingUrl, { reattachToken: this._reattachToken })
+        );
+        // What the view set on the first transport (see its constructor).
+        for (const key of [
+            '_chainFallback',
+            '_unpairedGuest',
+            'audioElement',
+            'mic',
+            'rideOutLoss',
+            'healsByInvalidation',
+            'rideOutFrames',
+        ])
+            if (old[key] !== undefined) next[key] = old[key];
+        if (typeof next.setVideoElement === 'function') next.setVideoElement(this.videoEl);
+        this.webrtc = /** @type {StreamTransport} */ (next);
+        this._wireTransportMessages();
+        this.setupWebRtc();
+    }
+
+    /**
+     * The new connection is open: what was measured on the old path is not
+     * this one's. Timing is re-primed as after a page back from the background
+     * (_resyncAfterHidden), and the pads say where they are again — whatever
+     * they did during the gap went nowhere.
+     */
+    _reprimeAfterReattach() {
+        if (this._stallDetector) this._stallDetector.reset();
+        if (typeof this._clearPacingTimer === 'function') this._clearPacingTimer();
+        if (this._framePacer) this._framePacer.reset();
+        if (this._videoWorker) this._videoWorker.postMessage({ type: 'resync' });
+        if (this._link) {
+            this._link.windowMinOffset = Infinity;
+            // The next link report tells the host's governor that the silence
+            // and the gap were the reattach, not congestion.
+            this._link.resumed = true;
+        }
+        if (this._gamepadManager) this._gamepadManager.resendAll();
+        if (this._stepper) this._stepper.linkChanged('reattached', performance.now());
+    }
+
+    /** A reattach that did not make it: the loss goes on as it always did. */
+    _abandonReattach(why) {
+        if (!this._reattaching) return;
+        console.warn('[StreamView] Reattach given up — ' + why);
+        this._reattaching = false;
+        clearTimeout(this._reattachTimer);
+        this._reattachTimer = null;
+        this._reattachToken = null;
+        this._reattachPictureBack = null;
+        this._reattachFrom = null;
+        const transport = this.webrtc;
+        if (transport) {
+            transport.onOpen = null;
+            transport.onClose = null;
+            transport.onError = null;
+            transport.markStopping();
+            transport.close();
+        }
+        if (this._quitting || this._manualQuitting) return;
+        if (!this._handOffLinkLoss(new Error(why))) this._linkLostDefault();
+    }
+
+    /**
+     * The window's 'online' or the connection's 'change'. Only a different
+     * kind of network counts: an estimate moving is not one (stream/Reattach.js).
+     * @param {Event} e
+     */
+    _onConnectionEvent(e) {
+        if (e && e.type === 'change') {
+            const key = networkKey(/** @type {any} */ (navigator).connection);
+            if (key === this._networkKey) return;
+            this._networkKey = key;
+        }
+        this._noteNetworkChange();
+    }
+
+    /** The browser's network changed: let the transport check its path now. */
+    _noteNetworkChange() {
+        if (this._quitting || this._reattaching || !this.webrtc) return;
+        if (typeof this.webrtc.noteNetworkChange === 'function') this.webrtc.noteNetworkChange();
     }
 
     /** How a lost link has always ended: the banners, then quit() in 3 s. */
@@ -5502,8 +5714,36 @@ export class StreamView {
             // Transport established at least once → past the connection-failure
             // window. Later failures are mid-stream disconnects, not fallbacks.
             this._everConnected = true;
-            this.setStatus('connecting', 'Waiting for stream...');
-            this._updateStartupStep(2);
+            // A reattached connection keeps the decoder, the renderer and the
+            // decode worker of the first one (stream/Reattach.js).
+            const reattached = this._reattaching;
+            if (this._reattaching) {
+                this._reattaching = false;
+                clearTimeout(this._reattachTimer);
+                this._reattachTimer = null;
+                const openedMs = Math.round(performance.now() - this._reattachStartedAt);
+                console.log('[StreamView] Reattached in ' + openedMs + ' ms — same host session');
+                this._reprimeAfterReattach();
+                const back = () => {
+                    if (this.videoEl) this.videoEl.removeEventListener('playing', back);
+                    if (this._quitting) return;
+                    console.log(
+                        '[StreamView] Picture back ' +
+                            Math.round(performance.now() - this._reattachStartedAt) +
+                            ' ms after the link went',
+                    );
+                    this.setStatus('live', 'Live');
+                };
+                if (this._transport === 'webrtc-media') {
+                    if (this.videoEl) this.videoEl.addEventListener('playing', back);
+                } else {
+                    // The decoder's next keyframe (handleVideoFrame) says it.
+                    this._reattachPictureBack = back;
+                }
+            } else {
+                this.setStatus('connecting', 'Waiting for stream...');
+                this._updateStartupStep(2);
+            }
 
             // No-video watchdog: transport up but nothing ever rendered — the
             // decode/render path is broken on this transport (not the network),
@@ -5675,7 +5915,7 @@ export class StreamView {
                 // Native RTP stats: poll getStats() for fps/bitrate/latency,
                 // since these frames never reach the WebCodecs pipeline.
                 this._startMediaStatsPolling();
-            } else {
+            } else if (!reattached) {
                 // DataChannel mode: set up WebCodecs decoder (main thread) OR
                 // hand decode+render to the OffscreenCanvas worker (opt-in).
                 if (this._useWorker) {
@@ -5775,6 +6015,9 @@ export class StreamView {
             // transport instead of showing a disconnect error.
             if (!this._everConnected && this._reportConnectionFailed('closed before connect'))
                 return;
+            // A stream that ran keeps going on the media transport: a new
+            // PeerConnection to the same worker (stream/Reattach.js).
+            if (this._reattachTransport('closed')) return;
             // Why it went is the host's to say: its worker may have crashed
             // under a healthy stream, and then the stream starts again.
             if (this._handOffLinkLoss()) return;
@@ -5791,6 +6034,7 @@ export class StreamView {
             }
             // Never connected → connection failure, defer to the transport chain.
             if (!this._everConnected && this._reportConnectionFailed(err.message)) return;
+            if (this._reattachTransport(err.message)) return;
             if (this._handOffLinkLoss(err)) return;
             Toast.error(t('stream.webrtcError'));
         };
@@ -8115,6 +8359,12 @@ export class StreamView {
         // Stop processing frames once quit() has started.  The DC may still
         // deliver queued messages during the async HTTP /quit call.
         if (this._quitting) return;
+        // The first keyframe on a reattached channel: the picture comes back.
+        if (isKeyframe && this._reattachPictureBack) {
+            const back = this._reattachPictureBack;
+            this._reattachPictureBack = null;
+            back();
+        }
         // Terminal decoder failure (e.g. broken AV1 in Safari): the stream
         // keeps delivering frames — drop them silently, the error is displayed.
         if (this._fatalDecodeError) return;
@@ -8818,6 +9068,15 @@ export class StreamView {
         // user's layout (AZERTY: KeyA → 'q') instead of the QWERTY position.
         // Chromium-only; Safari/Firefox fall back to e.key/e.code detection.
         this._loadKeyboardLayoutMap();
+        // A new network (Wi-Fi to cellular): the media transport checks its
+        // path at once instead of waiting for ICE to call it dead.
+        this._networkKey = networkKey(/** @type {any} */ (navigator).connection);
+        this._onNetworkChange = (/** @type {Event} */ e) => this._onConnectionEvent(e);
+        window.addEventListener('online', this._onNetworkChange);
+        /** @type {any} */ (navigator).connection?.addEventListener?.(
+            'change',
+            this._onNetworkChange,
+        );
         // Common events (both modes)
         document.addEventListener('keydown', this._onKeyDown);
         document.addEventListener('keyup', this._onKeyUp);
@@ -9885,6 +10144,16 @@ export class StreamView {
         for (const toast of this._hidOfferToasts || []) toast.dismiss();
         this._hidOfferToasts = [];
         document.removeEventListener('keydown', this._onKeyDown);
+        if (this._onNetworkChange) {
+            window.removeEventListener('online', this._onNetworkChange);
+            /** @type {any} */ (navigator).connection?.removeEventListener?.(
+                'change',
+                this._onNetworkChange,
+            );
+        }
+        clearTimeout(this._reattachTimer);
+        this._reattachTimer = null;
+        this._reattaching = false;
         document.removeEventListener('keyup', this._onKeyUp);
         document.removeEventListener('keypress', this._onKeyPress);
         this._dropComposedKey();
