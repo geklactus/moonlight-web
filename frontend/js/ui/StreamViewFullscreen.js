@@ -21,6 +21,16 @@ import { IS_MOBILE_OR_TABLET, IS_IOS, IS_STANDALONE } from '../util/BrowserDetec
 /** @typedef {import('./StreamView.js').StreamView} StreamViewInstance */
 
 /**
+ * The event a page around the stream sends on `window` to take the viewer out
+ * of fullscreen — its own "Exit fullscreen" button, say, where moonlight-web's
+ * header is hidden. A stream in fullscreen leaves it the way its exit combo
+ * does (_exitGamingMode), the iOS CSS fallback included, and calls
+ * preventDefault() to say so. Out of fullscreen nothing happens and the event
+ * is left as it came.
+ */
+export const EXIT_FULLSCREEN_EVENT = 'moonlightweb:exit-fullscreen';
+
+/**
  * When to re-read the device orientation after a rotation signal, in ms.
  * Rotation animations run ~300ms; the last probe is the safety net for slow
  * devices. See _scheduleOrientationSync().
@@ -459,6 +469,21 @@ export class StreamViewFullscreen {
             } catch (e) {}
             this._keyboardLocked = false;
         }
+    }
+
+    /**
+     * EXIT_FULLSCREEN_EVENT, from a page around the stream: in fullscreen
+     * (the standard API's, or the CSS fallback an iPhone gets), the same way
+     * out as the exit combo, and preventDefault() so the page knows. An iPhone
+     * has no Fullscreen API to leave, so this is the only way such a page can
+     * take it out of the CSS fallback while it is held in landscape.
+     * @this {StreamViewInstance}
+     * @param {Event} [e]
+     */
+    _exitFullscreenOnRequest(e) {
+        if (!document.fullscreenElement && !this._cssFullscreen) return;
+        if (e && typeof e.preventDefault === 'function') e.preventDefault();
+        this._exitGamingMode();
     }
 
     /**

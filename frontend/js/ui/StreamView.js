@@ -168,7 +168,7 @@ import { openSupportPage, showSupportButton } from '../util/supportNudge.js';
 import { BMC_LOGO } from './bmcLogo.js';
 import { StreamViewKeyboard } from './StreamViewKeyboard.js';
 import { StreamViewTouch } from './StreamViewTouch.js';
-import { StreamViewFullscreen } from './StreamViewFullscreen.js';
+import { StreamViewFullscreen, EXIT_FULLSCREEN_EVENT } from './StreamViewFullscreen.js';
 import { flushClientLog, serverDiag } from '../util/ClientLog.js';
 import { UltraPlayer, presentMode, ultraPlayerSupported } from '../stream/ultra/UltraPlayer.js';
 
@@ -1857,6 +1857,10 @@ export class StreamView {
             this._syncKeyboardLock();
             this._updateMobileFsButtonVisibility();
         };
+        // A page around the stream asking it out of fullscreen
+        // (EXIT_FULLSCREEN_EVENT, StreamViewFullscreen).
+        this._onExitFullscreenRequest = (/** @type {Event} */ e) =>
+            this._exitFullscreenOnRequest(e);
         // Transient on-screen hint element (reused for the fullscreen-exit tip).
         this._transientHintEl = null;
         this._transientHintTimer = null;
@@ -9104,6 +9108,7 @@ export class StreamView {
         document.addEventListener('visibilitychange', this._onVisibilityChange);
         // All platforms: keep Escape inside the host while in fullscreen.
         document.addEventListener('fullscreenchange', this._onFsChangeLock);
+        window.addEventListener(EXIT_FULLSCREEN_EVENT, this._onExitFullscreenRequest);
 
         // Mode-specific events
         if (this._gamingMode) {
@@ -10172,6 +10177,7 @@ export class StreamView {
         window.removeEventListener('focus', this._onWindowFocus);
         document.removeEventListener('visibilitychange', this._onVisibilityChange);
         document.removeEventListener('fullscreenchange', this._onFsChangeLock);
+        window.removeEventListener(EXIT_FULLSCREEN_EVENT, this._onExitFullscreenRequest);
         // Release the keyboard lock if still held (e.g. quit while fullscreen).
         if (this._keyboardLocked && navigator.keyboard && navigator.keyboard.unlock) {
             try {
