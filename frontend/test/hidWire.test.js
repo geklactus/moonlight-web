@@ -17,7 +17,11 @@ import {
     detachMessage,
     encodeReportFrame,
     isGameDevice,
+    isWiimote,
+    isWiimoteOutput,
     plainCollection,
+    WIIMOTE_FILTERS,
+    WIIMOTE_REPLY_IDS,
 } from '../js/hid/hidWire.js';
 
 // A WebHID collection keeps its fields on the prototype, as Chrome's do.
@@ -82,6 +86,21 @@ describe('hidWire (HID passthrough, P2)', () => {
         expect(isGameDevice([{ usagePage: 1, usage: 6 }])).toBe(false);
         expect(isGameDevice([{ usagePage: 0xfffd, usage: 0xfd01 }])).toBe(false);
         expect(isGameDevice(undefined)).toBe(false);
+    });
+
+    it('knows a Wii Remote by its ids alone, and its answers and outputs by report id', () => {
+        expect(WIIMOTE_FILTERS).toEqual([
+            { vendorId: 0x057e, productId: 0x0306 },
+            { vendorId: 0x057e, productId: 0x0330 },
+        ]);
+        expect(isWiimote({ vendorId: 0x057e, productId: 0x0306 })).toBe(true);
+        expect(isWiimote({ vendorId: 0x057e, productId: 0x0330 })).toBe(true);
+        expect(isWiimote({ vendorId: 0x057e, productId: 0x2009 })).toBe(false); // Switch Pro
+        expect(isWiimote({ vendorId: 0x046d, productId: 0x0306 })).toBe(false);
+        expect(isWiimote(undefined)).toBe(false);
+        expect(Array.from(WIIMOTE_REPLY_IDS)).toEqual([0x20, 0x21, 0x22]);
+        expect(isWiimoteOutput(0x10) && isWiimoteOutput(0x1a)).toBe(true);
+        expect(isWiimoteOutput(0x0f) || isWiimoteOutput(0x1b) || isWiimoteOutput(0x30)).toBe(false);
     });
 
     it('writes the attach and detach messages', () => {

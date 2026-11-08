@@ -62,6 +62,18 @@ function fakeDevice({
     };
 }
 
+/** A Wii Remote as WebHID shows it: its ids, a Game Pad collection, and what it was sent. */
+function fakeWiimote({ productId = 0x0306, sendFails = false } = {}) {
+    const d = fakeDevice({ vendorId: 0x057e, productId, usage: 5 });
+    d.productName = 'Nintendo RVL-CNT-01';
+    d.sent = [];
+    d.sendReport = vi.fn(async (id, data) => {
+        if (sendFails) throw new Error('NotAllowedError');
+        d.sent.push([id, Array.from(data)]);
+    });
+    return d;
+}
+
 function fakeHid(devices) {
     const listeners = new Set();
     return {
@@ -384,6 +396,151 @@ describe('HidPassthrough (HID passthrough in the stream, P2)', () => {
         expect(await hp.link(0x046d, 0xc26e)).toBe(false);
         await hp.applyWanted();
         hp.stop();
+    });
+});
+
+describe('HidPassthrough — a Wii Remote, for a GameStream host on its own machine', () => {
+    const b64 = (bytes) => globalThis.btoa(String.fromCharCode(...bytes));
+    const output = (slot, reportId, bytes) => ({
+        type: 'hidrequest',
+        slot,
+        kind: 'output',
+        reportId,
+        data: b64(bytes),
+    });
+
+    async function attached(remote) {
+        const t = setup([remote], [deviceKey(remote)]);
+        t.hp.handleMessage({ type: 'hidcaps', available: true });
+        await vi.waitFor(() => expect(t.sent).toHaveLength(1));
+        t.hp.handleMessage({ type: 'hidattached', slot: 0, ok: true });
+        return t;
+    }
+
+    it('links through a chooser narrowed to the two Wii Remotes, and sends it', async () => {
+        const remote = fakeWiimote();
+        const t = setup([remote]);
+        t.hp.handleMessage({ type: 'hidcaps', available: true });
+        const chosen = await t.hp.linkWiimote();
+        expect(chosen).toEqual([remote]);
+        expect(t.hid.requestDevice).toHaveBeenCalledWith({
+            filters: [
+                { vendorId: 0x057e, productId: 0x0306 },
+                { vendorId: 0x057e, productId: 0x0330 },
+            ],
+        });
+        expect(loadForwarded(t.storage).has('057e:0306')).toBe(true);
+        expect(t.sent[0]).toMatchObject({ type: 'hidattach', vendorId: 0x057e, productId: 0x0306 });
+    });
+
+    it('sends its answers once on the reliable channel, its data reports on hid', async () => {
+        const remote = fakeWiimote();
+        const t = await attached(remote);
+        remote.report(0x20, [0, 0, 0, 0, 0, 0x96]); // status
+        remote.report(0x21, Array(21).fill(7)); // a memory read
+        remote.report(0x22, [0, 0, 0x16, 0]); // an acknowledged write
+        expect(t.sent.slice(1)).toEqual([
+            { type: 'hidreply', slot: 0, reportId: 0x20, data: b64([0, 0, 0, 0, 0, 0x96]) },
+            { type: 'hidreply', slot: 0, reportId: 0x21, data: b64(Array(21).fill(7)) },
+            { type: 'hidreply', slot: 0, reportId: 0x22, data: b64([0, 0, 0x16, 0]) },
+        ]);
+        expect(t.frames).toHaveLength(0);
+        // Never repeated: only data reports are.
+        t.advance(2000);
+        expect(t.frames).toHaveLength(0);
+        expect(t.sent).toHaveLength(4);
+
+        remote.report(0x30, [0x00, 0x08]); // buttons
+        expect(t.frames).toHaveLength(1);
+        expect(decodeReportFrame(t.frames[0])).toMatchObject({ slot: 0, reportId: 0x30 });
+    });
+
+    it('writes what the game sends to the real remote, in order, without the id byte', async () => {
+        const remote = fakeWiimote();
+        const t = await attached(remote);
+        // Linux hands each report with its id first; the rumble bit is the game's.
+        t.hp.handleMessage(output(0, 0x11, [0x11, 0x10])); // light 1
+        t.hp.handleMessage(output(0, 0x12, [0x12, 0x01, 0x31])); // report mode 0x31, rumble on
+        t.hp.handleMessage(output(0, 0x16, [0x16, 0x04, 0xb0, 0x00, 0x30, 0x01, 0x08]));
+        await vi.waitFor(() => expect(remote.sent).toHaveLength(3));
+        expect(remote.sent).toEqual([
+            [0x11, [0x10]],
+            [0x12, [0x01, 0x31]],
+            [0x16, [0x04, 0xb0, 0x00, 0x30, 0x01, 0x08]],
+        ]);
+        expect(t.hp.requests).toBe(3);
+    });
+
+    it('waits for each write before the next', async () => {
+        const remote = fakeWiimote();
+        let release;
+        const order = [];
+        remote.sendReport = vi.fn((id) => {
+            order.push(`start ${id}`);
+            return id === 0x13
+                ? new Promise((r) => (release = () => (order.push('end 19'), r())))
+                : Promise.resolve(order.push(`end ${id}`));
+        });
+        const t = await attached(remote);
+        t.hp.handleMessage(output(0, 0x13, [0x13, 0x04])); // camera on: slow
+        t.hp.handleMessage(output(0, 0x1a, [0x1a, 0x04]));
+        await vi.waitFor(() => expect(order).toEqual(['start 19']));
+        release();
+        await vi.waitFor(() => expect(order).toEqual(['start 19', 'end 19', 'start 26', 'end 26']));
+    });
+
+    it('writes nothing outside the Wii Remote output set, nor a feature', async () => {
+        const remote = fakeWiimote();
+        const t = await attached(remote);
+        t.hp.handleMessage(output(0, 0x30, [0x30, 0]));
+        t.hp.handleMessage(output(0, 0x0f, [0x0f, 0]));
+        t.hp.handleMessage({ ...output(0, 0x11, [0x11, 0x10]), kind: 'setfeature' });
+        await Promise.resolve();
+        await Promise.resolve();
+        expect(remote.sendReport).not.toHaveBeenCalled();
+        expect(t.hp.requests).toBe(3); // still counted
+    });
+
+    it('stops writing once the remote is let go, and survives a write that fails', async () => {
+        const failing = fakeWiimote({ sendFails: true });
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+        const t = await attached(failing);
+        t.hp.handleMessage(output(0, 0x11, [0x11, 0x10]));
+        t.hp.handleMessage(output(0, 0x11, [0x11, 0x20]));
+        await vi.waitFor(() => expect(failing.sendReport).toHaveBeenCalledTimes(2));
+        expect(warn).toHaveBeenCalledTimes(1); // once, not per write
+        warn.mockRestore();
+
+        const remote = fakeWiimote();
+        const u = await attached(remote);
+        u.hp.handleMessage({ type: 'hidcaps', available: false, why: 'gone' });
+        u.hp.handleMessage(output(0, 0x11, [0x11, 0x10]));
+        await Promise.resolve();
+        expect(remote.sendReport).not.toHaveBeenCalled();
+    });
+
+    it('never writes to a device that is not a Wii Remote (a wheel keeps today’s rule)', async () => {
+        const wheel = fakeDevice();
+        wheel.sendReport = vi.fn(async () => {});
+        const t = setup([wheel], ['046d:c26e']);
+        t.hp.handleMessage({ type: 'hidcaps', available: true });
+        await vi.waitFor(() => expect(t.sent).toHaveLength(1));
+        t.hp.handleMessage({ type: 'hidattached', slot: 0, ok: true });
+        t.hp.handleMessage(output(0, 0x11, [0x11, 0x10]));
+        await Promise.resolve();
+        expect(wheel.sendReport).not.toHaveBeenCalled();
+        expect(t.hp.requests).toBe(1);
+    });
+
+    it('lists a Wii Remote by its ids even when its collections say nothing of a game pad', async () => {
+        // What a DolphinBar declares above its remotes is not known yet.
+        const remote = fakeWiimote();
+        remote.collections[0].usagePage = 0xff00;
+        remote.collections[0].usage = 1;
+        const t = setup([remote], ['057e:0306']);
+        expect((await t.hp.devices()).map((d) => d.key)).toEqual(['057e:0306']);
+        t.hp.handleMessage({ type: 'hidcaps', available: true });
+        await vi.waitFor(() => expect(t.sent).toHaveLength(1));
     });
 });
 
