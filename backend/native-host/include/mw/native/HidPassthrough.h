@@ -128,6 +128,14 @@ struct HidDeviceInfo
     /// drive its motor, e.g. Logitech's HID++ 0x8123): the recreated device
     /// gets a PID block, and what games ask of it comes back as HidFfb.
     bool forceFeedback = false;
+    /// The recreated device's uniq and phys (VirtualHidIdentity); empty: the
+    /// backend's defaults.
+    std::string uniq;
+    std::string phys;
+    /// Whether a silence puts its input reports back to rest (kSilenceMs).
+    /// Off for a device that is quiet on purpose — a Wii Remote reports only
+    /// on change, and a made-up report would be a false answer to the game.
+    bool restWhenSilent = true;
 };
 
 /// What the host's OS asked of a recreated device, for the page to pass on.
@@ -299,7 +307,8 @@ private:
 ///  - after kSilenceMs without a report, each input report goes back to rest
 ///    once: buttons up, hats centred, sticks and wheels centred, pedals and
 ///    throttles at their rest end, read from the device's first report when
-///    its usages do not say (hid::restReport, Bruno's rule of 04/10);
+///    its usages do not say (hid::restReport, Bruno's rule of 04/10) — unless
+///    the device is quiet on purpose (HidDeviceInfo::restWhenSilent);
 ///  - with a parking (setParking), the devices still here when this ends go
 ///    there at rest, and attach() takes a parked one back before making one.
 class HidPassthrough
@@ -339,8 +348,10 @@ public:
     static bool forceFeedbackAvailable();
 
     /// Empty on success; otherwise why the device was refused (for the log and
-    /// the page). A slot already in use is replaced. A parked device of the
-    /// same identity is taken back rather than a new one made.
+    /// the page). A slot already in use is replaced, unless it holds this same
+    /// device (identity and tag): then it is kept, as a page that reattached
+    /// to the stream sends its devices again. A parked device of the same
+    /// identity is taken back rather than a new one made.
     std::string attach(int slot, const HidDeviceInfo& device);
     /// Once the page knows the device is there (it answered hidattached): a
     /// device taken back from the parking sends what rebuilds its force

@@ -53,7 +53,9 @@ public:
         ev.type = UHID_CREATE2;
         auto& c = ev.u.create2;
         std::strncpy(reinterpret_cast<char*>(c.name), id.name.c_str(), sizeof(c.name) - 1);
-        std::strncpy(reinterpret_cast<char*>(c.phys), "moonlightweb/hid", sizeof(c.phys) - 1);
+        const std::string phys = id.phys.empty() ? std::string("moonlightweb/hid") : id.phys;
+        std::strncpy(reinterpret_cast<char*>(c.phys), phys.c_str(), sizeof(c.phys) - 1);
+        std::strncpy(reinterpret_cast<char*>(c.uniq), id.uniq.c_str(), sizeof(c.uniq) - 1);
         if (id.descriptor.empty() || id.descriptor.size() > sizeof(c.rd_data)) {
             error = "descriptor size out of uhid's range";
             destroy();

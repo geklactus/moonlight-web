@@ -103,6 +103,7 @@ struct HidPassthrough::Slot
     std::map<uint8_t, uint16_t> lastSeq;
     int64_t lastAtMs = 0;
     bool resting = true;
+    bool restWhenSilent = true; // HidDeviceInfo::restWhenSilent
     // Taken back from the parking: attached() replays its force feedback.
     bool fromParking = false;
 
@@ -135,6 +136,14 @@ struct HidPassthrough::Slot
         return identity.vendorId == vendorId && identity.productId == productId &&
                identity.version == version && identity.name == name &&
                identity.descriptor == descriptor;
+    }
+
+    /// The same device, tag included: what a page that reattached sends again.
+    bool sameAs(const input::VirtualHidIdentity& other) const
+    {
+        return sameAs(other.name, other.vendorId, other.productId, other.version,
+                      other.descriptor) &&
+               identity.uniq == other.uniq && identity.phys == other.phys;
     }
 };
 
@@ -533,6 +542,32 @@ std::string HidPassthrough::attach(int slot, const HidDeviceInfo& device)
         pidId ? input::hid::encodeWithPid(collections, pidId) : input::hid::encode(collections);
     if (std::string why = input::hid::validate(descriptor); !why.empty()) return why;
 
+    // The same device on the same slot, sent again: a page that reattached to
+    // the stream. The game keeps the device it has — one that vanished and
+    // came back would make it set the device up all over again.
+    {
+        input::VirtualHidIdentity want;
+        want.name = device.name;
+        want.vendorId = device.vendorId;
+        want.productId = device.productId;
+        want.version = device.version;
+        want.descriptor = descriptor;
+        want.uniq = device.uniq;
+        want.phys = device.phys;
+        std::lock_guard<std::mutex> lock(m_mutex);
+        auto it = m_slots.find(slot);
+        if (it != m_slots.end() && it->second && it->second->sameAs(want)) {
+            it->second->lastSeq.clear(); // the page counts from 0 again
+            // The page's force-feedback player is a new one: attached() sends
+            // it what the game set up, as for a device taken back from the
+            // parking. Nothing for a device without force feedback.
+            it->second->fromParking = true;
+            log::info("[hid] slot " + std::to_string(slot) + ": " + device.name + " " +
+                      idsOf(device.vendorId, device.productId) + " kept (sent again)");
+            return {};
+        }
+    }
+
     // The same device, kept from the last stream: the game still has it.
     std::unique_ptr<Slot> s;
     if (m_parking) {
@@ -553,6 +588,9 @@ std::string HidPassthrough::attach(int slot, const HidDeviceInfo& device)
         s->identity.productId = device.productId;
         s->identity.version = device.version;
         s->identity.descriptor = descriptor;
+        s->identity.uniq = device.uniq;
+        s->identity.phys = device.phys;
+        s->restWhenSilent = device.restWhenSilent;
         s->pidFirstId = pidId;
         s->describe(descriptor);
         s->route = std::make_shared<Route>();
@@ -677,7 +715,7 @@ void HidPassthrough::checkSilence(int64_t nowMs)
     std::lock_guard<std::mutex> lock(m_mutex);
     for (auto& [slot, sp] : m_slots) {
         Slot& s = *sp;
-        if (s.resting || nowMs - s.lastAtMs < kSilenceMs) continue;
+        if (!s.restWhenSilent || s.resting || nowMs - s.lastAtMs < kSilenceMs) continue;
         s.rest();
         log::info("[hid] slot " + std::to_string(slot) + " silent for " +
                   std::to_string(kSilenceMs) + " ms: put to rest");

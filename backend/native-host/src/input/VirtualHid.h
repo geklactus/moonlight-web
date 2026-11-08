@@ -43,6 +43,12 @@ struct VirtualHidIdentity
     uint16_t productId = 0;
     uint16_t version = 0;
     std::vector<uint8_t> descriptor;
+    /// What the host's OS shows as the device's unique id and physical path
+    /// (uhid's uniq and phys: HID_UNIQ and HID_PHYS in its uevent). Empty: the
+    /// backend's own defaults. A co-located GameStream host tags its devices
+    /// here, so a service on that host can tell whose they are.
+    std::string uniq;
+    std::string phys;
 };
 
 class IVirtualHid
