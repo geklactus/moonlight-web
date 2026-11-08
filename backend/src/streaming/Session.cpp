@@ -802,6 +802,11 @@ void StreamSession::onLaunchResult(bool ok, const BackendError& err, const Media
     // snapshot its real NumLock/CapsLock/ScrollLock state so the browser's
     // 'locksync' aligns instead of assuming the host starts with locks off.
     m_Engine->captureHostLockState(hostIsSelf);
+    // Same gate for the HID passthrough on a GameStream host, behind its own
+    // setting: a device made here lands on this machine, so it is only ever
+    // for a host that IS this machine (GameStreamHid.h).
+    if (auto* shim = qobject_cast<MoonlightShim*>(m_Engine))
+        shim->configureHid(m_HidGameStreamLocal, hostIsSelf);
 
     // Same gate again: Sunshine loopback-captures its virtual sink POST-volume,
     // and that sink is the host's default output during the stream — volume

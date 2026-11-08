@@ -30,6 +30,7 @@
 #include "../NativeMediaEngine.h"
 #include "../../backend/streambackend/NativeHostBackend.h"
 #include "../MediaTrackRelay.h"
+#include "../MoonlightShim.h"
 #include "../StreamRelay.h"
 #include "../SignalingServer.h"
 #include "../IMediaEngine.h"
@@ -120,11 +121,27 @@ struct WorkerState
     QPointer<DataChannelRelay> relay;
     QPointer<MediaTrackRelay> mediaRelay;
     QPointer<StreamRelay> streamRelay;
+    QString hostSessionId; // the host's id for this stream's session, once resolved
     bool endedEmitted = false;
     bool exiting = false;
 };
 
 WorkerState* g_State = nullptr;
+
+/// The host's session id to a relay's engine, on the relay's thread: a
+/// GameStream host on this machine tags the devices it recreates with it
+/// (GameStreamHid.h). The engine, like the policy below, is the relay's.
+template <typename Relay> void giveHostSessionId(Relay* relay, const QString& sessionId)
+{
+    if (!relay || sessionId.isEmpty()) return;
+    QMetaObject::invokeMethod(
+        relay,
+        [relay, sessionId]() {
+            if (auto* shim = qobject_cast<MoonlightShim*>(relay->mediaEngine()))
+                shim->setHostSessionId(sessionId);
+        },
+        Qt::QueuedConnection);
+}
 
 /// Swap the input policy under a running stream.
 ///
@@ -692,6 +709,10 @@ int runStreamWorker(QCoreApplication& app)
     session->setBackend(backend);
     session->setClientUniqueId(cfg["clientUniqueId"].toString());
     session->setPreferResume(cfg["preferResume"].toBool(false));
+    // The operator's word on recreating the page's devices for a GameStream
+    // host that runs here (GameStreamHid.h). Read from the server's own config,
+    // like keyboardDebug: off unless the file says so.
+    session->setHidGameStreamLocal(AppSettings().hidPassthroughGameStreamLocal());
     // Absent (an older parent) → Public: the conservative reading, since every
     // non-Public verdict grants something.
     session->setClientKind(NetClassify::fromString(cfg["clientKind"].toString()));
@@ -761,12 +782,19 @@ int runStreamWorker(QCoreApplication& app)
     // exactly the one where it died without a teardown. Joining a shared lobby
     // so a guest sees the owner's screen is the host's own streamed UI's job
     // now (Wolf UI), not ours — see docs/integration-multiseat-wolf.md.
+    // The same id tags the devices a GameStream host on this machine recreates
+    // (GameStreamHid.h): it goes to the live relay's engine too, and to any
+    // relay made after it.
     {
         auto* resolver = new CoopSessionResolver(
             backend,
-            [](const QString& sessionId) {
+            [&state](const QString& sessionId) {
                 emitEvent({{QStringLiteral("event"), QStringLiteral("coopSession")},
                            {QStringLiteral("sessionId"), sessionId}});
+                state.hostSessionId = sessionId;
+                giveHostSessionId(state.relay.data(), sessionId);
+                giveHostSessionId(state.mediaRelay.data(), sessionId);
+                giveHostSessionId(state.streamRelay.data(), sessionId);
             },
             qApp);
         QObject::connect(session, &StreamSession::sessionStarted, qApp,
@@ -784,17 +812,20 @@ int runStreamWorker(QCoreApplication& app)
         state.relay = r;
         QObject::connect(r, &DataChannelRelay::sessionEnded, qApp, []() { teardownAndExit(0); });
         relayMouseKeys(r->mediaEngine());
+        giveHostSessionId(r, state.hostSessionId);
     });
     QObject::connect(
         session, &StreamSession::mediaTrackRelayCreated, qApp, [&state](MediaTrackRelay* r) {
             state.mediaRelay = r;
             QObject::connect(r, &MediaTrackRelay::sessionEnded, qApp, []() { teardownAndExit(0); });
             relayMouseKeys(r->mediaEngine());
+            giveHostSessionId(r, state.hostSessionId);
         });
     QObject::connect(session, &StreamSession::streamRelayCreated, qApp, [&state](StreamRelay* r) {
         state.streamRelay = r;
         QObject::connect(r, &StreamRelay::sessionEnded, qApp, []() { teardownAndExit(0); });
         relayMouseKeys(r->mediaEngine());
+        giveHostSessionId(r, state.hostSessionId);
     });
     // Session failed before any relay existed (Sunshine rejection, bind failure):
     // the response event already carried the error — just exit.

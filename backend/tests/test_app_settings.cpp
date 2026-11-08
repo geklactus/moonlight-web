@@ -550,6 +550,26 @@ void run_app_settings_tests()
         s.seedDocumentedDefaults();
     }
 
+    // Devices recreated for a GameStream host on this machine: the same rule.
+    {
+        CHECK(s.readAll().contains("hid_passthrough_gamestream_local"));
+        CHECK_EQ(s.readAll().value("hid_passthrough_gamestream_local").toBool(true), false);
+        CHECK(!s.hidPassthroughGameStreamLocal());
+        QJsonObject obj = s.readAll();
+        obj["hid_passthrough_gamestream_local"] = true;
+        s.writeAll(obj);
+        CHECK(s.hidPassthroughGameStreamLocal());
+        s.seedDocumentedDefaults();
+        CHECK(s.hidPassthroughGameStreamLocal());
+        obj["hid_passthrough_gamestream_local"] = "true";
+        s.writeAll(obj);
+        CHECK(!s.hidPassthroughGameStreamLocal());
+        obj.remove("hid_passthrough_gamestream_local");
+        s.writeAll(obj);
+        CHECK(!s.hidPassthroughGameStreamLocal());
+        s.seedDocumentedDefaults();
+    }
+
     // A booth lets no guest in unless the owner wrote a real true (issue #40):
     // seeded as false, absent reads as false, a string or 1 is not a decision.
     {

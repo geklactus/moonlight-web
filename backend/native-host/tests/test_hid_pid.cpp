@@ -738,6 +738,35 @@ void run_hid_parking_tests()
         CHECK_EQ(w.get(b.getFeature(19 + 11), Kind::Feature, P(0x22)), 3);
     }
 
+    SECTION("HID passthrough — a wheel sent again on its slot (a page that reattached) is kept, "
+            "and its new player hears what the game set up");
+    {
+        ParkLog log;
+        int64_t now = 0;
+        ParkFake* live = nullptr;
+        HidPassthrough hp(
+            nullptr,
+            [&] {
+                auto d = std::make_unique<ParkFake>(log);
+                live = d.get();
+                return d;
+            },
+            [&] { return now; });
+        std::vector<HidFfb> ops;
+        hp.setFfbSink([&](const HidFfb& o) { ops.push_back(o); });
+        CHECK(hp.attach(0, ffbWheel()).empty());
+        hp.attached(0);
+        playConstant(*live, Writer{parse(log.descriptor)}, -2500, true);
+        CHECK(!ops.empty());
+        ops.clear();
+
+        CHECK(hp.attach(0, ffbWheel()).empty());
+        CHECK_EQ(log.created, 1);
+        CHECK_EQ(log.destroyed, 0);
+        hp.attached(0);
+        CHECK(namesOf(ops) == (std::vector<std::string>{"effect:1", "constant:1", "start:1"}));
+    }
+
     SECTION("HID parking — a stream that ends leaves its wheel at rest, the next takes it back");
     {
         ParkLog log;

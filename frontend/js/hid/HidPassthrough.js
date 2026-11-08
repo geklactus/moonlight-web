@@ -12,9 +12,13 @@ import {
     GAME_FILTERS,
     HID_MAX_SLOTS,
     HidReportPump,
+    WIIMOTE_FILTERS,
+    WIIMOTE_REPLY_IDS,
     attachMessage,
     detachMessage,
     isGameDevice,
+    isWiimote,
+    isWiimoteOutput,
     modelFilters,
 } from './hidWire.js';
 import { padKind, padName, parsePadId } from '../stream/gamepadMapping.js';
@@ -43,6 +47,15 @@ import { HidppRelay, hidppInputIds, isHidppReport } from './hidppRelay.js';
  * What the host asks back (`hidrequest`: output reports, features) is counted
  * and never written to the real device: a host writing to a wheel's vendor
  * interface could reprogram it.
+ *
+ * One exception, the Wii Remote (isWiimote), which only a GameStream host on
+ * its own machine takes (Wolf on LOLA, behind its operator's setting): the game
+ * drives the real remote itself — lights, rumble, the camera's and the
+ * extensions' set-up, the speaker — so the host's output reports (0x10–0x1a,
+ * its whole set) are written to it, in the order they came, one at a time.
+ * Its answers (status, memory reads, acknowledgements) go back as `hidreply`
+ * on this reliable channel; its data reports on 'hid' as any device's.
+ * linkWiimote() opens Chrome's chooser for it.
  *
  * Force feedback (P4) takes its own road, and only when the host says it can
  * (`hidcaps.ffb`): the host decodes what the game asks of the recreated wheel
@@ -79,6 +92,11 @@ const fromBase64 = (text) => {
         return new Uint8Array(0);
     }
 };
+
+/** A device this page may send: a game device, or a Wii Remote by its ids. */
+function sendable(device) {
+    return isGameDevice(device.collections) || isWiimote(device);
+}
 
 /** The key GamepadManager knows the same device by. */
 export function padKeyOf(device) {
@@ -226,19 +244,17 @@ export class HidPassthrough {
         if (!this._hid) return [];
         const forwarded = loadForwarded(this._storage);
         const list = await this._hid.getDevices();
-        return list
-            .filter((d) => isGameDevice(d.collections))
-            .map((d) => {
-                const e = this._entries.get(d);
-                return {
-                    device: d,
-                    key: deviceKey(d),
-                    name: d.productName || deviceKey(d),
-                    wanted: forwarded.has(deviceKey(d)),
-                    state: e ? e.state : 'off',
-                    why: e ? e.why : '',
-                };
-            });
+        return list.filter(sendable).map((d) => {
+            const e = this._entries.get(d);
+            return {
+                device: d,
+                key: deviceKey(d),
+                name: d.productName || deviceKey(d),
+                wanted: forwarded.has(deviceKey(d)),
+                state: e ? e.state : 'off',
+                why: e ? e.why : '',
+            };
+        });
     }
 
     /**
@@ -261,6 +277,10 @@ export class HidPassthrough {
                 available: !!msg.available,
                 ffb: !!msg.ffb,
                 hidpp: !!msg.hidpp,
+                // The host said the game drives the real Wii Remote (a
+                // GameStream host on its own machine, opted in): only then are
+                // its output reports written to it.
+                wiimote: !!msg.wiimote,
                 why: String(msg.why || ''),
             };
             if (this._caps.available) {
@@ -297,7 +317,20 @@ export class HidPassthrough {
         }
         if (msg.type === 'hidrequest') {
             this._requests++;
-            const relay = this._entryBySlot(msg.slot)?.[1].relay;
+            const entry = this._entryBySlot(msg.slot);
+            if (entry && isWiimote(entry[0])) {
+                // Written only for a host that said the game drives the remote
+                // (hidcaps.wiimote), and only once it took the device.
+                if (
+                    this._caps?.wiimote &&
+                    entry[1].state === 'on' &&
+                    msg.kind === 'output' &&
+                    isWiimoteOutput(msg.reportId)
+                )
+                    this._writeWiimote(entry[0], entry[1], msg.reportId, fromBase64(msg.data));
+                return true;
+            }
+            const relay = entry?.[1].relay;
             if (relay && msg.kind === 'output' && isHidppReport(msg.reportId)) {
                 let bytes = fromBase64(msg.data);
                 // Linux hands the report with its id first.
@@ -331,7 +364,7 @@ export class HidPassthrough {
         if (!this._hid || !this._caps?.available) return;
         const keys = loadForwarded(this._storage);
         for (const d of await this._hid.getDevices()) {
-            if (keys.has(deviceKey(d)) && isGameDevice(d.collections)) await this._attach(d);
+            if (keys.has(deviceKey(d)) && sendable(d)) await this._attach(d);
         }
         this._changed();
     }
@@ -356,6 +389,31 @@ export class HidPassthrough {
         for (const d of chosen) await this._attach(d);
         this._changed();
         return chosen.length > 0;
+    }
+
+    /**
+     * Chrome's chooser for a Wii Remote, from a click, tap or key press (a
+     * gamepad press does not count). What the viewer picked is switched on —
+     * remembered as the other devices are — and sent at once when the host can.
+     * @returns {Promise<HIDDevice[]>} the remotes picked
+     */
+    async linkWiimote() {
+        if (!this._hid) return [];
+        let chosen = [];
+        try {
+            chosen = await this._hid.requestDevice({ filters: WIIMOTE_FILTERS });
+        } catch {
+            chosen = [];
+        }
+        chosen = chosen.filter(isWiimote);
+        if (chosen.length) {
+            const keys = loadForwarded(this._storage);
+            for (const d of chosen) keys.add(deviceKey(d));
+            saveForwarded(keys, this._storage);
+        }
+        for (const d of chosen) await this._attach(d);
+        this._changed();
+        return chosen;
     }
 
     /**
@@ -416,9 +474,15 @@ export class HidPassthrough {
             return;
         }
         const hidppIds = hasHidpp(device) ? hidppInputIds(device) : new Set();
+        // A Wii Remote's answers: once each, on the reliable channel.
+        const replyIds = isWiimote(device) ? WIIMOTE_REPLY_IDS : new Set();
         const listener = (e) => {
             if (hidppIds.has(e.reportId)) return;
             const bytes = new Uint8Array(e.data.buffer, e.data.byteOffset, e.data.byteLength);
+            if (replyIds.has(e.reportId)) {
+                this._send({ type: 'hidreply', slot, reportId: e.reportId, data: toBase64(bytes) });
+                return;
+            }
             this._sendFrame(this._pump.report(slot, e.reportId, bytes, this._now()));
         };
         device.addEventListener('inputreport', listener);
@@ -527,6 +591,23 @@ export class HidPassthrough {
     _entryBySlot(slot) {
         for (const pair of this._entries) if (pair[1].slot === slot) return pair;
         return null;
+    }
+
+    // What the game wrote to the recreated Wii Remote, to the real one: in the
+    // order it came, each write awaited before the next (the camera's set-up
+    // and the memory writes depend on it), the bytes as they are — rumble is
+    // bit 0 of every one, and the game sets it. Linux hands the report with its
+    // id first; WebHID takes the id apart. A device let go stops the queue.
+    _writeWiimote(device, e, reportId, bytes) {
+        const payload = bytes[0] === reportId ? bytes.subarray(1) : bytes;
+        const write = () =>
+            e.slot >= 0 && e.state === 'on' && this._entries.get(device) === e
+                ? device.sendReport(reportId, payload)
+                : undefined;
+        e.writes = (e.writes || Promise.resolve()).then(write).catch((err) => {
+            if (!e.writeFailed) console.warn('[HID] Wii Remote write:', err?.message || err);
+            e.writeFailed = true;
+        });
     }
 
     _armTimer() {

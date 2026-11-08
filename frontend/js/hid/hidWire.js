@@ -39,6 +39,33 @@ export const GAME_FILTERS = [
     { usagePage: 0x02 }, // Simulation Controls (wheels, pedals)
 ];
 
+// The Wii Remote and the Wii Remote Plus, by their ids alone: what a DolphinBar
+// declares above them is not known, and the ids are what Dolphin takes as a
+// real remote. Only a GameStream host on the host's own machine (Wolf on LOLA)
+// recreates them, behind its operator's setting.
+export const WIIMOTE_FILTERS = [
+    { vendorId: 0x057e, productId: 0x0306 }, // Nintendo RVL-CNT-01
+    { vendorId: 0x057e, productId: 0x0330 }, // Nintendo RVL-CNT-01-TR
+];
+
+/** True for a Wii Remote (either model), from its ids. */
+export function isWiimote(device) {
+    return WIIMOTE_FILTERS.some(
+        (f) => f.vendorId === device?.vendorId && f.productId === device?.productId,
+    );
+}
+
+// A Wii Remote's answers, each the one reply to one request: status (0x20),
+// a memory read (0x21), an acknowledged write (0x22). They go on the reliable
+// channel as hidreply, never on 'hid', whose losses and repeats would drop or
+// replay them; its data reports (0x30–0x3f) carry whole states and go on 'hid'.
+export const WIIMOTE_REPLY_IDS = new Set([0x20, 0x21, 0x22]);
+
+/** A Wii Remote output report (0x10 rumble … 0x1a speaker mute): its whole set. */
+export function isWiimoteOutput(reportId) {
+    return reportId >= 0x10 && reportId <= 0x1a;
+}
+
 const ITEM_FIELDS = [
     'isAbsolute',
     'isArray',

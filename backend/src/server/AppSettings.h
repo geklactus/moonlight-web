@@ -160,6 +160,21 @@ public:
 
     bool shareGuestsAdminWindows() const;
 
+    // ── HID passthrough for a GameStream host on this machine ────────────────
+    //
+    // Whether the page's WebHID devices (Wii Remotes only, for now) are
+    // recreated here through uhid for a GameStream host — which is only ever
+    // honoured when that host's address is this machine (GameStreamHid.h). For
+    // a Wolf on the same box whose own service hands each device to the right
+    // player's game container; anywhere else a device made here would land on
+    // this machine's desktop, driven by whoever streams. Off by default.
+    //
+    // File-only setting (no UI, no write route): stored as JSON bool
+    // "hid_passthrough_gamestream_local", DEFAULT false, seeded so it can be
+    // found, read when each stream's worker starts.
+
+    bool hidPassthroughGameStreamLocal() const;
+
     // ── Sharing from a booth ──────────────────────────────────────────────────
     //
     // Whether booth mode (--noadmin) still lets the one streaming invite guests

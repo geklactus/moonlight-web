@@ -237,7 +237,9 @@ void run_hid_passthrough_tests()
               asked[0].reportId == 5);
         CHECK(asked[0].data == (std::vector<uint8_t>{5, 1, 2}));
 
-        CHECK(hp.attach(2, wheel()).empty()); // replaces the first
+        HidDeviceInfo other = wheel();
+        other.name = "Another wheel";
+        CHECK(hp.attach(2, other).empty()); // replaces the first
         CHECK_EQ(log.destroyed, 1);
         hp.detach(2);
         CHECK_EQ(log.destroyed, 2);
@@ -246,6 +248,51 @@ void run_hid_passthrough_tests()
         CHECK(hp.attach(1, wheel()).empty());
         hp.detachAll();
         CHECK_EQ(log.destroyed, 4);
+    }
+
+    SECTION("HID passthrough — the same device sent again on its slot is kept, not made again");
+    {
+        FakeLog log;
+        HidPassthrough hp(
+            nullptr, [&] { return std::make_unique<FakeHid>(log); }, [] { return int64_t{0}; });
+        HidDeviceInfo d = wheel();
+        d.uniq = "wolf:7:0";
+        CHECK(hp.attach(0, d).empty());
+        const uint8_t r[4] = {0x08, 0x00, 0x80, 0};
+        hp.input(0, 1, 500, r, 4);
+        // A page that reattached sends it again, counting from 0.
+        CHECK(hp.attach(0, d).empty());
+        CHECK_EQ(log.created.size(), static_cast<size_t>(1));
+        CHECK_EQ(log.destroyed, 0);
+        hp.input(0, 1, 0, r, 4); // not "late": the count started over
+        CHECK_EQ(log.inputs.size(), static_cast<size_t>(2));
+        // Another tag is another device.
+        d.uniq = "wolf:8:0";
+        CHECK(hp.attach(0, d).empty());
+        CHECK_EQ(log.created.size(), static_cast<size_t>(2));
+        CHECK_EQ(log.destroyed, 1);
+    }
+
+    SECTION("HID passthrough — uniq and phys reach the backend; a quiet device is never put to "
+            "rest");
+    {
+        FakeLog log;
+        HidPassthrough hp(
+            nullptr, [&] { return std::make_unique<FakeHid>(log); }, [] { return int64_t{0}; });
+        HidDeviceInfo d = wheel();
+        d.uniq = "wolf:12345:3";
+        d.phys = "moonlightweb/wolf";
+        d.restWhenSilent = false;
+        CHECK(hp.attach(3, d).empty());
+        CHECK(log.created[0].uniq == "wolf:12345:3");
+        CHECK(log.created[0].phys == "moonlightweb/wolf");
+        const uint8_t r[4] = {0x53, 0x34, 0x12, 200}; // far from rest
+        hp.input(3, 1, 1, r, 4);
+        hp.checkSilence(HidPassthrough::kSilenceMs * 100);
+        CHECK_EQ(log.inputs.size(), static_cast<size_t>(1));
+        // Untagged by default: the backend's own uniq and phys.
+        CHECK(hp.attach(4, wheel()).empty());
+        CHECK(log.created[1].uniq.empty() && log.created[1].phys.empty());
     }
 
     SECTION("HID passthrough — a backend that cannot be made refuses the device");

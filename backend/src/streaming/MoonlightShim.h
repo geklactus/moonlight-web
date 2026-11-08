@@ -34,6 +34,7 @@
 
 class QTimer;
 class InputWatchdog;
+class GameStreamHid;
 
 struct _SERVER_INFORMATION;
 struct _STREAM_CONFIGURATION;
@@ -163,6 +164,27 @@ public:
     /// once before the connection starts.
     void setControllerOffset(int offset) override { m_ControllerOffset = offset; }
 
+    // ── HID passthrough, on a host that runs on this machine ────────────────
+    //
+    // Off unless the operator's hid_passthrough_gamestream_local says so AND
+    // the host is this machine; then the page's devices are recreated here
+    // through uhid, tagged with the host's session id (GameStreamHid.h).
+    // Session calls these two before the connection starts and once the
+    // host's session id is known; hidCapsChanged() tells the relay to send
+    // hidcaps again when the answer moved.
+    void configureHid(bool enabled, bool hostIsSelf);
+    void setHostSessionId(const QString& sessionId);
+    QString hidUnavailableReason() const override;
+    QString hidAttach(int slot, const QJsonObject& message) override;
+    void hidAttached(int slot) override;
+    void hidInput(const uint8_t* frame, size_t size) override;
+    void hidDetach(int slot) override;
+    void hidReply(int slot, int reportId, const QByteArray& data) override;
+    /// True exactly when the passthrough is available (setting, host here,
+    /// uhid, session id): the page may then write the game's reports to the
+    /// real Wii Remote.
+    bool hidWritesWiimote() const override;
+
     // ── Input watchdog (dead-man switch) ────────────────────────────────────
     //
     // The contract and the rationale live in InputWatchdog.h: the watchdog is
@@ -286,6 +308,9 @@ public:
     // definitions of the same signal on one object.
 
 private:
+    // The HID passthrough (see configureHid). Its devices go when the
+    // connection stops, and with this object at the latest.
+    std::unique_ptr<GameStreamHid> m_Hid;
     QPointer<QThread> m_WorkerThread;
     std::atomic<bool> m_Connected{false};
     std::atomic<bool> m_Stopping{false};

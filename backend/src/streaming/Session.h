@@ -313,6 +313,13 @@ public:
     /// hint (e.g. the app just exited).
     void setPreferResume(bool prefer) { m_PreferResume = prefer; }
 
+    /// The operator's hid_passthrough_gamestream_local: a GameStream host on
+    /// THIS machine recreates the page's devices (GameStreamHid.h). Set before
+    /// the session starts.
+    /// The host's session id comes later, straight to the engine (the worker's
+    /// CoopSessionResolver): this session object is gone by then.
+    void setHidGameStreamLocal(bool on) { m_HidGameStreamLocal = on; }
+
     /// Set the actual HTTPS port used by HttpServer (may differ from 443
     /// due to port fallback). Used to construct the correct wsUrl() for
     /// the browser when sharing the unified port.
@@ -506,6 +513,7 @@ private:
     QString m_ClientUniqueId;
     /// Resume directly instead of launching (see setPreferResume).
     bool m_PreferResume = false;
+    bool m_HidGameStreamLocal = false; ///< see setHidGameStreamLocal
     QNetworkReply* m_LaunchReply = nullptr;
     /// Track which start paths we've tried, so launch↔resume fallback (used when
     /// the registry hint is stale) terminates instead of looping.

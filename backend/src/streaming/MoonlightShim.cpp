@@ -17,6 +17,7 @@
 
 #include "MoonlightShim.h"
 #include "AnnexBFiller.h"
+#include "GameStreamHid.h"
 #include "InputWatchdog.h"
 
 #include "common/MacActivity.h"
@@ -62,10 +63,26 @@ MoonlightShim::MoonlightShim(QObject* parent)
         LiSendMultiControllerEvent(controller, mask, 0, 0, 0, 0, 0, 0, 0);
     };
     m_Watchdog = new InputWatchdog(std::move(sink), this);
+
+    // What the host's OS asks of a recreated device leaves on a uhid thread;
+    // the relay that sends it to the page listens on this engine's thread.
+    m_Hid = std::make_unique<GameStreamHid>([this](const mw::native::HidRequest& r) {
+        const int kind = static_cast<int>(r.kind);
+        const QByteArray data(reinterpret_cast<const char*>(r.data.data()),
+                              static_cast<int>(r.data.size()));
+        const int slot = r.slot;
+        const int reportId = r.reportId;
+        QMetaObject::invokeMethod(
+            this,
+            [this, slot, kind, reportId, data]() { emit hidRequest(slot, kind, reportId, data); },
+            Qt::QueuedConnection);
+    });
 }
 
 MoonlightShim::~MoonlightShim()
 {
+    // First: a recreated device's thread may still be asking (see above).
+    m_Hid->detachAll();
     // Use blocking stop to ensure cleanup completes before destruction.
     // Non-blocking stopConnection() defers LiStopConnection() via the
     // QThread::finished signal, but the destructor cannot wait for that
@@ -247,6 +264,10 @@ void MoonlightShim::stopConnection()
             << "m_Connected=" << m_Connected.load() << "m_WorkerThread=" << m_WorkerThread;
 
     m_Connected = false;
+
+    // The stream ends: the devices it recreated go with it, now — the host's
+    // service then takes their nodes out of the game's container.
+    m_Hid->detachAll();
 
     // LiInterruptConnection() is thread-safe — just sets an atomic flag in
     // moonlight-common-c. The worker thread's LiStartConnection() will check
@@ -721,6 +742,53 @@ void MoonlightShim::captureHostLockState(bool hostIsSelf)
     Q_UNUSED(hostIsSelf);
 #endif
     m_HostLockState.store(-1, std::memory_order_release);
+}
+
+// ── HID passthrough (GameStreamHid.h) ───────────────────────────────────────
+
+void MoonlightShim::configureHid(bool enabled, bool hostIsSelf)
+{
+    m_Hid->configure(enabled, hostIsSelf);
+}
+
+void MoonlightShim::setHostSessionId(const QString& sessionId)
+{
+    if (m_Hid->setSessionId(sessionId)) emit hidCapsChanged();
+}
+
+QString MoonlightShim::hidUnavailableReason() const
+{
+    return m_Hid->unavailableReason();
+}
+
+QString MoonlightShim::hidAttach(int slot, const QJsonObject& message)
+{
+    return m_Hid->attach(slot, message);
+}
+
+void MoonlightShim::hidAttached(int slot)
+{
+    m_Hid->attached(slot);
+}
+
+void MoonlightShim::hidInput(const uint8_t* frame, size_t size)
+{
+    m_Hid->input(frame, size);
+}
+
+void MoonlightShim::hidDetach(int slot)
+{
+    m_Hid->detach(slot);
+}
+
+void MoonlightShim::hidReply(int slot, int reportId, const QByteArray& data)
+{
+    m_Hid->reply(slot, reportId, data);
+}
+
+bool MoonlightShim::hidWritesWiimote() const
+{
+    return m_Hid->unavailableReason().isEmpty();
 }
 
 void MoonlightShim::syncLockKeys(bool numLock, bool capsLock, bool scrollLock)
