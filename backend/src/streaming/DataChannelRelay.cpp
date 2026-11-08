@@ -577,6 +577,9 @@ DataChannelRelay::DataChannelRelay(IMediaEngine* engine, QObject* parent)
                     m_InputDc->send(std::string(j.constData(), j.size()));
                 } catch (const std::exception&) {}
             });
+    // Whether this host recreates devices changed mid-stream (a GameStream
+    // host on this machine learned its session id): the page asks again.
+    connect(m_Shim, &IMediaEngine::hidCapsChanged, this, [this]() { sendHidCaps(); });
 
     // Force feedback a game asked of a recreated wheel, for the page to play on
     // the real one. Reliable and ordered like the rest of this channel: an

@@ -399,6 +399,10 @@ void AppSettings::seedDocumentedDefaults()
         obj["share_guests_admin_windows"] = false;
         changed = true;
     }
+    if (!obj.contains("hid_passthrough_gamestream_local")) {
+        obj["hid_passthrough_gamestream_local"] = false;
+        changed = true;
+    }
     if (!obj.contains("share_in_booth_mode")) {
         obj["share_in_booth_mode"] = false;
         changed = true;
@@ -710,6 +714,13 @@ bool AppSettings::shareGuestsAdminWindows() const
     // Only a real true opens them: a value someone typed as "true" (a string)
     // or 1 is not a decision to make a stranger administrator.
     return obj.value("share_guests_admin_windows").toBool(false);
+}
+
+bool AppSettings::hidPassthroughGameStreamLocal() const
+{
+    // A real true only, as above: a device a stranger drives is not one to
+    // make on a string someone typed.
+    return readAll().value("hid_passthrough_gamestream_local").toBool(false);
 }
 
 bool AppSettings::shareInBoothMode() const

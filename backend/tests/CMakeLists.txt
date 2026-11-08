@@ -54,6 +54,7 @@ add_executable(run_tests
     test_input_encoder.cpp
     test_hid_collections_json.cpp
     test_hid_parked_json.cpp
+    test_gamestream_hid.cpp
     test_stream_config.cpp
     test_input_crypto.cpp
     test_rest_router.cpp
@@ -146,6 +147,16 @@ add_executable(run_tests
     # Its wheels kept between two streams, as they travel between processes.
     ${_src}/src/streaming/HidParkedJson.cpp
     ${_src}/native-host/src/input/HidDescriptor.cpp
+    # The passthrough on a GameStream host that runs here (a Wii Remote for Wolf
+    # on the same machine), and the native passthrough it drives, against a
+    # fake uhid: VirtualHid_none is the backend of an OS without one, so no
+    # device is ever made by the tests.
+    ${_src}/src/streaming/GameStreamHid.cpp
+    ${_src}/native-host/src/input/HidPassthrough.cpp
+    ${_src}/native-host/src/input/HidPid.cpp
+    ${_src}/native-host/src/input/HidFfbJournal.cpp
+    ${_src}/native-host/src/input/VirtualHid_none.cpp
+    ${_src}/native-host/src/core/Log.cpp
     ${_src}/src/streaming/StreamConfig.cpp
     ${_src}/src/streaming/InputCrypto.cpp
     ${_src}/src/server/RestRouter.cpp

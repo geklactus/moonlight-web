@@ -466,6 +466,11 @@ signals:
     /// page's hidffb message (mw::native::HidFfb): op, effect, kind, fields.
     void hidFfb(QJsonObject message);
 
+    /// What hidUnavailableReason() says changed after the stream started (a
+    /// GameStream host on this machine, once its session id is known): the
+    /// relay sends the page hidcaps again.
+    void hidCapsChanged();
+
     /// The mouse pointer's SHAPE changed, and the browser is the one drawing it.
     ///
     /// Native host only, and only in desktop mode — see setCompositeCursor.
