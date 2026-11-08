@@ -431,6 +431,12 @@ public:
     /// Its force feedback refuses a non-USB device, so none comes this way.
     /// Announced in hidcaps as `hidpp`.
     virtual bool hidRelaysHidpp() const { return false; }
+    /// Whether the page should write the host's output reports to a Wii
+    /// Remote it sends: only a GameStream host on this machine whose operator
+    /// turned the passthrough on (GameStreamHid.h), where the game drives the
+    /// real remote. Every other host's requests stay counted, never written.
+    /// Announced in hidcaps as `wiimote`.
+    virtual bool hidWritesWiimote() const { return false; }
     /// Whether a recreated device can carry force feedback back to the page
     /// (a PID block pid.dll drives on Windows, a uinput device whose effects
     /// the host services on Linux). Announced in hidcaps.

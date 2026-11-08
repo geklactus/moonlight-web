@@ -180,6 +180,10 @@ public:
     void hidInput(const uint8_t* frame, size_t size) override;
     void hidDetach(int slot) override;
     void hidReply(int slot, int reportId, const QByteArray& data) override;
+    /// True exactly when the passthrough is available (setting, host here,
+    /// uhid, session id): the page may then write the game's reports to the
+    /// real Wii Remote.
+    bool hidWritesWiimote() const override;
 
     // ── Input watchdog (dead-man switch) ────────────────────────────────────
     //

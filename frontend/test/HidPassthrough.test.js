@@ -195,6 +195,7 @@ describe('HidPassthrough (HID passthrough in the stream, P2)', () => {
             available: false,
             ffb: false,
             hidpp: false,
+            wiimote: false,
             why: 'needs the native host',
         });
 
@@ -409,9 +410,9 @@ describe('HidPassthrough — a Wii Remote, for a GameStream host on its own mach
         data: b64(bytes),
     });
 
-    async function attached(remote) {
+    async function attached(remote, caps = { available: true, wiimote: true }) {
         const t = setup([remote], [deviceKey(remote)]);
-        t.hp.handleMessage({ type: 'hidcaps', available: true });
+        t.hp.handleMessage({ type: 'hidcaps', ...caps });
         await vi.waitFor(() => expect(t.sent).toHaveLength(1));
         t.hp.handleMessage({ type: 'hidattached', slot: 0, ok: true });
         return t;
@@ -469,6 +470,25 @@ describe('HidPassthrough — a Wii Remote, for a GameStream host on its own mach
             [0x16, [0x04, 0xb0, 0x00, 0x30, 0x01, 0x08]],
         ]);
         expect(t.hp.requests).toBe(3);
+    });
+
+    it('writes nothing unless the host said the game drives the remote, nor before it took it', async () => {
+        // A host that recreates devices but did not opt in (the native host).
+        const remote = fakeWiimote();
+        const t = await attached(remote, { available: true });
+        t.hp.handleMessage(output(0, 0x11, [0x11, 0x10]));
+        await Promise.resolve();
+        expect(remote.sendReport).not.toHaveBeenCalled();
+        expect(t.hp.requests).toBe(1);
+
+        // Opted in, but the device not taken yet (no hidattached).
+        const pending = fakeWiimote();
+        const u = setup([pending], [deviceKey(pending)]);
+        u.hp.handleMessage({ type: 'hidcaps', available: true, wiimote: true });
+        await vi.waitFor(() => expect(u.sent).toHaveLength(1));
+        u.hp.handleMessage(output(0, 0x11, [0x11, 0x10]));
+        await Promise.resolve();
+        expect(pending.sendReport).not.toHaveBeenCalled();
     });
 
     it('waits for each write before the next', async () => {

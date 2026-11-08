@@ -277,6 +277,10 @@ export class HidPassthrough {
                 available: !!msg.available,
                 ffb: !!msg.ffb,
                 hidpp: !!msg.hidpp,
+                // The host said the game drives the real Wii Remote (a
+                // GameStream host on its own machine, opted in): only then are
+                // its output reports written to it.
+                wiimote: !!msg.wiimote,
                 why: String(msg.why || ''),
             };
             if (this._caps.available) {
@@ -315,7 +319,14 @@ export class HidPassthrough {
             this._requests++;
             const entry = this._entryBySlot(msg.slot);
             if (entry && isWiimote(entry[0])) {
-                if (msg.kind === 'output' && isWiimoteOutput(msg.reportId))
+                // Written only for a host that said the game drives the remote
+                // (hidcaps.wiimote), and only once it took the device.
+                if (
+                    this._caps?.wiimote &&
+                    entry[1].state === 'on' &&
+                    msg.kind === 'output' &&
+                    isWiimoteOutput(msg.reportId)
+                )
                     this._writeWiimote(entry[0], entry[1], msg.reportId, fromBase64(msg.data));
                 return true;
             }
@@ -590,7 +601,7 @@ export class HidPassthrough {
     _writeWiimote(device, e, reportId, bytes) {
         const payload = bytes[0] === reportId ? bytes.subarray(1) : bytes;
         const write = () =>
-            e.slot >= 0 && this._entries.get(device) === e
+            e.slot >= 0 && e.state === 'on' && this._entries.get(device) === e
                 ? device.sendReport(reportId, payload)
                 : undefined;
         e.writes = (e.writes || Promise.resolve()).then(write).catch((err) => {

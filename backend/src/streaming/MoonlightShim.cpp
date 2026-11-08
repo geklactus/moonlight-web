@@ -786,6 +786,11 @@ void MoonlightShim::hidReply(int slot, int reportId, const QByteArray& data)
     m_Hid->reply(slot, reportId, data);
 }
 
+bool MoonlightShim::hidWritesWiimote() const
+{
+    return m_Hid->unavailableReason().isEmpty();
+}
+
 void MoonlightShim::syncLockKeys(bool numLock, bool capsLock, bool scrollLock)
 {
     if (!m_Connected.load(std::memory_order_acquire)) return;

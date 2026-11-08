@@ -258,5 +258,6 @@ QJsonObject RelayBase::hidCapsMessage(const InputMsg::Policy& policy, IMediaEngi
                        {QStringLiteral("available"), why.isEmpty()},
                        {QStringLiteral("ffb"), why.isEmpty() && engine.hidForceFeedback()},
                        {QStringLiteral("hidpp"), why.isEmpty() && engine.hidRelaysHidpp()},
+                       {QStringLiteral("wiimote"), why.isEmpty() && engine.hidWritesWiimote()},
                        {QStringLiteral("why"), why}};
 }
