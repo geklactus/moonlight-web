@@ -173,6 +173,23 @@ import { flushClientLog, serverDiag } from '../util/ClientLog.js';
 import { UltraPlayer, presentMode, ultraPlayerSupported } from '../stream/ultra/UltraPlayer.js';
 
 /**
+ * The launcher's "a Wii Remote at this computer" choice rides in the stream
+ * URL's query string (lola play.js appends ?wiimote=here). During startup the
+ * app canonicalizes its address to '/' (several history.replaceState calls in
+ * app.js), which clears location.search long before the stream's `hidcaps`
+ * message arrives and _offerWiimote() looks for the choice. This module
+ * evaluates at import — before that cleanup runs — so read the launch query
+ * once, here, and keep it.
+ */
+const LAUNCH_WIIMOTE_HERE = (() => {
+    try {
+        return new URLSearchParams(location.search).get('wiimote') === 'here';
+    } catch {
+        return false;
+    }
+})();
+
+/**
  * Lane name → the i18n key the card already uses for that value. The graph
  * names its lanes with the very words of the rows it plots: two names for one
  * number would read as two measurements.
@@ -8119,6 +8136,9 @@ export class StreamView {
 
     /** The launcher asked for a Wii Remote at this computer (lola play.js passes ?wiimote=here). */
     _wiimoteLocalPick() {
+        // The captured launch query is the source of truth; the live read is a
+        // fallback for the rare case the URL still carries the param.
+        if (LAUNCH_WIIMOTE_HERE) return true;
         try {
             return new URLSearchParams(location.search).get('wiimote') === 'here';
         } catch {
