@@ -293,7 +293,18 @@ jobs:
         with:
           arch: x64
       - name: Install OpenCppCoverage
-        run: choco install opencppcoverage -y
+        shell: pwsh
+        # Chocolatey proxies this installer straight from GitHub releases, which returns an occasional
+        # 504; retry so a CDN hiccup is a 15 s pause, not a red build for an unrelated PR.
+        run: |
+          for ($i = 1; $i -le 3; $i++) {
+            choco install opencppcoverage -y --no-progress
+            if ($LASTEXITCODE -eq 0) { exit 0 }
+            Write-Host "::warning::choco install opencppcoverage failed (attempt $i/3); retrying in 15s"
+            Start-Sleep -Seconds 15
+          }
+          Write-Error "choco install opencppcoverage failed after 3 attempts"
+          exit 1
       - name: Add OpenCppCoverage to PATH
         shell: pwsh
         run: echo "C:\Program Files\OpenCppCoverage" | Out-File -FilePath $env:GITHUB_PATH -Append
