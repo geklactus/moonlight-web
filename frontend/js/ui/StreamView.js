@@ -8086,6 +8086,7 @@ export class StreamView {
                 if (ok) Toast.info(t('stream.hidForwarded', { name }), { durationMs: 5000 });
                 else Toast.warning(t('stream.hidRefused', { name, why }), { durationMs: 8000 });
             },
+            onWiimote: (ev) => this._onWiimoteEvent(ev),
         });
         // Chrome shows a pad once a button is pressed: offer it then too.
         this._onHidPadConnected = () => this._offerHid();
@@ -8116,13 +8117,89 @@ export class StreamView {
         }
     }
 
+    /** The launcher asked for a Wii Remote at this computer (lola play.js passes ?wiimote=here). */
+    _wiimoteLocalPick() {
+        try {
+            return new URLSearchParams(location.search).get('wiimote') === 'here';
+        } catch {
+            return false;
+        }
+    }
+
+    /**
+     * When the player chose "a Wii Remote at this computer" in the launcher, offer to connect one here.
+     * WebHID's chooser needs a click and its permission belongs to this origin, so the launcher can't do
+     * it. A remote already allowed reconnects with no click (getDevices); otherwise a sticky banner's one
+     * button opens the chooser. The live-entry pick narrows a DolphinBar's four to the streaming one.
+     */
+    async _offerWiimote() {
+        const hp = this._hidPassthrough;
+        if (!hp || this._quitting || !this._wiimoteLocalPick() || !navigator.hid) return;
+        if (this._wiimoteConnected || this._wiimoteOffered) return;
+        this._wiimoteOffered = true;
+        if (await hp.linkWiimoteRemembered()) return; // reconnected; onWiimote('attached') shows status
+        if (hp !== this._hidPassthrough || this._wiimoteConnected) return;
+        this._wiimoteConnectToast?.dismiss();
+        this._wiimoteConnectToast = Toast.info(t('stream.wiimoteConnect'), {
+            sticky: true,
+            action: {
+                label: t('stream.wiimoteConnectAction'),
+                onClick: () => {
+                    this._wiimoteOffered = false;
+                    hp.linkWiimote();
+                },
+            },
+        });
+    }
+
+    /** Attach / status / detach from the passthrough, turned into the banner's state. */
+    _onWiimoteEvent(ev) {
+        if (ev.type === 'attached') {
+            this._wiimoteConnected = true;
+            this._wiimoteConnectToast?.dismiss();
+            this._wiimoteConnectToast = null;
+            this._wiimoteStatus = { name: ev.name };
+            this._showWiimoteStatus();
+        } else if (ev.type === 'status' && this._wiimoteConnected) {
+            this._wiimoteStatus = { ...(this._wiimoteStatus || {}), ...ev };
+            this._showWiimoteStatus();
+        } else if (ev.type === 'detached') {
+            this._wiimoteConnected = false;
+            this._wiimoteOffered = false;
+            this._wiimoteStatusToast?.dismiss();
+            this._wiimoteStatusToast = null;
+            this._offerWiimote();
+        }
+    }
+
+    /** The connected remote's line: player light, battery, an extension if one is in. */
+    _showWiimoteStatus() {
+        const st = this._wiimoteStatus || {};
+        const light = st.leds ? Math.log2(st.leds & -st.leds) + 1 : 0; // lowest lit light = player number
+        const battery =
+            typeof st.battery === 'number' ? Math.round((st.battery / 255) * 100) : null;
+        const message =
+            battery === null
+                ? t('stream.wiimoteConnected')
+                : t('stream.wiimoteStatus', {
+                      light: light || '?',
+                      battery,
+                      ext: st.extension ? t('stream.wiimoteExtension') : '',
+                  });
+        this._wiimoteStatusToast?.dismiss();
+        this._wiimoteStatusToast = Toast.info(message, { sticky: true });
+    }
+
     // ── Stats message handler (ping/pong + periodic backend stats) ─────────
 
     _handleStatsMessage(msg) {
         this._lastRxAt = performance.now();
         if (typeof msg.type === 'string' && msg.type.startsWith('hid')) {
             this._ensureHidPassthrough()?.handleMessage(msg);
-            if (msg.type === 'hidcaps') this._offerHid();
+            if (msg.type === 'hidcaps') {
+                this._offerHid();
+                this._offerWiimote();
+            }
             return;
         }
         if (msg.type === 'inputcaps') {
@@ -10148,6 +10225,10 @@ export class StreamView {
         }
         for (const toast of this._hidOfferToasts || []) toast.dismiss();
         this._hidOfferToasts = [];
+        this._wiimoteConnectToast?.dismiss();
+        this._wiimoteStatusToast?.dismiss();
+        this._wiimoteConnectToast = this._wiimoteStatusToast = null;
+        this._wiimoteConnected = this._wiimoteOffered = false;
         document.removeEventListener('keydown', this._onKeyDown);
         if (this._onNetworkChange) {
             window.removeEventListener('online', this._onNetworkChange);
