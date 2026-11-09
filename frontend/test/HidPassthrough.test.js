@@ -71,6 +71,9 @@ function fakeWiimote({ productId = 0x0306, sendFails = false } = {}) {
         if (sendFails) throw new Error('NotAllowedError');
         d.sent.push([id, Array.from(data)]);
     });
+    d.close = vi.fn(async () => {
+        d.opened = false;
+    });
     return d;
 }
 
@@ -432,6 +435,60 @@ describe('HidPassthrough — a Wii Remote, for a GameStream host on its own mach
         });
         expect(loadForwarded(t.storage).has('057e:0306')).toBe(true);
         expect(t.sent[0]).toMatchObject({ type: 'hidattach', vendorId: 0x057e, productId: 0x0306 });
+    });
+
+    it('picks the live DolphinBar entry among four, attaches only it, closes the rest', async () => {
+        const dead1 = fakeWiimote();
+        const live = fakeWiimote();
+        const dead2 = fakeWiimote();
+        const dead3 = fakeWiimote();
+        const all = [dead1, live, dead2, dead3];
+        const t = setup(all);
+        t.hp.handleMessage({ type: 'hidcaps', available: true, wiimote: true });
+        t.hid.requestDevice.mockResolvedValueOnce(all);
+
+        const p = t.hp.linkWiimote();
+        // Every entry is opened and nudged with a status request (0x15).
+        await vi.waitFor(() => all.forEach((d) => expect(d.sendReport).toHaveBeenCalledWith(0x15, expect.anything())));
+        // The entry with the synced remote streams; it wins.
+        live.report(0x30, [0x00, 0x00]);
+        const chosen = await p;
+
+        expect(chosen).toEqual([live]);
+        expect(t.sent.filter((m) => m.type === 'hidattach')).toHaveLength(1);
+        expect(t.sent[0]).toMatchObject({ type: 'hidattach', slot: 0 });
+        for (const d of [dead1, dead2, dead3]) expect(d.close).toHaveBeenCalled();
+        expect(live.close).not.toHaveBeenCalled();
+    });
+
+    it('falls back to the first entry if none answer in time', async () => {
+        const a = fakeWiimote();
+        const b = fakeWiimote();
+        // A delay that fires at once makes the probe time out with no report.
+        const t = setup([a, b]);
+        t.hp = new (Object.getPrototypeOf(t.hp).constructor)({
+            hid: t.hid,
+            send: (m) => t.sent.push(m),
+            sendFrame: () => true,
+            storage: t.storage,
+            now: () => 0,
+            delay: () => Promise.resolve(),
+        });
+        t.hp.handleMessage({ type: 'hidcaps', available: true, wiimote: true });
+        t.hid.requestDevice.mockResolvedValueOnce([a, b]);
+        const chosen = await t.hp.linkWiimote();
+        expect(chosen).toEqual([a]);
+        expect(b.close).toHaveBeenCalled();
+    });
+
+    it('a single entry (a real Bluetooth remote) attaches without a status probe', async () => {
+        const remote = fakeWiimote();
+        const t = setup([remote]);
+        t.hp.handleMessage({ type: 'hidcaps', available: true, wiimote: true });
+        const chosen = await t.hp.linkWiimote();
+        expect(chosen).toEqual([remote]);
+        // No selection ping: the only output a lone remote gets is the game's, later.
+        expect(remote.sendReport).not.toHaveBeenCalledWith(0x15, expect.anything());
     });
 
     it('sends its answers once on the reliable channel, its data reports on hid', async () => {

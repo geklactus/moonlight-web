@@ -77,6 +77,12 @@ import { HidppRelay, hidppInputIds, isHidppReport } from './hidppRelay.js';
 export const FORWARD_KEY = 'mw_hid_forward';
 const TICK_MS = 100;
 export const HOLD_MS = 3000;
+// A DolphinBar grants four identical 057e:0306 entries at once; only the slot with the synced remote
+// answers. Keep whichever delivers a report first (a live one streams) within this window, closing the
+// rest; a status request nudges a quiet-but-live entry. A real Bluetooth remote is a single entry and
+// skips the probe. Long enough for a streaming entry to speak, short enough not to stall the click.
+const WIIMOTE_PROBE_MS = 500;
+const WIIMOTE_STATUS = 0x15;
 
 /** `vid:pid` in lowercase hex: how a device is remembered. */
 export function deviceKey(device) {
@@ -198,6 +204,7 @@ export class HidPassthrough {
         clearTimer = (t) => clearInterval(t),
         later = (fn, ms) => setTimeout(fn, ms),
         cancelLater = (t) => clearTimeout(t),
+        delay = (ms) => new Promise((r) => setTimeout(r, ms)),
         onChange = null,
         onResult = null,
     }) {
@@ -209,6 +216,7 @@ export class HidPassthrough {
         this._setTimer = setTimer;
         this._clearTimer = clearTimer;
         this._cancelLater = cancelLater;
+        this._delay = delay;
         this._onChange = onChange;
         this._onResult = onResult;
         this._caps = null; // { available, why } once the host said
@@ -406,14 +414,70 @@ export class HidPassthrough {
             chosen = [];
         }
         chosen = chosen.filter(isWiimote);
-        if (chosen.length) {
-            const keys = loadForwarded(this._storage);
-            for (const d of chosen) keys.add(deviceKey(d));
-            saveForwarded(keys, this._storage);
+        const live = await this._pickLiveWiimote(chosen);
+        if (!live) {
+            this._changed();
+            return [];
         }
-        for (const d of chosen) await this._attach(d);
+        const keys = loadForwarded(this._storage);
+        keys.add(deviceKey(live));
+        saveForwarded(keys, this._storage);
+        await this._attach(live);
         this._changed();
-        return chosen;
+        return [live];
+    }
+
+    /**
+     * The one live entry among what the chooser granted. A DolphinBar hands over four identical
+     * 057e:0306 entries and only the slot with the synced remote streams; a real Bluetooth remote is a
+     * single entry. Open each, nudge it with a status request, and keep whichever reports first within
+     * WIIMOTE_PROBE_MS; close the rest so the host never clones an empty slot. If none speak in time,
+     * fall back to the first that opened, which the quiet-watchdog can re-pick once it is attached.
+     * @param {HIDDevice[]} candidates
+     * @returns {Promise<HIDDevice|null>}
+     */
+    async _pickLiveWiimote(candidates) {
+        const open = [];
+        for (const d of candidates) {
+            try {
+                if (!d.opened) await d.open();
+                open.push(d);
+            } catch {
+                /* an entry that will not open is not a candidate */
+            }
+        }
+        if (open.length <= 1) return open[0] ?? null;
+        const listeners = new Map();
+        const winner = await new Promise((resolve) => {
+            let done = false;
+            const finish = (d) => {
+                if (!done) {
+                    done = true;
+                    resolve(d);
+                }
+            };
+            for (const d of open) {
+                const listener = () => finish(d);
+                d.addEventListener('inputreport', listener);
+                listeners.set(d, listener);
+                // A live entry already streams; the status request only wakes a quiet-but-connected one.
+                Promise.resolve()
+                    .then(() => d.sendReport(WIIMOTE_STATUS, new Uint8Array([0x00])))
+                    .catch(() => {});
+            }
+            this._delay(WIIMOTE_PROBE_MS).then(() => finish(open[0]));
+        });
+        for (const [d, listener] of listeners) d.removeEventListener('inputreport', listener);
+        for (const d of open) {
+            if (d !== winner) {
+                try {
+                    await d.close?.();
+                } catch {
+                    /* closing an unused entry is best effort */
+                }
+            }
+        }
+        return winner;
     }
 
     /**
