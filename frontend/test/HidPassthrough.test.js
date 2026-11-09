@@ -103,6 +103,7 @@ function setup(devices, wanted = []) {
     const storage = memoryStorage({ [FORWARD_KEY]: JSON.stringify(wanted) });
     const onChange = vi.fn();
     const onResult = vi.fn();
+    const wiimote = [];
     const hp = new HidPassthrough({
         hid,
         send: (m) => sent.push(m),
@@ -115,6 +116,7 @@ function setup(devices, wanted = []) {
         cancelLater: () => (hold = null),
         onChange,
         onResult,
+        onWiimote: (e) => wiimote.push(e),
     });
     return {
         hp,
@@ -124,6 +126,7 @@ function setup(devices, wanted = []) {
         frames,
         storage,
         onChange,
+        wiimote,
         advance: (ms) => {
             now += ms;
             if (tick) tick();
@@ -594,6 +597,40 @@ describe('HidPassthrough — a Wii Remote, for a GameStream host on its own mach
         u.hp.handleMessage(output(0, 0x11, [0x11, 0x10]));
         await Promise.resolve();
         expect(remote.sendReport).not.toHaveBeenCalled();
+    });
+
+    it('tells the stream page when a Wii Remote attaches, its status, and when it drops', async () => {
+        const remote = fakeWiimote();
+        const t = await attached(remote);
+        expect(t.wiimote).toContainEqual({ type: 'attached', slot: 0, name: 'Nintendo RVL-CNT-01' });
+        // 0x20 status: buttons(2) flags(1) 00 00 battery(1). flags 0xf2 = lights 1-4 + extension bit.
+        remote.report(0x20, [0, 0, 0xf2, 0, 0, 0x55]);
+        expect(t.wiimote).toContainEqual({ type: 'status', slot: 0, battery: 0x55, extension: true, leds: 0xf });
+        t.hid.unplug(remote);
+        expect(t.wiimote).toContainEqual({ type: 'detached', slot: 0 });
+    });
+
+    it('reconnects a remembered remote with no chooser, and attaches only a live one', async () => {
+        const remote = fakeWiimote();
+        const t = setup([remote], [deviceKey(remote)]);
+        t.hp.handleMessage({ type: 'hidcaps', available: true, wiimote: true });
+        const got = await t.hp.linkWiimoteRemembered();     // one entry: a lone Bluetooth remote, no probe
+        expect(got).toBe(remote);
+        expect(t.hid.requestDevice).not.toHaveBeenCalled();
+        expect(t.sent[0]).toMatchObject({ type: 'hidattach', vendorId: 0x057e });
+    });
+
+    it('does not reconnect when a DolphinBar has no live entry', async () => {
+        const dead1 = fakeWiimote();
+        const dead2 = fakeWiimote();
+        const t = setup([dead1, dead2], [deviceKey(dead1)]);
+        t.hp = new (Object.getPrototypeOf(t.hp).constructor)({
+            hid: t.hid, send: () => {}, sendFrame: () => true, storage: t.storage,
+            now: () => 0, delay: () => Promise.resolve(),   // the probe times out at once, nothing streams
+        });
+        t.hp.handleMessage({ type: 'hidcaps', available: true, wiimote: true });
+        const got = await t.hp.linkWiimoteRemembered();
+        expect(got).toBe(null);
     });
 
     it('never writes to a device that is not a Wii Remote (a wheel keeps today’s rule)', async () => {

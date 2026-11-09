@@ -207,8 +207,10 @@ export class HidPassthrough {
         delay = (ms) => new Promise((r) => setTimeout(r, ms)),
         onChange = null,
         onResult = null,
+        onWiimote = null,
     }) {
         this._hid = hid || null;
+        this._onWiimote = onWiimote;
         this._send = send;
         this._sendFrame = sendFrame;
         this._storage = storage;
@@ -311,6 +313,12 @@ export class HidPassthrough {
                 if (msg.ok) {
                     e.state = 'on';
                     e.why = '';
+                    if (isWiimote(device))
+                        this._onWiimote?.({
+                            type: 'attached',
+                            slot: e.slot,
+                            name: device.productName || '',
+                        });
                     if (e.ffb) this._startFfb(e);
                     else if (this._caps?.hidpp && hasHidpp(device)) this._startRelay(device, e);
                 } else {
@@ -436,7 +444,7 @@ export class HidPassthrough {
      * @param {HIDDevice[]} candidates
      * @returns {Promise<HIDDevice|null>}
      */
-    async _pickLiveWiimote(candidates) {
+    async _pickLiveWiimote(candidates, { requireLive = false } = {}) {
         const open = [];
         for (const d of candidates) {
             try {
@@ -465,7 +473,7 @@ export class HidPassthrough {
                     .then(() => d.sendReport(WIIMOTE_STATUS, new Uint8Array([0x00])))
                     .catch(() => {});
             }
-            this._delay(WIIMOTE_PROBE_MS).then(() => finish(open[0]));
+            this._delay(WIIMOTE_PROBE_MS).then(() => finish(requireLive ? null : open[0]));
         });
         for (const [d, listener] of listeners) d.removeEventListener('inputreport', listener);
         for (const d of open) {
@@ -478,6 +486,31 @@ export class HidPassthrough {
             }
         }
         return winner;
+    }
+
+    /**
+     * Reconnect a Wii Remote the viewer already allowed, with no click — Chrome keeps the permission
+     * for a device whose serial it can read. getDevices() needs no gesture; a live entry is attached
+     * (a DolphinBar's four are narrowed to the streaming one), a dead or absent one left alone.
+     * @returns {Promise<HIDDevice|null>} the remote reconnected, or null
+     */
+    async linkWiimoteRemembered() {
+        if (!this._hid) return null;
+        let remembered = [];
+        try {
+            remembered = (await this._hid.getDevices()).filter(isWiimote);
+        } catch {
+            return null;
+        }
+        if (!remembered.length) return null;
+        const live = await this._pickLiveWiimote(remembered, { requireLive: true });
+        if (!live) return null;
+        const keys = loadForwarded(this._storage);
+        keys.add(deviceKey(live));
+        saveForwarded(keys, this._storage);
+        await this._attach(live);
+        this._changed();
+        return live;
     }
 
     /**
@@ -545,6 +578,23 @@ export class HidPassthrough {
             const bytes = new Uint8Array(e.data.buffer, e.data.byteOffset, e.data.byteLength);
             if (replyIds.has(e.reportId)) {
                 this._send({ type: 'hidreply', slot, reportId: e.reportId, data: toBase64(bytes) });
+                // A Wii Remote's status (0x20): buttons(2) flags(1) 00 00 battery(1). The flags byte
+                // carries the extension bit (0x02) and the player-light nibble (bits 4-7).
+                if (
+                    this._onWiimote &&
+                    isWiimote(device) &&
+                    e.reportId === 0x20 &&
+                    bytes.length >= 6
+                ) {
+                    const flags = bytes[2];
+                    this._onWiimote({
+                        type: 'status',
+                        slot,
+                        battery: bytes[5],
+                        extension: !!(flags & 0x02),
+                        leds: flags >> 4,
+                    });
+                }
                 return;
             }
             this._sendFrame(this._pump.report(slot, e.reportId, bytes, this._now()));
@@ -569,6 +619,8 @@ export class HidPassthrough {
     _drop(device, why, tell = true) {
         const e = this._entries.get(device);
         if (!e) return;
+        if (isWiimote(device) && (e.state === 'on' || e.state === 'pending'))
+            this._onWiimote?.({ type: 'detached', slot: e.slot });
         if (tell && (e.state === 'on' || e.state === 'pending')) this._send(detachMessage(e.slot));
         this._release(device, e);
         this._entries.delete(device);

@@ -933,7 +933,12 @@
         "rcBack": "返回",
         "rcBackVal": "彩色键（红、绿……）",
         "rcCursor": "浏览器光标",
-        "rcCursorVal": "长按返回键"
+        "rcCursorVal": "长按返回键",
+        "wiimoteConnect": "连接你的 Wii 遥控器：点击后在选择器中选中它。",
+        "wiimoteConnectAction": "连接",
+        "wiimoteConnected": "Wii 遥控器已连接。",
+        "wiimoteStatus": "Wii 遥控器已连接 — 指示灯 {{light}}，电量 {{battery}}%{{ext}}",
+        "wiimoteExtension": "（带扩展）"
     },
     "transport": {
         "webrtcDcUdp": "WebRTC 数据通道（UDP）",

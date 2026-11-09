@@ -933,7 +933,12 @@
         "rcBack": "Back",
         "rcBackVal": "A colour key (red, green…)",
         "rcCursor": "The browser's cursor",
-        "rcCursorVal": "Hold Back"
+        "rcCursorVal": "Hold Back",
+        "wiimoteConnect": "Connect your Wii Remote: click, then pick it in the chooser.",
+        "wiimoteConnectAction": "Connect",
+        "wiimoteConnected": "Wii Remote connected.",
+        "wiimoteStatus": "Wii Remote connected — light {{light}}, battery {{battery}}%{{ext}}",
+        "wiimoteExtension": " (with an extension)"
     },
     "transport": {
         "webrtcDcUdp": "WebRTC DataChannel (UDP)",
