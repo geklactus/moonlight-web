@@ -241,9 +241,11 @@ const std::vector<std::pair<uint8_t, uint16_t>> kWiimoteIn = {
     {0x34, 21}, {0x35, 21}, {0x36, 21}, {0x37, 21}, {0x3d, 21}, {0x3e, 21}, {0x3f, 21}};
 
 /// The remote as Chrome should show that descriptor to a page: one byte array
-/// per report. Not a recording yet — LOLA's Spike 1 (Chrome on a Mac, over
-/// Bluetooth and through a DolphinBar) has not run; when it has, its
-/// `collections` replace this, and the check below must still hold.
+/// per report. LOLA's Spike 1 has now run — a DolphinBar on a Mac shows exactly
+/// these collections (kDolphinBar* below), so this is recording-backed. A
+/// Bluetooth-paired remote's own WebHID collections are still uncaptured
+/// (Spike 1 M1: a Mac cannot pair one), so the Bluetooth case stays the
+/// reference descriptor, kWiimote.
 std::vector<Collection> wiimoteAsChromeShouldShowIt()
 {
     auto bytes = [](uint8_t id, uint16_t count) {
@@ -259,6 +261,39 @@ std::vector<Collection> wiimoteAsChromeShouldShowIt()
     for (auto [id, n] : kWiimoteOut)
         app.outputReports.push_back(bytes(id, n));
     for (auto [id, n] : kWiimoteIn)
+        app.inputReports.push_back(bytes(id, n));
+    return {app};
+}
+
+/// The DolphinBar's collections as Chrome actually showed them (LOLA's Spike 1, 2026-11-09: a
+/// Mayflash DolphinBar in mode 4 on a Mac, geklactus/lola docs/wiimote/mac/dolphinbar-spike1/).
+/// Transcribed from that recording: one Game Pad application collection, every report a vendor byte
+/// array (usage 0xFF000001, 8-bit) with these ids and byte counts. They equal
+/// kWiimoteIn/kWiimoteOut — the bar passes Nintendo's own descriptor through — which the section
+/// below asserts, so the clone the host builds from what the page sends is the descriptor Dolphin
+/// expects.
+const std::vector<std::pair<uint8_t, uint16_t>> kDolphinBarOut = {
+    {0x10, 1},  {0x11, 1}, {0x12, 2},  {0x13, 1}, {0x14, 1}, {0x15, 1},
+    {0x16, 21}, {0x17, 6}, {0x18, 21}, {0x19, 1}, {0x1a, 1}};
+const std::vector<std::pair<uint8_t, uint16_t>> kDolphinBarIn = {
+    {0x20, 6},  {0x21, 21}, {0x22, 4},  {0x30, 2},  {0x31, 5},  {0x32, 10}, {0x33, 17},
+    {0x34, 21}, {0x35, 21}, {0x36, 21}, {0x37, 21}, {0x3d, 21}, {0x3e, 21}, {0x3f, 21}};
+
+std::vector<Collection> dolphinBarAsRecorded()
+{
+    auto bytes = [](uint8_t id, uint16_t count) {
+        ReportItem it = axes({0xFF000001}, 8, 0, 255);
+        it.isArray = true;
+        it.reportCount = count;
+        return Report{id, {it}};
+    };
+    Collection app;
+    app.usagePage = 0x01;
+    app.usage = 0x05;
+    app.type = Application;
+    for (auto [id, n] : kDolphinBarOut)
+        app.outputReports.push_back(bytes(id, n));
+    for (auto [id, n] : kDolphinBarIn)
         app.inputReports.push_back(bytes(id, n));
     return {app};
 }
@@ -511,6 +546,29 @@ void run_hid_descriptor_tests()
             CHECK_EQ(reportBytes(p, Kind::Input, id), static_cast<size_t>(0));
         }
         for (auto [id, n] : kWiimoteIn) {
+            CHECK_EQ(reportBytes(p, Kind::Input, id), static_cast<size_t>(n + 1));
+            CHECK_EQ(reportBytes(p, Kind::Output, id), static_cast<size_t>(0));
+        }
+    }
+
+    SECTION(
+        "HID descriptor — a DolphinBar's recorded collections rebuild to the descriptor Dolphin "
+        "expects");
+    {
+        // The bar's recorded report set is Nintendo's own, id for id and byte for byte.
+        CHECK(kDolphinBarOut == kWiimoteOut);
+        CHECK(kDolphinBarIn == kWiimoteIn);
+        // What the host would clone from what the page sends, from the real recording's
+        // collections.
+        const std::vector<uint8_t> rebuilt = encode(dolphinBarAsRecorded());
+        CHECK(validate(rebuilt).empty());
+        CHECK(sameLayout(rebuilt, kWiimote));
+        const Parsed p = parse(rebuilt);
+        for (auto [id, n] : kDolphinBarOut) {
+            CHECK_EQ(reportBytes(p, Kind::Output, id), static_cast<size_t>(n + 1));
+            CHECK_EQ(reportBytes(p, Kind::Input, id), static_cast<size_t>(0));
+        }
+        for (auto [id, n] : kDolphinBarIn) {
             CHECK_EQ(reportBytes(p, Kind::Input, id), static_cast<size_t>(n + 1));
             CHECK_EQ(reportBytes(p, Kind::Output, id), static_cast<size_t>(0));
         }
