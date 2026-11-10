@@ -84,6 +84,17 @@ export const HOLD_MS = 3000;
 const WIIMOTE_PROBE_MS = 500;
 const WIIMOTE_STATUS = 0x15;
 
+// TEMPORARY diagnostics for the real-Wii-Remote handoff (lola debug/wiimote-trace).
+// console.log so lola-trace captures each step in stream-front; grep `[wmt]`. Remove once the
+// drop-out is understood. Discrete events only (no per-report spam — _seenReport throttles that).
+const wmt = (...a) => {
+    try {
+        console.log('[wmt]', ...a);
+    } catch {
+        /* logging must never break the stream */
+    }
+};
+
 /** `vid:pid` in lowercase hex: how a device is remembered. */
 export function deviceKey(device) {
     const h = (n) => (n >>> 0).toString(16).padStart(4, '0');
@@ -308,6 +319,12 @@ export class HidPassthrough {
         }
         if (msg.type === 'hidattached') {
             const entry = this._entryBySlot(msg.slot);
+            wmt('hidattached', {
+                slot: msg.slot,
+                ok: !!msg.ok,
+                why: msg.why || '',
+                found: !!entry,
+            });
             if (entry) {
                 const [device, e] = entry;
                 if (msg.ok) {
@@ -337,12 +354,26 @@ export class HidPassthrough {
             if (entry && isWiimote(entry[0])) {
                 // Written only for a host that said the game drives the remote
                 // (hidcaps.wiimote), and only once it took the device.
-                if (
-                    this._caps?.wiimote &&
-                    entry[1].state === 'on' &&
-                    msg.kind === 'output' &&
-                    isWiimoteOutput(msg.reportId)
-                )
+                const caps = !!this._caps?.wiimote;
+                const on = entry[1].state === 'on';
+                const output = msg.kind === 'output';
+                const wiiOut = isWiimoteOutput(msg.reportId);
+                const relay = caps && on && output && wiiOut;
+                // Dedupe by reportId:outcome so a chatty game can't flood the trace, but every
+                // distinct (report-mode 0x12, led 0x11, …) outcome is seen once.
+                const key = `${msg.reportId}:${relay ? 'relay' : 'drop'}:${entry[1].state}`;
+                if (!(this._wmtOut ||= new Set()).has(key)) {
+                    this._wmtOut.add(key);
+                    wmt('wiimote output', {
+                        reportId: msg.reportId,
+                        relayed: relay,
+                        caps,
+                        state: entry[1].state,
+                        kind: msg.kind,
+                        wiiOut,
+                    });
+                }
+                if (relay)
                     this._writeWiimote(entry[0], entry[1], msg.reportId, fromBase64(msg.data));
                 return true;
             }
@@ -454,18 +485,20 @@ export class HidPassthrough {
                 /* an entry that will not open is not a candidate */
             }
         }
+        wmt('pickLiveWiimote', { candidates: candidates.length, opened: open.length, requireLive });
         if (open.length <= 1) return open[0] ?? null;
         const listeners = new Map();
         const winner = await new Promise((resolve) => {
             let done = false;
-            const finish = (d) => {
+            const finish = (d, how) => {
                 if (!done) {
                     done = true;
+                    wmt('pickLiveWiimote done', { how, winner: d ? d.productName || '?' : null });
                     resolve(d);
                 }
             };
             for (const d of open) {
-                const listener = () => finish(d);
+                const listener = () => finish(d, 'live-answer');
                 d.addEventListener('inputreport', listener);
                 listeners.set(d, listener);
                 // A live entry already streams; the status request only wakes a quiet-but-connected one.
@@ -473,7 +506,12 @@ export class HidPassthrough {
                     .then(() => d.sendReport(WIIMOTE_STATUS, new Uint8Array([0x00])))
                     .catch(() => {});
             }
-            this._delay(WIIMOTE_PROBE_MS).then(() => finish(requireLive ? null : open[0]));
+            this._delay(WIIMOTE_PROBE_MS).then(() =>
+                finish(
+                    requireLive ? null : open[0],
+                    requireLive ? 'timeout-null' : 'timeout-fallback',
+                ),
+            );
         });
         for (const [d, listener] of listeners) d.removeEventListener('inputreport', listener);
         for (const d of open) {
@@ -499,11 +537,17 @@ export class HidPassthrough {
         let remembered = [];
         try {
             remembered = (await this._hid.getDevices()).filter(isWiimote);
-        } catch {
+        } catch (err) {
+            wmt('linkWiimoteRemembered getDevices failed', String(err?.message || err));
             return null;
         }
+        wmt('linkWiimoteRemembered', {
+            remembered: remembered.length,
+            names: remembered.map((d) => d.productName || '?'),
+        });
         if (!remembered.length) return null;
         const live = await this._pickLiveWiimote(remembered, { requireLive: true });
+        wmt('linkWiimoteRemembered pick', { live: live ? live.productName || '?' : null });
         if (!live) return null;
         const keys = loadForwarded(this._storage);
         keys.add(deviceKey(live));
@@ -570,13 +614,18 @@ export class HidPassthrough {
             });
             return;
         }
+        wmt('attach', { slot, name: device.productName || '?', wiimote: isWiimote(device) });
         const hidppIds = hasHidpp(device) ? hidppInputIds(device) : new Set();
         // A Wii Remote's answers: once each, on the reliable channel.
         const replyIds = isWiimote(device) ? WIIMOTE_REPLY_IDS : new Set();
+        let _nIn = 0;
+        let _nReply = 0;
         const listener = (e) => {
             if (hidppIds.has(e.reportId)) return;
             const bytes = new Uint8Array(e.data.buffer, e.data.byteOffset, e.data.byteLength);
             if (replyIds.has(e.reportId)) {
+                if (_nReply++ === 0)
+                    wmt('first reply report', { slot, reportId: e.reportId, len: bytes.length });
                 this._send({ type: 'hidreply', slot, reportId: e.reportId, data: toBase64(bytes) });
                 // A Wii Remote's status (0x20): buttons(2) flags(1) 00 00 battery(1). The flags byte
                 // carries the extension bit (0x02) and the player-light nibble (bits 4-7).
@@ -597,12 +646,15 @@ export class HidPassthrough {
                 }
                 return;
             }
+            if (_nIn++ === 0)
+                wmt('first input report', { slot, reportId: e.reportId, len: bytes.length });
             this._sendFrame(this._pump.report(slot, e.reportId, bytes, this._now()));
         };
         device.addEventListener('inputreport', listener);
         const ffb = await this._probeFfb(device);
         this._entries.set(device, { slot, state: 'pending', why: '', listener, ffb });
         this._send(attachMessage(slot, device, { forceFeedback: !!ffb }));
+        wmt('attach sent (pending host ack)', { slot });
         this._armTimer();
     }
 
@@ -619,6 +671,8 @@ export class HidPassthrough {
     _drop(device, why, tell = true) {
         const e = this._entries.get(device);
         if (!e) return;
+        if (isWiimote(device))
+            wmt('drop wiimote', { slot: e.slot, state: e.state, why: why || '', tell });
         if (isWiimote(device) && (e.state === 'on' || e.state === 'pending'))
             this._onWiimote?.({ type: 'detached', slot: e.slot });
         if (tell && (e.state === 'on' || e.state === 'pending')) this._send(detachMessage(e.slot));
