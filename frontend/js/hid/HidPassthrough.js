@@ -406,12 +406,19 @@ export class HidPassthrough {
         this._changed();
     }
 
-    /** Attach every wanted device this page may open; called when the host can. */
+    /**
+     * Attach every wanted device this page may open; called when the host can.
+     * A Wii Remote is never attached here: a DolphinBar grants four identical 057e:0306 entries that
+     * all share one deviceKey (vid:pid), so a wanted key would attach all four — the host takes the
+     * first (often an empty slot) and rejects the rest ("one Wii Remote per player"), leaving the game
+     * bound to a slot with no remote. Only _pickLiveWiimote may choose among them: it probes and keeps
+     * the one that streams. Reconnect runs through linkWiimoteRemembered / the Connect banner.
+     */
     async applyWanted() {
         if (!this._hid || !this._caps?.available) return;
         const keys = loadForwarded(this._storage);
         for (const d of await this._hid.getDevices()) {
-            if (keys.has(deviceKey(d)) && sendable(d)) await this._attach(d);
+            if (keys.has(deviceKey(d)) && sendable(d) && !isWiimote(d)) await this._attach(d);
         }
         this._changed();
     }
