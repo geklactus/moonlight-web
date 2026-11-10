@@ -419,6 +419,9 @@ describe('HidPassthrough — a Wii Remote, for a GameStream host on its own mach
     async function attached(remote, caps = { available: true, wiimote: true }) {
         const t = setup([remote], [deviceKey(remote)]);
         t.hp.handleMessage({ type: 'hidcaps', ...caps });
+        // A Wii Remote attaches through the live-pick, never applyWanted (a DolphinBar's four identical
+        // entries share one key): StreamView calls this on the same hidcaps.
+        await t.hp.linkWiimoteRemembered();
         await vi.waitFor(() => expect(t.sent).toHaveLength(1));
         t.hp.handleMessage({ type: 'hidattached', slot: 0, ok: true });
         return t;
@@ -452,7 +455,9 @@ describe('HidPassthrough — a Wii Remote, for a GameStream host on its own mach
 
         const p = t.hp.linkWiimote();
         // Every entry is opened and nudged with a status request (0x15).
-        await vi.waitFor(() => all.forEach((d) => expect(d.sendReport).toHaveBeenCalledWith(0x15, expect.anything())));
+        await vi.waitFor(() =>
+            all.forEach((d) => expect(d.sendReport).toHaveBeenCalledWith(0x15, expect.anything())),
+        );
         // The entry with the synced remote streams; it wins.
         live.report(0x30, [0x00, 0x00]);
         const chosen = await p;
@@ -545,6 +550,7 @@ describe('HidPassthrough — a Wii Remote, for a GameStream host on its own mach
         const pending = fakeWiimote();
         const u = setup([pending], [deviceKey(pending)]);
         u.hp.handleMessage({ type: 'hidcaps', available: true, wiimote: true });
+        await u.hp.linkWiimoteRemembered();
         await vi.waitFor(() => expect(u.sent).toHaveLength(1));
         u.hp.handleMessage(output(0, 0x11, [0x11, 0x10]));
         await Promise.resolve();
@@ -602,10 +608,20 @@ describe('HidPassthrough — a Wii Remote, for a GameStream host on its own mach
     it('tells the stream page when a Wii Remote attaches, its status, and when it drops', async () => {
         const remote = fakeWiimote();
         const t = await attached(remote);
-        expect(t.wiimote).toContainEqual({ type: 'attached', slot: 0, name: 'Nintendo RVL-CNT-01' });
+        expect(t.wiimote).toContainEqual({
+            type: 'attached',
+            slot: 0,
+            name: 'Nintendo RVL-CNT-01',
+        });
         // 0x20 status: buttons(2) flags(1) 00 00 battery(1). flags 0xf2 = lights 1-4 + extension bit.
         remote.report(0x20, [0, 0, 0xf2, 0, 0, 0x55]);
-        expect(t.wiimote).toContainEqual({ type: 'status', slot: 0, battery: 0x55, extension: true, leds: 0xf });
+        expect(t.wiimote).toContainEqual({
+            type: 'status',
+            slot: 0,
+            battery: 0x55,
+            extension: true,
+            leds: 0xf,
+        });
         t.hid.unplug(remote);
         expect(t.wiimote).toContainEqual({ type: 'detached', slot: 0 });
     });
@@ -614,7 +630,7 @@ describe('HidPassthrough — a Wii Remote, for a GameStream host on its own mach
         const remote = fakeWiimote();
         const t = setup([remote], [deviceKey(remote)]);
         t.hp.handleMessage({ type: 'hidcaps', available: true, wiimote: true });
-        const got = await t.hp.linkWiimoteRemembered();     // one entry: a lone Bluetooth remote, no probe
+        const got = await t.hp.linkWiimoteRemembered(); // one entry: a lone Bluetooth remote, no probe
         expect(got).toBe(remote);
         expect(t.hid.requestDevice).not.toHaveBeenCalled();
         expect(t.sent[0]).toMatchObject({ type: 'hidattach', vendorId: 0x057e });
@@ -625,8 +641,12 @@ describe('HidPassthrough — a Wii Remote, for a GameStream host on its own mach
         const dead2 = fakeWiimote();
         const t = setup([dead1, dead2], [deviceKey(dead1)]);
         t.hp = new (Object.getPrototypeOf(t.hp).constructor)({
-            hid: t.hid, send: () => {}, sendFrame: () => true, storage: t.storage,
-            now: () => 0, delay: () => Promise.resolve(),   // the probe times out at once, nothing streams
+            hid: t.hid,
+            send: () => {},
+            sendFrame: () => true,
+            storage: t.storage,
+            now: () => 0,
+            delay: () => Promise.resolve(), // the probe times out at once, nothing streams
         });
         t.hp.handleMessage({ type: 'hidcaps', available: true, wiimote: true });
         const got = await t.hp.linkWiimoteRemembered();
@@ -654,6 +674,24 @@ describe('HidPassthrough — a Wii Remote, for a GameStream host on its own mach
         const t = setup([remote], ['057e:0306']);
         expect((await t.hp.devices()).map((d) => d.key)).toEqual(['057e:0306']);
         t.hp.handleMessage({ type: 'hidcaps', available: true });
+        // Attaches through the live-pick (never applyWanted, which skips wiimotes).
+        await t.hp.linkWiimoteRemembered();
+        await vi.waitFor(() => expect(t.sent).toHaveLength(1));
+    });
+
+    it('never attaches a Wii Remote through applyWanted — only the live-pick may (a DolphinBar grants four identical entries)', async () => {
+        // All four of a DolphinBar's 057e:0306 entries share one deviceKey, so a "wanted" key would
+        // attach every one; the host takes the first (often an empty slot) and rejects the rest. The
+        // live-pick alone probes and keeps the streaming one — applyWanted must leave wiimotes to it.
+        const remote = fakeWiimote();
+        const t = setup([remote], [deviceKey(remote)]); // the key is remembered (wanted)
+        t.hp.handleMessage({ type: 'hidcaps', available: true, wiimote: true });
+        await t.hp.applyWanted();
+        await Promise.resolve();
+        expect(t.sent).toHaveLength(0); // applyWanted skipped the wiimote
+        // The live-pick (which StreamView calls on the same hidcaps) still attaches it.
+        const live = await t.hp.linkWiimoteRemembered();
+        expect(live).toBeTruthy();
         await vi.waitFor(() => expect(t.sent).toHaveLength(1));
     });
 });
