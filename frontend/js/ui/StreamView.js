@@ -189,6 +189,17 @@ const LAUNCH_WIIMOTE_HERE = (() => {
     }
 })();
 
+// TEMPORARY diagnostics for the real-Wii-Remote handoff (lola debug/wiimote-trace).
+// Logged with console.log so lola-trace captures each discrete step in stream-front;
+// remove once the drop-out is understood. Grep the trace for `[wmt]`.
+const wmt = (...a) => {
+    try {
+        console.log('[wmt]', ...a);
+    } catch {
+        /* logging must never break the stream */
+    }
+};
+
 /**
  * Lane name → the i18n key the card already uses for that value. The graph
  * names its lanes with the very words of the rows it plots: two names for one
@@ -8154,11 +8165,29 @@ export class StreamView {
      */
     async _offerWiimote() {
         const hp = this._hidPassthrough;
-        if (!hp || this._quitting || !this._wiimoteLocalPick() || !navigator.hid) return;
-        if (this._wiimoteConnected || this._wiimoteOffered) return;
+        if (!hp || this._quitting || !this._wiimoteLocalPick() || !navigator.hid) {
+            wmt('offerWiimote skip', {
+                hp: !!hp,
+                quitting: this._quitting,
+                localPick: this._wiimoteLocalPick(),
+                hasHid: !!navigator.hid,
+            });
+            return;
+        }
+        if (this._wiimoteConnected || this._wiimoteOffered) {
+            wmt('offerWiimote already', {
+                connected: this._wiimoteConnected,
+                offered: this._wiimoteOffered,
+            });
+            return;
+        }
         this._wiimoteOffered = true;
-        if (await hp.linkWiimoteRemembered()) return; // reconnected; onWiimote('attached') shows status
+        wmt('offerWiimote → linkWiimoteRemembered');
+        const reconnected = await hp.linkWiimoteRemembered();
+        wmt('linkWiimoteRemembered result', { reconnected: !!reconnected });
+        if (reconnected) return; // reconnected; onWiimote('attached') shows status
         if (hp !== this._hidPassthrough || this._wiimoteConnected) return;
+        wmt('offerWiimote → Connect banner shown');
         this._wiimoteConnectToast?.dismiss();
         this._wiimoteConnectToast = Toast.info(t('stream.wiimoteConnect'), {
             sticky: true,
@@ -8174,6 +8203,14 @@ export class StreamView {
 
     /** Attach / status / detach from the passthrough, turned into the banner's state. */
     _onWiimoteEvent(ev) {
+        if (ev.type === 'status')
+            wmt('wiimote status', {
+                slot: ev.slot,
+                battery: ev.battery,
+                ext: ev.extension,
+                leds: ev.leds,
+            });
+        else wmt('wiimote event', ev);
         if (ev.type === 'attached') {
             this._wiimoteConnected = true;
             this._wiimoteConnectToast?.dismiss();
@@ -8215,6 +8252,16 @@ export class StreamView {
     _handleStatsMessage(msg) {
         this._lastRxAt = performance.now();
         if (typeof msg.type === 'string' && msg.type.startsWith('hid')) {
+            if (msg.type === 'hidcaps')
+                wmt('hidcaps', {
+                    available: msg.available,
+                    wiimote: msg.wiimote,
+                    ffb: msg.ffb,
+                    hidpp: msg.hidpp,
+                    localPick: this._wiimoteLocalPick(),
+                    hasHid: !!navigator.hid,
+                    hasHp: !!this._ensureHidPassthrough(),
+                });
             this._ensureHidPassthrough()?.handleMessage(msg);
             if (msg.type === 'hidcaps') {
                 this._offerHid();
