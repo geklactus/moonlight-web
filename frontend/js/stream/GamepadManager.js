@@ -52,6 +52,9 @@ import {
     detectPlatform,
     isAutoMapped,
     isTvRemoteId,
+    firefoxLinuxJoyCon,
+    JOYCON_LEFT_BUTTONS,
+    JOYCON_LEFT_AXES,
 } from './gamepadMapping.js';
 import { getMapping, CHANGED_EVENT } from '../util/gamepadMappingsStore.js';
 
@@ -93,6 +96,13 @@ const BUTTON_MAP = {
     15: BTN.RIGHT,
     16: BTN.SPECIAL,
 };
+
+/**
+ * The pad a Joy-Con pair is joined into (_joinJoyCons): Firefox's id form, with
+ * the ids and name Chrome gives the pair it joins itself (057e:200e, "Joy-Con
+ * L+R"), so it is keyed, named and typed as that pad everywhere.
+ */
+export const JOINED_JOYCON_ID = '057e-200e-Joy-Con L+R';
 
 // LI_CTYPE_* (Limelight.h)
 const CTYPE = { UNKNOWN: 0, XBOX: 1, PS: 2, NINTENDO: 3 };
@@ -194,6 +204,7 @@ export class GamepadManager {
      * @param {{ profile?: 'auto'|'x360'|'ds4',
      *           onIgnored?: (gp: Gamepad) => void,
      *           onMapped?: (gp: Gamepad, res: object) => void,
+     *           onNote?: (kind: string, gp: object) => void,
      *           single?: boolean, preferredKey?: string|null,
      *           probe?: {notePadRead: (gapMs: number) => void, notePadSend: () => void}|null,
      *           platform?: string, db?: object|null, user?: (key: string) => object|null }} [options]
@@ -228,6 +239,17 @@ export class GamepadManager {
         this._profile = options.profile || 'auto';
         this._onIgnored = typeof options.onIgnored === 'function' ? options.onIgnored : null;
         this._onMapped = typeof options.onMapped === 'function' ? options.onMapped : null;
+        // Things worth telling the player once a stream, by kind: a Joy-Con
+        // pair joined ('joyconJoined'); a left Joy-Con whose stick Firefox
+        // can't read ('joyconFirefoxStick').
+        this._onNote = typeof options.onNote === 'function' ? options.onNote : null;
+        this._noted = new Set();
+        // The Joy-Con pair joined into one pad, as "<left index>+<right index>",
+        // or '' — when it changes, the halves are taken off and announced anew.
+        this._joinSig = '';
+        // How each half is read, by "<index>|<id>": kept apart from _resolved,
+        // whose slot the joined pad takes.
+        this._halfResolved = new Map();
         this._single = options.single === true;
         this._preferredKey = options.preferredKey || null;
         this._platform = options.platform || detectPlatform();
@@ -300,6 +322,9 @@ export class GamepadManager {
         this._ignored.clear();
         this._announced.clear();
         this._resolved.clear();
+        this._halfResolved.clear();
+        this._joinSig = '';
+        this._noted.clear();
     }
 
     /**
@@ -309,6 +334,7 @@ export class GamepadManager {
      */
     refreshMappings() {
         this._resolved.clear();
+        this._halfResolved.clear();
         this._ignored.clear();
     }
 
@@ -493,7 +519,9 @@ export class GamepadManager {
             ctype: this._controllerType(gp),
             rumble: hasRumble,
         });
-        if (isAutoMapped(res.source) && !this._announced.has(gp.index)) {
+        if (res.note) {
+            this._noteOnce(res.note, gp);
+        } else if (isAutoMapped(res.source) && !this._announced.has(gp.index)) {
             this._announced.add(gp.index);
             if (this._onMapped) this._onMapped(gp, res);
         }
@@ -525,7 +553,101 @@ export class GamepadManager {
 
     _handleConnect(gp) {
         if (!gp || isTvRemotePad(gp)) return;
+        // A Joy-Con half waits for the next poll (one frame), which knows
+        // whether it has its other half (_joinJoyCons).
+        if (firefoxLinuxJoyCon(gp, this._platform)) return;
         this._consider(gp);
+    }
+
+    /** Tell the player `kind` once a stream. */
+    _noteOnce(kind, gp) {
+        if (this._noted.has(kind)) return;
+        this._noted.add(kind);
+        if (this._onNote) this._onNote(kind, gp);
+    }
+
+    /** How a Joy-Con half is read, cached apart from the pads' own slots. */
+    _halfRes(gp) {
+        const k = `${gp.index}|${gp.id}`;
+        let res = this._halfResolved.get(k);
+        if (!res) {
+            res = resolveMapping(gp, { user: this._user, db: this._db, platform: this._platform });
+            this._halfResolved.set(k, res);
+        }
+        return res;
+    }
+
+    /**
+     * The pads to read this poll: the browser's, with a Joy-Con pair it shows
+     * as two pads (Firefox on Linux: firefoxLinuxJoyCon) replaced by ONE
+     * standard pad — the left half's controls (JOYCON_LEFT_BUTTONS and _AXES)
+     * from the left, the rest from the right, each half read as its layout
+     * says. The game then has one player with the whole controller, where
+     * the two halves made two players with half of it each.
+     *
+     * It takes the lower of the two browser indexes, so the pair is the
+     * controller the first half was. Not joined: a half the player mapped
+     * themselves, or one the HID passthrough sends as itself.
+     */
+    _joinJoyCons(pads) {
+        let left = null;
+        let right = null;
+        for (const gp of pads) {
+            if (!gp) continue;
+            const half = firefoxLinuxJoyCon(gp, this._platform);
+            if (half === 'L' && !left) left = gp;
+            else if (half === 'R' && !right) right = gp;
+        }
+        if (left) this._noteOnce('joyconFirefoxStick', left);
+        let resL = null;
+        let resR = null;
+        if (left && right) {
+            resL = this._halfRes(left);
+            resR = this._halfRes(right);
+            const own = (r) => r.source === 'user' || this._excluded.has(r.key);
+            if (own(resL) || own(resR)) left = right = null;
+        }
+        const sig = left && right ? `${left.index}+${right.index}` : '';
+        if (sig !== this._joinSig) {
+            // Paired or parted: every pad either half was goes, and comes back
+            // as what it is now at this same poll.
+            for (const part of [this._joinSig, sig]) {
+                for (const i of part ? part.split('+') : []) {
+                    this._release(Number(i));
+                    this._resolved.delete(Number(i));
+                }
+            }
+            this._joinSig = sig;
+        }
+        if (!sig) return pads;
+
+        const viewL = resL.bindings ? readVirtualPad(left, resL.bindings) : left;
+        const viewR = resR.bindings ? readVirtualPad(right, resR.bindings) : right;
+        const rest = { pressed: false, value: 0 };
+        const buttons = [];
+        for (let i = 0; i < 17; i++) {
+            const from = JOYCON_LEFT_BUTTONS.includes(i) ? viewL : viewR;
+            const b = from.buttons[i];
+            buttons.push(
+                b ? { pressed: !!b.pressed, value: b.value || (b.pressed ? 1 : 0) } : rest,
+            );
+        }
+        const axes = [0, 1, 2, 3].map((i) => {
+            const from = JOYCON_LEFT_AXES.includes(i) ? viewL : viewR;
+            return typeof from.axes[i] === 'number' ? from.axes[i] : 0;
+        });
+        const joined = {
+            index: Math.min(left.index, right.index),
+            id: JOINED_JOYCON_ID,
+            mapping: 'standard',
+            connected: true,
+            timestamp: Math.max(left.timestamp || 0, right.timestamp || 0),
+            vibrationActuator: null,
+            buttons,
+            axes,
+        };
+        this._noteOnce('joyconJoined', joined);
+        return pads.filter((gp) => gp && gp !== left && gp !== right).concat([joined]);
     }
 
     /**
@@ -604,7 +726,9 @@ export class GamepadManager {
      * pad is forwarded. The two interleave; neither sends what has not changed.
      */
     _poll() {
-        const pads = navigator.getGamepads ? navigator.getGamepads() : [];
+        const pads = this._joinJoyCons(
+            Array.from(navigator.getGamepads ? navigator.getGamepads() : []),
+        );
         for (const gp of pads) {
             if (!gp) continue;
             // A TV remote: its arrows as keys, and never a pad on the host.

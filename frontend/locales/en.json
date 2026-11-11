@@ -909,6 +909,8 @@
         "consoleHint": "Back to Wolf UI (Ctrl+Alt+Shift+W, which the browser may swallow)",
         "gamepadConfigure": "Map it",
         "gamepadAutoMapped": "\"{{name}}\" was recognized automatically. Buttons in the wrong place?",
+        "gamepadJoyConJoined": "Joy-Con (L) and Joy-Con (R) are playing as one controller.",
+        "gamepadJoyConFirefoxStick": "Firefox can’t read the left Joy-Con’s stick (a Firefox bug), so it isn’t sent; its D-pad and buttons are. For the stick, open this page in Chrome or Safari.",
         "hidForwarded": "\"{{name}}\" goes to the host as itself.",
         "hidRefused": "\"{{name}}\" could not be sent as itself: {{why}}",
         "hidOffer": "\"{{name}}\" can reach the game as itself, every axis and button, instead of as an Xbox controller.",
