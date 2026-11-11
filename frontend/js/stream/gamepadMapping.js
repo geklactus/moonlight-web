@@ -365,6 +365,66 @@ export function readVirtualPad(gp, bindings) {
 export const ANDROID_NAME_FIXES = [];
 
 /**
+ * Joy-Con halves as Firefox on Linux shows them, the one browser that shows a
+ * pair as two pads (Chrome joins a Bluetooth pair into "Joy-Con L+R" itself,
+ * nintendo_data_fetcher.cc; Apple's GameController does it for Safari). Read
+ * from the sources on 2026-11-11 — Linux drivers/hid/hid-nintendo.c, Firefox
+ * dom/gamepad/linux/LinuxGamepad.cpp and dom/gamepad/GamepadRemapping.cpp —
+ * and matched by a real pair in LOLA's trace (Firefox 158):
+ *
+ *   - The kernel's driver gives each half its own input device. Firefox takes
+ *     a device as a standard pad when it has BTN_SOUTH, and lays it out itself.
+ *     Joy-Con (R) has it (B is BTN_SOUTH): a true standard pad, by position —
+ *     b0 B, b1 A, b2 Y, b3 X, b5 R, b7 ZR, b9 +, b11 stick, b16 Home, its
+ *     stick on axes 2 and 3 (b4 and b6 are its SL and SR).
+ *   - Joy-Con (L) has no BTN_SOUTH, so Firefox numbers its buttons in the
+ *     kernel's code order and hands them to its SwitchJoyConRemapper, which
+ *     says "standard" with 17 buttons and 2 axes but passes the numbers on as
+ *     they are: b0 Capture, b1 L, b2 SL, b3 ZL, b4 SR, b5 −, b6 stick, b7 up,
+ *     b8 down, b9 left, b10 right. Read as standard, L is B and − is R.
+ *   - That remapper also puts BOTH stick axes on axis 0 (RemapAxisMoveEvent
+ *     writes AXIS_INDEX_LEFT_STICK_X whatever the axis), so the left stick
+ *     can't be read: X and Y overwrite each other. It is left unbound — a
+ *     stick that went sideways when pushed up would be worse than none.
+ *
+ * The counts guard the match: a Firefox that changes either half's layout
+ * changes them, and the pad is then read as the browser says again.
+ */
+const FIREFOX_JOYCON_ID = /^057e-(2006|2007)-/i; // Firefox's "%04x-%04x-name"
+
+/** 'L' or 'R' for a Joy-Con half as Firefox on Linux shows it, else null. */
+export function firefoxLinuxJoyCon(gp, platform = detectPlatform()) {
+    if (platform !== 'linux' || !gp || gp.mapping !== 'standard') return null;
+    const m = FIREFOX_JOYCON_ID.exec(String(gp.id || ''));
+    if (!m) return null;
+    const buttons = gp.buttons ? gp.buttons.length : 0;
+    const axes = gp.axes ? gp.axes.length : 0;
+    if (m[1] === '2006' && buttons === 17 && axes === 2) return 'L';
+    if (m[1] === '2007' && buttons === 17 && axes === 4) return 'R';
+    return null;
+}
+
+/** Joy-Con (L) in Firefox on Linux, its controls where they are (see above). */
+export const FIREFOX_LINUX_JOYCON_L = {
+    leftshoulder: { t: 'b', i: 1 },
+    lefttrigger: { t: 'b', i: 3 },
+    back: { t: 'b', i: 5 },
+    leftstick: { t: 'b', i: 6 },
+    dpup: { t: 'b', i: 7 },
+    dpdown: { t: 'b', i: 8 },
+    dpleft: { t: 'b', i: 9 },
+    dpright: { t: 'b', i: 10 },
+};
+
+/**
+ * The controls each half of a pair holds, as standard button and axis indices:
+ * the left's, and the rest are the right's. A pair joined into one pad takes
+ * each control from the half that has it.
+ */
+export const JOYCON_LEFT_BUTTONS = [4, 6, 8, 10, 12, 13, 14, 15];
+export const JOYCON_LEFT_AXES = [0, 1];
+
+/**
  * How to read this pad.
  *
  * @param {Gamepad} gp
@@ -374,8 +434,9 @@ export const ANDROID_NAME_FIXES = [];
  *   that needs it); null = unavailable.
  * @returns {{ source: 'user'|'standard'|'builtin'|'android'|'db'|'pending'|null,
  *             bindings: object|null, key: string, name: string, kind: string,
- *             dbName?: string }}
+ *             dbName?: string, note?: string }}
  *   bindings null with source 'standard'/'android' = read the pad as is.
+ *   `note`: something to tell the player about how the pad is read (GamepadManager's onNote).
  *   `kind` is what the device is (padKind), whichever source lays it out.
  */
 export function resolveMapping(gp, ctx = {}) {
@@ -384,9 +445,20 @@ export function resolveMapping(gp, ctx = {}) {
     const saved = ctx.user ? ctx.user(key) : null;
     const base = { key, name, kind: padKind(gp, saved) };
     if (saved && saved.bindings) return { ...base, source: 'user', bindings: saved.bindings };
-    if (gp.mapping === 'standard') return { ...base, source: 'standard', bindings: null };
-
     const platform = ctx.platform || detectPlatform();
+    if (gp.mapping === 'standard') {
+        // Firefox on Linux calls the left Joy-Con standard and isn't (firefoxLinuxJoyCon).
+        if (firefoxLinuxJoyCon(gp, platform) === 'L') {
+            return {
+                ...base,
+                source: 'builtin',
+                bindings: copyBindings(FIREFOX_LINUX_JOYCON_L),
+                note: 'joyconFirefoxStick',
+            };
+        }
+        return { ...base, source: 'standard', bindings: null };
+    }
+
     const desktop = platform === 'win' || platform === 'mac' || platform === 'linux';
     const builtin = desktop ? builtinFor(gp.id) : null;
     if (builtin) return { ...base, source: 'builtin', bindings: builtin };
@@ -482,6 +554,11 @@ function builtinFor(id) {
     const { vid, pid } = parsePadId(id);
     const profile = vid && pid ? BUILTIN_PADS[`${vid}:${pid}`] : null;
     if (!profile) return null;
+    return copyBindings(profile);
+}
+
+/** A copy of a bindings table: the tables here are shared. */
+function copyBindings(profile) {
     return Object.fromEntries(Object.entries(profile).map(([target, b]) => [target, { ...b }]));
 }
 

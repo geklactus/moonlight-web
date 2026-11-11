@@ -5876,6 +5876,19 @@ export class StreamView {
                                 },
                             });
                         },
+                        // Once a stream: a Joy-Con pair Firefox shows as two
+                        // pads, joined into one; and the left Joy-Con's stick,
+                        // which Firefox can't read (GamepadManager._joinJoyCons,
+                        // gamepadMapping.firefoxLinuxJoyCon).
+                        onNote: (kind) => {
+                            if (kind === 'joyconJoined') {
+                                Toast.info(t('stream.gamepadJoyConJoined'), { durationMs: 6000 });
+                            } else if (kind === 'joyconFirefoxStick') {
+                                Toast.warning(t('stream.gamepadJoyConFirefoxStick'), {
+                                    durationMs: 12000,
+                                });
+                            }
+                        },
                     },
                 );
             }

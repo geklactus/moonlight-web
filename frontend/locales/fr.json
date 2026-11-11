@@ -909,6 +909,8 @@
         "consoleHint": "Retour à Wolf UI (Ctrl+Alt+Shift+W, que le navigateur peut intercepter)",
         "gamepadConfigure": "Configurer",
         "gamepadAutoMapped": "« {{name}} » a été reconnue automatiquement. Des boutons mal placés ?",
+        "gamepadJoyConJoined": "Joy-Con (L) et Joy-Con (R) jouent comme une seule manette.",
+        "gamepadJoyConFirefoxStick": "Firefox ne sait pas lire le stick du Joy-Con gauche (un bogue de Firefox) : il n’est pas transmis, sa croix et ses boutons le sont. Pour le stick, ouvrez cette page dans Chrome ou Safari.",
         "hidForwarded": "« {{name}} » part vers l'hôte tel quel.",
         "hidRefused": "« {{name}} » n'a pas pu partir tel quel : {{why}}",
         "hidOffer": "« {{name}} » peut arriver au jeu tel quel, avec tous ses axes et boutons, au lieu d'une manette Xbox.",
