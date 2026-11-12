@@ -2660,6 +2660,134 @@ cap, and worse as the minutes went on. Open points, none started:
 - Chrome's HEVC decoder on macOS breaking after a stall;
 - the panel's headline under-reading the delay.
 
+### 04/11/2026 — The sound leaves in EF by default, video and data in AF41 (audio + DSCP plan, D9)
+
+A decision, with no new measure. Until now everything left in AF41 and
+`MW_DSCP=46,34,34` was the bench's way to try the sound in EF.
+
+What is known of EF, all from the bench of 21/10 (host DualRTX, the N95 on
+Wi-Fi behind the repeater, a ~316 Mbit/s download and ~300 Mbit/s video bursts
+on its station, 2 rounds of 3 passes): no loss either way, the same jitter, a
+NetEq buffer within its noise (37-63 ms). The one hint, a better p95 of that
+buffer in EF under the download (2 pairs of 2), went the other way at rest.
+That path sends EF and AF41 to the same queue (TID = DSCP >> 3, 06/10), so it
+could not show what EF is for: **the voice queue of an access point that follows
+RFC 8325 has not been measured here**, nor has any harm from it.
+
+Why it is the default anyway: the sound is ~0.25 Mbit/s, so VO costs the house
+nothing, and there it no longer waits behind a key frame's packets. It is also
+RFC 8837's value for interactive audio.
+
+What keeps the video out: VO does not aggregate, and CS6 broke the video on
+10/10. libdatachannel chooses a track's class by the type of its section, so
+frames on the audio road would have followed the sound into EF.
+`Track::setVideoDscp` (`libdatachannel-track-video-dscp.patch`) keeps those
+tracks in the video's class, as `ultra-lan-poc.md` asked.
+
+Under `hostcap=`, a bench key, one QoS policy holds one value for the whole
+executable, so the sound is not expected to keep EF there. Not measured.
+
+### 05/11/2026 — The Opus frame under a loaded Wi-Fi: nothing argues for leaving 5 ms (audio + DSCP plan, A3 L2)
+
+The 06/10 pass on a quiet Wi-Fi left one question: 10 ms halves the packets on
+the air, so could it win where the air is busy? **Not on this bench.** No pass
+lost a packet, and the case with half the packets concealed the most. **Bruno
+kept 5 ms and closed the question the same day**, with no more passes on a quiet
+Wi-Fi.
+
+Host DualRTX (native), client a Mac M1 with Chrome 156 on Wi-Fi (channel 44,
+-42 dBm), the N95 on the same channel as a second station. The load is direct TCP
+from the host's cable to the N95's Wi-Fi: none, the "iPhone video" profile
+(22 Mbit/s) or a continuous download (250-285 Mbit/s). Before the passes, a UDP
+ping to the Mac went from a median of 4.1 ms to 20-21 ms (p90 36-41) under the
+download, with the N95's Wi-Fi receiving what was sent. Two rounds of 9 passes,
+the second in reverse order, 2 min 20 each; the buffer is read after the first
+20 s. All 18 passes: DSCP 46/34/34, no `[UPNP]`.
+
+Mean NetEq buffer plus the frame's own wait, in ms (round 1 / round 2):
+
+| | 5 ms | 10 ms | 20 ms |
+|---|---|---|---|
+| Quiet | 53.0 / 63.5 | 40.3 / 43.1 | 50.3 / 57.1 |
+| Video 22 Mbit/s | 69.5 / 70.8 | 65.9 / 70.3 | 68.8 / 70.2 |
+| Download | 72.7 / 66.1 | 87.9 / 62.2 | 79.0 / 81.8 |
+
+Concealment over the whole of each 46-49 s reading, start included:
+
+| | 5 ms | 10 ms | 20 ms |
+|---|---|---|---|
+| Passes with any (of 6) | 1 | 4 | 1 |
+| Events | 1 | 8 | 1 |
+| Sound invented | 15 ms | 102 ms | 7.5 ms |
+| After the first 20 s | 0 | 50 ms | 0 |
+
+None on a quiet Wi-Fi, for any frame. Six passes per frame show a direction and
+prove nothing, and why 10 ms would conceal more than 20 ms is not known.
+
+- **Under load, the frames do not separate in 5 ms's disfavour.** With video they
+  tie within round-to-round noise. Under the download 20 ms is the slowest in both
+  rounds, and 10 ms moves from 62 to 88.
+- **On a quiet Wi-Fi, 10 ms beat 5 ms by 13-20 ms in both rounds, and this is not
+  established.** On 06/10, 5 ms won (36.2 against 39.8). The buffer settles after
+  about 20 s and stays flat within ~2 ms, on a level that changes between passes
+  of the same setting: 31.2, 48.0 and 58.5 at 5 ms. So the gap may be which level a
+  pass lands on. That NetEq leaves a band of about 20 ms around its target is a
+  reading from memory of libwebrtc, not checked. Round 2's 58.5 was the round's last
+  pass, which rules out the Mac's wake-up as the cause of round 1's 48.0, its first.
+
+**The rounds differ in one way that was not planned.** The stream asks for 120 fps
+throughout. In round 1 the virtual display ran at 240 Hz for all 9 passes. Round 2's
+first pass (download, 20 ms) ended that with « capture did not hold the display at
+240.08 Hz », so the other 8 ran at 120 Hz. Each round's frames are still compared at
+one rate, apart from that first pass, but round 1 against round 2 is not clean: the
+video drops from 34-54 to 30-44 Mbit/s, and the download gains ~30 Mbit/s. Between
+rounds the same setting's buffer moved by -25.7 to +10.5 ms (median +2.1), so
+no effect of the rate shows, and it cannot be told apart from the round.
+
+**A bench trap.** That refusal was stored in the --dev's `vdd_match_refused`, which
+then caps the next benches on that --dev without a word. Why the capture folded is
+not known. To read in a log: « under 235 Hz: the capture did not hold more ».
+
+Limits: a silent host source and a muted Chrome, where the 06/10 reference was not
+muted, and nobody listened. One client, 2 passes per case, no alternation, 7.4 GB of
+swap of 8 on the Mac. The screen was probably locked. Not measured: the cable witness
+the plan asked for. Packets on the air were not counted.
+
+### 05/11/2026 — The D9 defaults on the wire: the sound in EF, video and data in AF41 (audio + DSCP plan, D9a)
+
+Native host on DualRTX (Windows 11 26200, a --dev of the 05/11 build, not
+elevated, `packet_marking` on, no `MW_DSCP`), Chrome 156 on the N95 by cable.
+pktmon ran at DualRTX's NICs on the UDP leaving the media ports, about 66 s per
+pass. pktmon sees each datagram 4 times; the counts are of distinct datagrams.
+
+| Pass | Sound (RTP PT 111) | Frames (RTP PT 110) | SCTP (DTLS records) |
+|---|---|---|---|
+| video over SCTP, the default | EF, 13,326 | — | AF41, 32,715 |
+| audio road (`MW_RTP_VIDEO=native:h264+hevc+aroad`) | EF, 13,087 | AF41, 98,584 | AF41, 8,310 |
+
+STUN checks leave in 0, as libjuice does by design.
+
+- **The sound keeps EF next to a video in AF41.** `DtlsSrtpTransport` copies every
+  packet through `make_message`, which used to drop the class; on 21/10, without the
+  one-line fix in our submodule, the sound left with the video's value.
+- **On the audio road the frames ride an audio section and still leave in AF41**:
+  `Track::setVideoDscp` holds.
+- **One exception, in both passes**: the host's first two DTLS handshake datagrams
+  (ServerHello with the certificate, then ChangeCipherSpec and Finished, 34 ms after
+  the first packet) leave in AF11. libdatachannel's `DtlsTransport` starts from a
+  hard-coded `mCurrentDscp = 10` and only takes the class of the records it carries
+  later; `SetDscpSettings` does not reach it. The Mac's WebRTC session with the macOS
+  fix saw the same « 2 packets in AF11 ». Two datagrams before the stream starts: no effect expected.
+- **The three upstream branches pass their own suites** on Linux (WSL, GCC 14.2):
+  libdatachannel `keep-dscp-make-message` 29 tests of 29, libjuice `windows-diffserv`
+  and `macos-ipv4-tclass` `tests`. None of these tests reads a DSCP; the Windows and
+  Apple paths are not compiled there.
+
+Limits: one client, by cable, one pass per arm. The capture is at the host, so what
+the repeater and the Wi-Fi do with the marks is in the entries of 05/10 and 06/10.
+Not measured with these defaults: a host under the Windows service, Linux and macOS
+hosts.
+
 ## 4. The model so far (04/10/2026)
 
 What the measurements support, in order of the path:

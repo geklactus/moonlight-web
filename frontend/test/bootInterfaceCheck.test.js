@@ -220,7 +220,8 @@ beforeEach(() => {
     localStorage.clear();
     sessionStorage.clear();
     document.body.innerHTML =
-        '<h1 id="stage"></h1><p id="detail"></p><div id="bar"></div><p id="status"></p><p id="note"></p>' +
+        '<h1 id="stage"></h1><button id="reload" hidden></button><p id="detail"></p>' +
+        '<div id="bar"></div><p id="status"></p><p id="note"></p>' +
         '<div id="instance-menu" hidden></div>';
     delete document.body.dataset.state;
     served = { ...OFFICIAL };
@@ -274,6 +275,8 @@ describe('where the check is enforced', () => {
         expect(cachesStub.shell()).toEqual([]);
         expect(sw.told).toEqual([]);
         expect(tunnelClosed).toBe(true);
+        // A reload would only ask the same machine for the same files.
+        expect(document.getElementById('reload').hidden).toBe(true);
         expect(localStorage.getItem('mw-shell-stamp')).toBeNull();
     });
 
@@ -344,9 +347,10 @@ describe('where the check only reports', () => {
         // Both words: an older worker opens on the second.
         expect(sw.told).toEqual(['mw-shell-verified', 'mw-shell-checked']);
         expect(cachesStub.shell()).toContain('/js/app.js');
-        expect(warnings.some((w) => w.includes('/js/app.js differ from the official 0.4.0'))).toBe(
-            true,
-        );
+        // Once: the check of the fresh cache after the download keeps quiet.
+        expect(
+            warnings.filter((w) => w.includes('/js/app.js differ from the official 0.4.0')),
+        ).toHaveLength(1);
     });
 
     it('keeps what is not part of the interface, as before', async () => {
@@ -373,6 +377,7 @@ describe('the caption under a machine this browser has never reached', () => {
         await start();
         expect(document.getElementById('stage').textContent).toBe('Not connected');
         expect(caption()).toBe('No server found');
+        expect(document.getElementById('reload').hidden).toBe(false);
     });
 
     it('stays empty where the machine answered but no direct connection opened', async () => {

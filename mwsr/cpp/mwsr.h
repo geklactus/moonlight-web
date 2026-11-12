@@ -26,15 +26,18 @@
 //
 // What it gives a Direct3D 11 or 12 renderer (or any other), with no
 // dependency: the mode a frame of inW x inH drawn at outW x outH takes and its
-// shader file (regime, shaderFile), the 64 bytes of the constant buffer at
-// register b0 (constants), and the defines to compile the shader with
-// (defines), each the twin of the JavaScript module's function of that name.
+// shader file (regime, shaderFile), the kernel's values for those sizes (law),
+// the 96 bytes of the constant buffer at register b0 (constants), and the
+// defines to compile the shader with (defines), each the twin of the JavaScript
+// module's function of that name.
 // example_d3d11.cpp shows them at work.
 
 #pragma once
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -45,7 +48,7 @@ enum class Mode { Copy, Up, Down };
 
 struct Regime {
     Mode mode = Mode::Copy;
-    int taps = 0;              // Up: 5 (the flat path's); Down: the grid's samples, 1, 4, 9 or 16
+    int taps = 0;              // Down: the grid's samples, 1, 4, 9 or 16
     double rDown = 0.0;        // Down: MWSR_R_DOWN
     unsigned linearLight = 0;  // Down: MWSR_LINEAR_LIGHT
 };
@@ -54,36 +57,51 @@ struct Regime {
 struct Constants {
     float texel[2];        // 1 / inW, 1 / inH
     float scale[2];        // outW / inW, outH / inH
-    float tau;             // the vote's threshold, luma per input texel
-    float sharp;           // the sharpness (x W_ACROSS)
-    float gaze;            // the gaze zone's weight, 0 without one
-    float pad0;
+    float dims[2];         // inW, inH
+    float across[2];       // the distance of the across taps, as a share of the input
+    float kc;              // the cubic's sharpness
+    float ft;              // the vote's threshold, luma per input texel
+    float kg;              // the sharpness along the across reads: 0 at 1:1, whole from kFullScale on
+    float kwc;             // the colour's sharpness, the same way
     float zoneCentre[2];   // the gaze zone, read only with MWSR_GAZE 1
     float zoneHalfAxes[2];
     float zoneRing;
-    float zoneTau;
-    float zoneSharp;
+    float zoneFt;
+    float zoneKg;
+    float gaze;            // its weight, 0 without one
+    float kl;              // the bound's margin, as a share of the three reads' range
+    float zoneRef;         // what the native host's zones count their drops against, read by no shader here
     float pad1;
+    float pad2;
 };
-static_assert(sizeof(Constants) == 64, "the constant buffer is 16 floats");
+static_assert(sizeof(Constants) == 96, "the constant buffer is 24 floats");
 
 // The gaze zone: its centre and half-axes as fractions of the picture, the
-// ring's width as a fraction of the half-axes, its threshold and sharpness.
+// ring's width as a fraction of the half-axes, its threshold and its sharpness
+// as a multiple of the law's.
 struct Zone {
     double cx = 0.5, cy = 0.5;
     double rx = 0.2, ry = 0.45;
     double ring = 0.75;
-    double tau = 0.02, sharp = 2.5;
+    double ft = 0.005, boost = 1.5;
 };
 
-// The per-frame defaults, the scale whose across weight the sharpness law holds,
-// and the sharpness from x2 up with the scale its ramp starts from.
-constexpr double kTau = 0.05;
-constexpr double kSharp = 1.85;
-constexpr double kSharpRefScale = 1.3333333333333333;
-constexpr double kSharpX2 = 1.5;
-constexpr double kSharpX2From = 1.75;
-constexpr double kSFull = 1.5;  // MWSR_S_FULL's default
+// The law's coefficients (mwsrLaw()), value = c0 + c1 x + c2 x^2, x = ln(scale),
+// in the order of kc, kg, kr, kl; the scales it holds at their ends; the force
+// of the sharpness on kg and kl, 1 at kForceFrom, kForceTop from kForceTo, a
+// straight line in x between them.
+constexpr double kLaw[4][3] = {
+    {0.6353583202388096, 0.021845681633595574, 0.12781268100437676},  // kc
+    {-0.1288413863403059, 2.5844683855070816, -1.260092021482419},  // kg
+    {1.0071546009267338, -1.0209066704914191, 0.5699605831985769},  // kr
+    {0.33416994543071277, -0.2962022126856069, 0.08628272130287401},  // kl
+};
+constexpr double kLawScaleMin = 1.07, kLawScaleMax = 4.0;
+constexpr double kForceFrom = 1.3333333333333333, kForceTo = 2.0, kForceTop = 1.35;
+constexpr double kLawFt = 0.005, kLawKwc = 0.1;
+
+// The scale from which the kernel's sharpening is whole.
+constexpr double kFullScale = 1.07;
 
 // The reduction's grids, by the smallest scale they serve: {minimum scale, samples, R_DOWN}.
 struct Grid {
@@ -112,18 +130,8 @@ struct Constant {
 };
 constexpr Constant kConstants[] = {
     {"SHOW", true, 0.0},
-    {"W_ALONG", false, 0.15},
-    {"W_ACROSS", false, 0.3},
-    {"R_ALONG", false, 0.5},
-    {"R_ACROSS", false, 1.0},
-    {"S_FULL", false, 1.5},
-    {"W_MIN", false, -0.5},
-    {"DERING", true, 2.0},
     {"CHROMA444", true, 0.0},
-    {"FLAT_TAPS", true, 5.0},
-    {"FLAT_C", false, 0.5},
     {"GAZE", true, 0.0},
-    {"FLAT_ZONE", true, 0.0},
     {"R_DOWN", false, 1.0},
     {"LINEAR_LIGHT", true, 1.0},
 };
@@ -138,7 +146,7 @@ inline Regime regime(int inW, int inH, int outW, int outH, bool srgbViews = fals
         return {Mode::Copy, 0, 0.0, 0};
     const double s = std::min(double(outW) / inW, double(outH) / inH);
     if (s >= 1.0)
-        return {Mode::Up, 5, 0.0, 0};
+        return {Mode::Up, 0, 0.0, 0};
     const Grid* table = srgbViews || linearFeed ? kDownGridsSrgb : kDownGrids;
     const unsigned light = srgbViews ? 0u : linearFeed ? 3u : 1u;
     for (int i = 0; i < 3; ++i)
@@ -155,32 +163,62 @@ inline std::string shaderFile(const Regime& r, bool half = false)
     return half ? "mwsr-up-half.hlsl" : "mwsr-up.hlsl";
 }
 
-// The sharpness law (mwsrSharpness()): sharp up to the reference scale, then
-// held so that the across weight stays the one of that scale; from x2From a
-// ramp to x2 at x2, held above (never above sharp).
-inline double sharpness(double scale, double sharp = kSharp, double ref = kSharpRefScale, double x2 = kSharpX2,
-                        double x2From = kSharpX2From)
+// The kernel's values for an input of inW x inH drawn at outW x outH (mwsrLaw()):
+// each a curve over the scale, the smaller axis.
+struct Law {
+    double kc, ft, kg, kr, kwc, kl;
+};
+
+inline Law law(int inW, int inH, int outW, int outH)
 {
-    auto strength = [](double s) { return std::min(std::max((s - 1.0) / (kSFull - 1.0), 0.0), 1.0); };
-    const double at = strength(scale);
-    if (at <= 0.0)
-        return sharp;
-    const double held = sharp * std::min(1.0, strength(ref) / at);
-    const double t = std::min(std::max((scale - x2From) / (2.0 - x2From), 0.0), 1.0);
-    return std::min(sharp, held + t * (x2 - held));
+    auto hold = [](double v, double lo, double hi) { return std::min(std::max(v, lo), hi); };
+    const double s = hold(std::min(double(outW) / inW, double(outH) / inH), kLawScaleMin, kLawScaleMax);
+    const double x = std::log(s);
+    auto value = [&](int i) { return kLaw[i][0] + x * (kLaw[i][1] + x * kLaw[i][2]); };
+    const double force = 1.0 + (kForceTop - 1.0) * hold(std::log(s / kForceFrom) / std::log(kForceTo / kForceFrom), 0.0, 1.0);
+    return {value(0), kLawFt, value(1) * force, value(2), kLawKwc, value(3) * force};
+}
+
+// A reduction's sharpening (mwsrDownLaw()): each pair at x0.5, then at x2/3 and
+// above, a straight line in the scale between them; below x0.5 none, and both
+// gains fall to none between kDownFade and 1:1.
+constexpr double kDownScale[2] = {0.5, 0.6666666666666666};
+constexpr double kDownGain[2] = {0.25, 0.45};
+constexpr double kDownEdgeGain[2] = {0.05, 0.2};
+constexpr double kDownMargin[2] = {0.1, 0.25};
+constexpr double kDownEdgeMargin[2] = {0.0, 0.1};
+constexpr double kDownFade = 0.93, kDownFt = 0.003;
+
+// Its values, under the names of the constant buffer's places that hold them:
+// kg the gain, kwc the gain at a strong edge, kl the margin, zref the margin
+// at a strong edge.
+struct DownLaw {
+    double ft, kg, kwc, kl, zref;
+};
+
+inline DownLaw downLaw(int inW, int inH, int outW, int outH)
+{
+    const double s = std::min(double(outW) / inW, double(outH) / inH);
+    if (s < kDownScale[0])
+        return {kDownFt, 0.0, 0.0, 0.0, 0.0};
+    const double t = std::min((s - kDownScale[0]) / (kDownScale[1] - kDownScale[0]), 1.0);
+    auto at = [&](const double (&p)[2]) { return p[0] + (p[1] - p[0]) * t; };
+    const double f = std::min(std::max((1.0 - s) / (1.0 - kDownFade), 0.0), 1.0);
+    return {kDownFt, at(kDownGain) * f, at(kDownEdgeGain) * f, at(kDownMargin), at(kDownEdgeMargin)};
 }
 
 struct Options {
-    double tau = kTau;
-    double sharp = -1.0;  // below 0: the sharpness law at this scale
-    double gaze = 0.0;    // 0 to 1, read only with MWSR_GAZE 1
+    // a value named here replaces the law's
+    std::optional<double> kc, ft, kg, kr, kwc, kl, sfull;
+    double gaze = 0.0;  // 0 to 1, read only with MWSR_GAZE 1
     Zone zone;
+    bool hdr = false;  // the feed holds values past 1.0: the bound takes no margin, a reduction does not sharpen
 };
 
 // The constant buffer for an input of inW x inH drawn at outW x outH (mwsrUniforms()).
 inline Constants constants(int inW, int inH, int outW, int outH, const Options& o = {})
 {
-    const double sharp = o.sharp >= 0.0 ? o.sharp : sharpness(std::min(double(outW) / inW, double(outH) / inH));
+    const Law l = law(inW, inH, outW, outH);
     // a ring of no width would put the smoothstep's two edges together
     const double ring = std::max(o.zone.ring, 1e-3);
     Constants c{};
@@ -188,16 +226,33 @@ inline Constants constants(int inW, int inH, int outW, int outH, const Options& 
     c.texel[1] = float(1.0 / inH);
     c.scale[0] = float(double(outW) / inW);
     c.scale[1] = float(double(outH) / inH);
-    c.tau = float(o.tau);
-    c.sharp = float(sharp);
-    c.gaze = float(std::min(std::max(o.gaze, 0.0), 1.0));
+    c.dims[0] = float(inW);
+    c.dims[1] = float(inH);
+    const double kr = o.kr.value_or(l.kr);
+    c.across[0] = float(kr / inW);
+    c.across[1] = float(kr / inH);
+    // the sharpening's strength: none at 1:1 (the renderer copies the frame there), whole from kFullScale on
+    const double smin = std::min(double(outW) / inW, double(outH) / inH);
+    const double strength = std::min(std::max((smin - 1.0) / (o.sfull.value_or(kFullScale) - 1.0), 0.0), 1.0);
+    // a reduction's own values, in the same places: its text reads them under these names
+    const bool down = smin < 1.0;
+    const DownLaw d = down ? downLaw(inW, inH, outW, outH) : DownLaw{};
+    const double kg = down ? o.kg.value_or(o.hdr ? 0.0 : d.kg) : o.kg.value_or(l.kg) * strength;
+    c.kc = float(o.kc.value_or(l.kc));
+    // the edge's direction divides by the slope's length: a vote of 0 would let a slope of 0 through
+    c.ft = float(std::max(o.ft.value_or(down ? d.ft : l.ft), 1e-6));
+    c.kg = float(kg);
+    c.kwc = float(down ? o.kwc.value_or(o.hdr ? 0.0 : d.kwc) : o.kwc.value_or(l.kwc) * strength);
     c.zoneCentre[0] = float(o.zone.cx);
     c.zoneCentre[1] = float(o.zone.cy);
     c.zoneHalfAxes[0] = float(o.zone.rx);
     c.zoneHalfAxes[1] = float(o.zone.ry);
     c.zoneRing = float(ring);
-    c.zoneTau = float(o.zone.tau);
-    c.zoneSharp = float(o.zone.sharp);
+    c.zoneFt = float(std::max(o.zone.ft, 1e-6));
+    c.zoneKg = float(kg * o.zone.boost);
+    c.gaze = float(std::min(std::max(o.gaze, 0.0), 1.0));
+    c.kl = float(o.kl.value_or(down ? d.kl : o.hdr ? 0.0 : l.kl));
+    c.zoneRef = down ? float(d.zref) : 1.0f;
     return c;
 }
 
@@ -216,8 +271,7 @@ inline std::string number(double v)
 
 // The defines of a regime's shader: a reduction's span and light, or, for the
 // upscale, the constants given (by name, without the prefix) over the
-// defaults, such as {{"FLAT_TAPS", "3"}} on a phone or {{"CHROMA444", "1"}}
-// on a 4:4:4 stream.
+// defaults, such as {{"CHROMA444", "1"}} on a 4:4:4 stream.
 inline std::vector<Define> defines(const Regime& r, const std::vector<Define>& up = {})
 {
     std::vector<Define> d;

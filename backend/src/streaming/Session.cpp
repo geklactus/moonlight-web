@@ -577,6 +577,20 @@ void StreamSession::onLaunchResult(bool ok, const BackendError& err, const Media
         }
         const BackendError& refusal = m_LaunchRefusal && m_ResumeAttempted ? *m_LaunchRefusal : err;
 
+        if (refusal.kind == BackendError::CertificateChanged) {
+            QJsonObject errObj;
+            errObj["error"] = QString("\"%1\" is not showing the certificate it was paired with, "
+                                      "so nothing was sent to it. If its software was reinstalled, "
+                                      "remove the host and add it again.")
+                                  .arg(m_Host->name);
+            errObj["code"] = QStringLiteral("certificate_changed");
+            errObj["status"] = 409;
+            m_Respond(HttpResponse::json(errObj, 409));
+            emit sessionFailed(refusal.message);
+            deleteLater();
+            return;
+        }
+
         // Sunshine 503 = the host could not initialize video capture/encoding.
         // Almost always a display problem on the HOST: no display connected, or
         // the session is locked with the screen asleep — a blanked output stops
@@ -727,6 +741,10 @@ void StreamSession::onLaunchResult(bool ok, const BackendError& err, const Media
         // The same codec bitmask the GameStream path negotiates with, so the
         // browser's decoder expectations are identical either way.
         nativeParams.clientVideoFormats = params.supportedVideoFormats;
+        // The mask says HEVC and H.264 alike for Auto and for HEVC chosen by
+        // hand, and the browser resolves Auto to a codec before asking: only
+        // its own word tells an offer from a wish. See setCodecAuto.
+        nativeParams.codecAuto = m_CodecAuto;
         nativeParams.hdr = media.nativeHost.hdrRequested;
         nativeParams.yuv444 = m_Config.chroma == ChromaSampling::C444;
         // Intra-refresh is only worth its cost when the client will decode
@@ -745,6 +763,10 @@ void StreamSession::onLaunchResult(bool ok, const BackendError& err, const Media
         nativeParams.clientTearingReal = m_ClientTearingReal;
         // And the ceiling that alignment may not cross — see setMaxFps.
         nativeParams.maxFps = m_MaxFps;
+        // And the administrator's, for what moves mid-stream — see
+        // setStreamLimits.
+        nativeParams.fpsLimit = m_FpsLimit;
+        nativeParams.bitrateLimitKbps = m_BitrateLimitKbps;
         nativeParams.followDisplayShape = m_FollowDisplayShape;
         nativeParams.fitRequestedBox = m_FitRequestedBox;
         nativeParams.allowUpscale = m_AllowUpscale;
@@ -756,6 +778,8 @@ void StreamSession::onLaunchResult(bool ok, const BackendError& err, const Media
         // The "mute host audio" stream setting, honoured here as the GameStream
         // path honours it through localAudioPlayMode.
         nativeParams.muteHostAudio = m_Config.muteHostAudio;
+        nativeParams.audioSource = m_Config.audioSource.toStdString();
+        nativeParams.onAudioAppChanged = m_Config.onAudioAppChanged;
         // The portal consent this installation already holds. Only a machine
         // that captures through the portal has one at all.
         nativeParams.portalRestoreToken = m_PortalRestoreToken;
@@ -789,12 +813,15 @@ void StreamSession::onLaunchResult(bool ok, const BackendError& err, const Media
     // (standard installer deployment: backend runs next to Sunshine) — the
     // backend clipboard is then the host's. For remote Sunshine hosts the
     // relay stays clipboard-silent and the browser keeps today's behavior.
+    // The native host is this machine by construction, and its entry carries no
+    // address for isSelfAddress() to recognise.
     //
     // A restricted session (an invited player) never gets it either, whatever
     // the address: the host's clipboard is an exfiltration channel, and it is
     // not a guest's to read.
     const bool hostIsSelf = ClipboardBridge::isSelfAddress(m_Host->activeAddress.address());
-    const bool clipboardLocal = hostIsSelf && m_InputPolicy.unrestricted();
+    const bool hostIsHere = media.type == MediaType::NativeHost || hostIsSelf;
+    const bool clipboardLocal = hostIsHere && m_InputPolicy.unrestricted();
     qInfo() << "[Session] Clipboard sync" << (clipboardLocal ? "enabled" : "disabled")
             << "(host address:" << m_Host->activeAddress.address()
             << ", restricted:" << !m_InputPolicy.unrestricted() << ")";
@@ -822,11 +849,9 @@ void StreamSession::onLaunchResult(bool ok, const BackendError& err, const Media
     // and the voice would come out on the wrong PC. Same gate as the clipboard
     // otherwise: the owner's, never an invited player's. Every transport
     // carries it: the WebRTC ones on the audio track, the WebSocket one as
-    // frames on its socket. The native host is this machine by construction,
-    // and its entry carries no address for isSelfAddress() to recognise.
+    // frames on its socket.
     if (m_MicRequested) {
-        const bool micHostHere = media.type == MediaType::NativeHost || hostIsSelf;
-        std::string why = MicUplink::refusal(micHostHere, m_InputPolicy.unrestricted());
+        std::string why = MicUplink::refusal(hostIsHere, m_InputPolicy.unrestricted());
         if (why.empty()) why = MicUplink::unavailable(m_MicDevice.toStdString());
         if (why.empty()) {
             auto mic = std::make_shared<MicUplink>(m_MicDevice.toStdString());

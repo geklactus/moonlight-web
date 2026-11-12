@@ -24,12 +24,13 @@
  */
 import { WebRtcDataChannel } from '../api/WebRtcDataChannel.js';
 import { WebRtcMedia } from '../api/WebRtcMedia.js';
+import { DecoderErrorTrail } from '../stream/DecoderErrorTrail.js';
 import { BackendClient } from '../api/BackendClient.js';
 import { Toast } from './Toast.js';
 import { StatsGraph } from './StatsGraph.js';
 import { AudioPipeline } from '../audio/AudioPipeline.js';
 import * as streamVolume from '../audio/streamVolume.js';
-import { MicUplink, micSupported } from '../audio/MicUplink.js';
+import { MicUplink, loadMicDevice, micSupported } from '../audio/MicUplink.js';
 import { JitterController } from '../stream/JitterController.js';
 import { FramePacer } from '../stream/FramePacer.js';
 import {
@@ -38,8 +39,10 @@ import {
     onRefreshRateChange,
 } from '../util/RefreshRate.js';
 import { devicePixelSize } from '../util/StreamResolution.js';
+import { hostScreenCaps } from '../util/HostLimit.js';
 import { PeriodicStallDetector } from '../stream/PeriodicStallDetector.js';
 import { GamepadManager } from '../stream/GamepadManager.js';
+import { PadNumberNotice } from '../stream/HostPadNumber.js';
 import { HidPassthrough } from '../hid/HidPassthrough.js';
 import { GamepadRemapDialog } from './GamepadRemapDialog.js';
 import { padKey, padName } from '../stream/gamepadMapping.js';
@@ -94,8 +97,9 @@ import {
     plainPresenterIsWebGpu,
     supportsDisplayHdr,
     supportsGamingMode,
+    lockFreeLookWanted,
 } from '../util/BrowserDetect.js';
-import { noteHevcFailed } from '../util/CodecAuto.js';
+import { Av1Watch, noteAv1Failed, noteAv1Proven, noteHevcFailed } from '../util/CodecAuto.js';
 import { noteRtpH265Failed } from '../util/RtpH265.js';
 import * as RemoteNav from './RemoteNav.js';
 import { StreamRemoteMenu } from './StreamRemoteMenu.js';
@@ -122,11 +126,13 @@ import {
     formatMainThread,
 } from '../stream/PipelineDiag.js';
 import { shouldFlushAtKeyframe } from '../stream/DecodeQueuePolicy.js';
+import { queueBrake } from '../stream/DecodeBrake.js';
 import { DecodeDelay, DecodeQueueSignal } from '../stream/DecodeQueueSignal.js';
 import { DecodeRateGovernor } from '../stream/DecodeRateGovernor.js';
 import { SilentDecoderWatch } from '../stream/SilentDecoderWatch.js';
 import { ByteRate } from '../stream/ByteRate.js';
 import {
+    ENHANCER_LADDER,
     EnhancerGovernor,
     ladderRung,
     rendererAlgo,
@@ -145,6 +151,7 @@ import {
 import { cropToAnnounced } from '../stream/FrameCrop.js';
 import { VsyncGrid } from '../stream/VsyncGrid.js';
 import { CadenceStepper, autostepEnabled, stepMemory } from '../stream/CadenceStepper.js';
+import { frameMatchesAsked } from '../stream/AutoCeilingMeter.js';
 import { LatencyProbe } from '../stream/LatencyProbe.js';
 import { InputUplink } from '../stream/InputUplink.js';
 import { LINK_STALL_MS, LINK_STALL_PROBE_MS } from '../stream/CrashRelaunch.js';
@@ -168,9 +175,13 @@ import { openSupportPage, showSupportButton } from '../util/supportNudge.js';
 import { BMC_LOGO } from './bmcLogo.js';
 import { StreamViewKeyboard } from './StreamViewKeyboard.js';
 import { StreamViewTouch } from './StreamViewTouch.js';
+import { StreamViewTouchPad } from './StreamViewTouchPad.js';
 import { StreamViewFullscreen, EXIT_FULLSCREEN_EVENT } from './StreamViewFullscreen.js';
-import { flushClientLog, serverDiag } from '../util/ClientLog.js';
+import { flushClientLog, refreshClientLog, serverDiag } from '../util/ClientLog.js';
 import { UltraPlayer, presentMode, ultraPlayerSupported } from '../stream/ultra/UltraPlayer.js';
+
+// Set once the viewer has been told the microphone starts cut.
+const MIC_HINT_KEY = 'mw-mic-hint-seen';
 
 /**
  * The launcher's "a Wii Remote at this computer" choice rides in the stream
@@ -561,6 +572,13 @@ export function mwsrSplitLabel(view) {
     return `Split ${n}/${MWSR_SPLIT_VIEWS.length} · ${what[view]}`;
 }
 
+/**
+ * How long before "visibilitychange hidden" a decoder error is still iOS
+ * taking the decoder back: on an iPhone it often comes first, 44 to 107 ms
+ * ahead of the event (Safari 26.5, 11/11, two spells of three).
+ */
+export const IOS_ERROR_BEFORE_HIDDEN_MS = 300;
+
 export class StreamView {
     /** Ticks (seconds) of RTP bytes with no frame decoded before an H.265
      *  media track is given up on (_checkMediaNeverDecoded). */
@@ -671,6 +689,11 @@ export class StreamView {
         // tapping where it points, and the trackpad model clicked wherever the
         // host's pointer already was instead (03/10/2026, a Mi TV).
         this._touchScreen = touchScreen === true || IS_TV;
+        // iOS/iPadOS never grants the pointer lock: there a refusal is final,
+        // and the mouse turns to relative look (A23). Elsewhere a refusal is
+        // a moment (Chrome right after Escape), and the next click asks again.
+        this._lockFreeLook = lockFreeLookWanted(IS_IOS);
+        this._lockRefusalFinal = IS_IOS;
         // A TV's taps come from its browser's cursor: one off the picture is
         // ignored (_tvTapOffPicture), not pinned to the nearest edge.
         this._tvCursor = IS_TV;
@@ -1142,8 +1165,13 @@ export class StreamView {
         /** @type {HTMLButtonElement|null} */
         this._micBtn = null;
         if (opts.mic === true && micSupported()) {
-            this._mic = new MicUplink({ held: this._standby, quality: opts.micQuality });
+            this._mic = new MicUplink({
+                held: this._standby,
+                quality: opts.micQuality,
+                device: loadMicDevice(),
+            });
             this._mic.onStateChange = (state) => this._onMicState(state);
+            this._mic.onDeviceMissing = () => Toast.warning(t('stream.micDeviceMissing'));
             this.webrtc.mic = this._mic;
         }
 
@@ -1179,6 +1207,10 @@ export class StreamView {
         // (`inputcaps`).
         this._mouseAllowed = !this._playerMode || opts.keyboardMouseAllowed === true;
         this._padKey = opts.padKey || null;
+        // The on-screen controller's settings (StreamViewTouchPad._touchPadPref).
+        this._touchPadPrefs = opts.touchPad || null;
+        // A guest's choice between it and a real pad, kept for their next visit.
+        this._touchPadRemember = opts.onTouchPadMode || null;
         // Click-to-photon probe (debug builds, Windows host): the launch reply
         // says whether the host raises its flag on every click. Only then is
         // the measuring side installed — see stream/LatencyProbe.js.
@@ -1245,11 +1277,27 @@ export class StreamView {
         // only for a rate left to Auto — see _noteHostCadence. Off on a TV.
         this._autostep = opts.fpsAuto === true && autostepEnabled(IS_TV);
         this._stepper = null;
+        // Does this stream prove the rung of Auto's ceiling it runs at? The app
+        // hands the live view a meter (stream/AutoCeilingSession.js), fed here.
+        /** @type {import('../stream/AutoCeilingMeter.js').AutoCeilingMeter|null} */
+        this.autoCeilingMeter = null;
+        /** @type {(() => boolean)|null} a transition is under way */
+        this.autoCeilingIdle = null;
+        /** @type {(() => boolean)|null} this stream tries a rung not yet held */
+        this.autoCeilingOnTrial = null;
+        /** The most a step of the cadence may reach, pixels a second; 0: no bound. */
+        this.autoCeilingMaxPixelRate = 0;
+        /** @type {(() => {size: string, trial: boolean}|null)|null} the stats card's line */
+        this.autoCeilingLine = null;
+        this._hostPresentsFps = 0;
+        this._decodeRateCap = 0;
         // Native host: mouse motion goes out on `pointerrawupdate` — every
         // report the device makes, not the one-per-display-frame sum that
         // `mousemove` delivers. Decided in _bindPointerRaw; while it is on, the
         // mousemove handlers keep their cursor bookkeeping and stop sending.
         this._nativeHost = opts.nativeHost === true;
+        /** @type {PadNumberNotice | null} the native host's word on pad numbers */
+        this._padNumber = null;
         // The virtual display and the apps opened before the stream on two
         // GPUs (util/vdGpuApartNotice.js): watched only when the host says so.
         this._vdGpuApart = opts.vdGpuApart || null;
@@ -1287,6 +1335,14 @@ export class StreamView {
         this._frameSize =
             opts.frameSize && opts.frameSize.width > 0 && opts.frameSize.height > 0
                 ? { width: opts.frameSize.width, height: opts.frameSize.height }
+                : null;
+        // The native host's own screen and what this launch asked of it, the
+        // screen then following each `displayformat`: the stats card says
+        // "host limit" beside the resolution when that screen is what held
+        // the stream down (util/HostLimit.js). Null for every other host.
+        this._hostScreen =
+            opts.hostScreen && opts.hostScreen.display && opts.hostScreen.asked
+                ? { display: { ...opts.hostScreen.display }, asked: opts.hostScreen.asked }
                 : null;
         // "NVENC" / "AMF" / "oneVPL" — which silicon block encodes this stream.
         // Empty for every other host. Shown in the latency detail, not in the
@@ -1518,6 +1574,8 @@ export class StreamView {
         // Filled here on the main-thread path; the worker path fills its own and
         // posts a snapshot with the counters, kept in _workerDiag.
         this._diag = new PipelineDiag(2000);
+        // What the decoder had just been fed, for the line logged with its error.
+        this._decoderTrail = new DecoderErrorTrail();
         this._workerDiag = null;
         // Enhancer ladder, created with the renderer when it runs an enhancer
         // pass — WebGPU or WebGL2 (the worker path owns its own instance and
@@ -1745,12 +1803,13 @@ export class StreamView {
         this._onMouseUp = (e) => this.handleMouseUp(e);
         this._onWheel = (e) => this.handleWheel(e);
         this._onPointerLockChange = () => this.handlePointerLockChange();
+        this._onPointerLockError = () => this._handlePointerLockError();
         this._onContextMenu = (e) => e.preventDefault();
 
         // ── Touch event handlers (mobile) ─────────────────────────────────
-        this._onTouchStart = (e) => this.handleTouchStart(e);
-        this._onTouchMove = (e) => this.handleTouchMove(e);
-        this._onTouchEnd = (e) => this.handleTouchEnd(e);
+        this._onTouchStart = (e) => this.handleTouchStart(this._touchesBesidePad(e));
+        this._onTouchMove = (e) => this.handleTouchMove(this._touchesBesidePad(e));
+        this._onTouchEnd = (e) => this.handleTouchEnd(this._touchesBesidePad(e));
 
         // Touch state — laptop-trackpad model: relative cursor deltas,
         // tap = left click, two-finger tap = right click, two-finger drag =
@@ -1889,7 +1948,11 @@ export class StreamView {
         this._onVisibilityChange = () => {
             // Going to background can swallow keyups — release everything so no
             // modifier stays stuck on the host.
-            if (document.visibilityState === 'hidden') this._releaseAllPhysKeys();
+            if (document.visibilityState === 'hidden') {
+                this._releaseAllPhysKeys();
+                this._touchPadLetGo();
+                this._noteHiddenAfterError(performance.now());
+            }
             if (document.visibilityState === 'visible' && !this._quitting) {
                 this._resyncAfterHidden();
                 // Coming back to the tab may leave the pointer over the picture
@@ -2904,6 +2967,7 @@ export class StreamView {
                 // The worker's governor stepped the enhancer up or down. The
                 // user's setting is untouched — only what runs right now, and
                 // what the overlay names.
+                this._noteEnhancerStep(m.algo);
                 this._videoEnhancementAlgo = m.algo;
                 this._enhancerDegraded = !!m.degraded;
                 this._rememberEnhancer(m.kind, ladderRung(m.algo), m.recoverAfterMs);
@@ -2960,13 +3024,65 @@ export class StreamView {
                 if (this.videoCodec === CODEC_AV1) frame = cropToAnnounced(frame, this._frameSize);
                 this.onDecodedFrame(frame);
             },
-            error: (err) => {
-                console.error('[StreamView] VideoDecoder error:', err.message, err);
-                if (err.code) console.error('[StreamView] Error code:', err.code);
-                this._handleDecoderError(err);
-            },
+            error: (err) => this._onDecoderError(err),
         });
         console.log('[StreamView] VideoDecoder created, state=' + this.decoder.state);
+    }
+
+    /**
+     * The decoder threw. On a hidden page that is iOS taking the hardware
+     * decoder back as the app goes to the background (Chrome and Safari on
+     * an iPhone, "Decoder failure" a few hundred ms after "visibility hidden",
+     * every one of the 13 in the prod log of 07-11/11): the stream did nothing
+     * wrong. It is logged as what it is, and the decoder is rebuilt without
+     * spending one of the recovery attempts meant for a broken stream — once
+     * per spell in the background: a desktop tab keeps decoding while hidden,
+     * and a decoder that keeps failing there is a broken stream again.
+     */
+    _onDecoderError(err) {
+        const hidden = typeof document !== 'undefined' && document.visibilityState === 'hidden';
+        const forgiven = hidden && !this._hiddenLossForgiven;
+        if (forgiven) this._hiddenLossForgiven = true;
+        if (hidden) {
+            console.warn(
+                '[StreamView] VideoDecoder lost while the page is hidden: ' +
+                    (err && err.message) +
+                    ' — rebuilt, a keyframe asked for when the page is back',
+            );
+        } else {
+            console.error('[StreamView] VideoDecoder error:', err && err.message, err);
+            if (err && err.code) console.error('[StreamView] Error code:', err.code);
+        }
+        console.warn(
+            '[StreamView] ' + this._decoderTrail.line(err, performance.now(), this.videoCodec),
+        );
+        const before = this._recoveryAttempts;
+        this._handleDecoderError(err, { hidden: forgiven });
+        // Counted while the page still looked visible: the "hidden" that may
+        // follow within IOS_ERROR_BEFORE_HIDDEN_MS gives it back.
+        this._countedErrorAt = this._recoveryAttempts > before ? performance.now() : -1;
+    }
+
+    /**
+     * The page went hidden at @p nowMs. A decoder error counted just before
+     * it was iOS taking the decoder back (see IOS_ERROR_BEFORE_HIDDEN_MS):
+     * its attempt is given back, and it takes this spell's one pardon, as
+     * an error after the event would have. Returns whether it did.
+     */
+    _noteHiddenAfterError(nowMs) {
+        const at = this._countedErrorAt;
+        if (typeof at !== 'number' || at < 0) return false;
+        this._countedErrorAt = -1;
+        if (nowMs - at > IOS_ERROR_BEFORE_HIDDEN_MS || this._hiddenLossForgiven) return false;
+        this._hiddenLossForgiven = true;
+        // A frame decoded since has already reset the count.
+        if (this._recoveryAttempts > 0) this._recoveryAttempts--;
+        console.warn(
+            '[StreamView] The decoder error ' +
+                Math.round(nowMs - at) +
+                ' ms before the page went hidden was iOS taking the decoder back — attempt given back',
+        );
+        return true;
     }
 
     /**
@@ -2985,8 +3101,12 @@ export class StreamView {
      *
      * After recovery, the next keyframe triggers configureDecoder() which
      * reconfigures the new decoder and resumes normal playback.
+     *
+     * `opts.hidden`: the error came while the page was hidden (see
+     * _onDecoderError) — the decoder is rebuilt the same way, but the
+     * attempt is not counted.
      */
-    _handleDecoderError(err) {
+    _handleDecoderError(err, opts = {}) {
         // Guard: prevent recovery during quit (or the manual-quit animation)
         if (this._quitting || this._manualQuitting) return;
         // Guard: prevent re-entrant recovery (error callback may fire during
@@ -2994,8 +3114,9 @@ export class StreamView {
         if (this._decoderRecovering) return;
         this._diag.noteRecovery('reset');
         // Guard: limit total recovery attempts to avoid infinite loops on
-        // a fundamentally broken connection
-        this._recoveryAttempts++;
+        // a fundamentally broken connection. A decoder the system took back
+        // from a hidden page says nothing about the stream.
+        if (!opts.hidden) this._recoveryAttempts++;
 
         // Decode capability failure: the config passed isConfigSupported() but the
         // browser cannot actually decode it (e.g. Android Chrome with HEVC Main10
@@ -3185,6 +3306,7 @@ export class StreamView {
             this._congFiredAt = now;
             this._congEvents.length = 0;
             console.warn('[StreamView] Sustained congestion detected (last: ' + reason + ')');
+            if (this.autoCeilingMeter) this.autoCeilingMeter.noteCongestion();
             this.onCongestion();
         }
     }
@@ -3702,6 +3824,10 @@ export class StreamView {
             this._transport !== 'webrtc-media'
         )
             noteHevcFailed();
+        // The same for an 8-bit AV1, which Auto asks where HEVC failed: H.264
+        // from the next launch on (CodecAuto.av1FailedHere).
+        if (cur === 'av1' && !this._hdrEnabled && !this._yuv444 && target.codec === 'h264')
+            noteAv1Failed();
 
         console.warn(
             `[StreamView] Codec fallback: ${cur}${this._hdrEnabled ? ' HDR' : ''} → ` +
@@ -3794,6 +3920,7 @@ export class StreamView {
                 (ridingOut ? ' — under the refresh wave' : '') +
                 (repaired ? " — under the host's reference repairs" : ''),
         );
+        if (this.autoCeilingMeter) this.autoCeilingMeter.noteSick('decoder_silent', true);
         if (ridingOut) noteDecoderCannotRideOut();
         if (repaired) noteDecoderRefusesReferenceRepairs();
         if ((ridingOut || repaired) && !this._playerMode) {
@@ -4056,6 +4183,8 @@ export class StreamView {
                 const arriveMs = performance.timeOrigin + performance.now() - arrivalAbs;
                 if (arriveMs >= 0 && arriveMs < 5000) this._clientArriveStats.addSample(arriveMs);
             }
+            if (this._decoderTrail)
+                this._decoderTrail.noteDecode(isKeyframe, this.decoder.decodeQueueSize);
             this.decoder.decode(chunk);
             this.stats.received++;
             this._tellDecodeQueue();
@@ -4462,6 +4591,7 @@ export class StreamView {
         if (consoleBtn) consoleBtn.classList.remove('stream-ctl-prestart');
         if (this._kbdBtn) this._kbdBtn.classList.remove('stream-ctl-prestart');
         this._mountGamepadButton();
+        this._mountTouchPad();
         this._mountMicButton();
         this._mountShareMenu();
         this._mountGuestPresence();
@@ -4535,7 +4665,9 @@ export class StreamView {
         btn.setAttribute('aria-label', t('stream.gamepadButton'));
         btn.addEventListener('click', (e) => {
             e.stopPropagation();
-            this._openGamepadDialog(this._gamepadManager?.forwardedKey() || this._padKey);
+            // The on-screen controller is no pad the dialog can show.
+            const gm = this._gamepadManager;
+            this._openGamepadDialog((!gm?.hasVirtual() && gm?.forwardedKey()) || this._padKey);
         });
         header.insertBefore(btn, quitBtn || null);
         this._padBtn = btn;
@@ -4562,7 +4694,7 @@ export class StreamView {
         btn.className = 'btn-stream-pad btn-stream-mic';
         btn.addEventListener('click', (e) => {
             e.stopPropagation();
-            if (this._mic) this._mic.toggleMuted();
+            this._toggleMicSaid();
             this._syncMicButton();
             // Space in the game would toggle it again.
             btn.blur();
@@ -4574,36 +4706,73 @@ export class StreamView {
         this._micBtn = btn;
         this._syncMicButton();
         this._positionGamingOverlay();
+        this._showMicHintOnce();
     }
 
-    /** The button as the microphone stands: live, muted, or refused. */
+    /**
+     * It starts cut, which a viewer who left the default has no reason to guess:
+     * said once on this browser, at the first stream that offers it.
+     */
+    _showMicHintOnce() {
+        if (this._standby) return;
+        try {
+            if (localStorage.getItem(MIC_HINT_KEY)) return;
+            localStorage.setItem(MIC_HINT_KEY, '1');
+        } catch (_e) {
+            /* a blocked storage would say it at every stream: not said at all */
+            return;
+        }
+        const combo = /Mac/.test(navigator.platform) ? 'Cmd+Option+Ctrl+P' : 'Ctrl+Alt+Shift+P';
+        Toast.info(t('stream.micStartsOff', { combo }));
+    }
+
+    /**
+     * Opens or cuts the microphone, from the button or the shortcut. Said on
+     * screen once it really changed: in fullscreen the button is out of sight,
+     * and a refusal has its own message.
+     */
+    _toggleMicSaid() {
+        const mic = this._mic;
+        if (!mic) return;
+        const before = mic.state === 'live';
+        mic.toggleMuted().then(() => {
+            const now = mic.state === 'live';
+            if (now !== before) {
+                Toast.info(t(now ? 'stream.micOn' : 'stream.micOff'), { durationMs: 1500 });
+            }
+        });
+    }
+
+    /**
+     * The button as the microphone stands. Lit only once it really sends: not
+     * while the permission prompt is up. Still clickable after a refusal, as
+     * the viewer may have allowed it in the browser since.
+     */
     _syncMicButton() {
         const btn = this._micBtn;
         if (!btn || !this._mic) return;
         const state = this._mic.state;
-        const off = this._mic.muted || state === 'denied' || state === 'error';
+        const off = state !== 'live';
         btn.innerHTML = off ? Icons.micOff : Icons.mic;
         btn.classList.toggle('is-off', off);
-        btn.disabled = state === 'denied' || state === 'error';
         const label =
             state === 'denied'
                 ? t('stream.micDenied')
                 : state === 'error'
                   ? t('stream.micError')
-                  : this._mic.muted
+                  : off
                     ? t('stream.micUnmute')
                     : t('stream.micMute');
         btn.title = label;
         btn.setAttribute('aria-label', label);
-        btn.setAttribute('aria-pressed', this._mic.muted ? 'true' : 'false');
+        btn.setAttribute('aria-pressed', off ? 'true' : 'false');
     }
 
     /** @param {string} state - MicUplink.state */
     _onMicState(state) {
         this._syncMicButton();
-        // Said once per stream: a standby leg's own refusal would only repeat it.
-        if ((state === 'denied' || state === 'error') && !this._micWarned && !this._standby) {
-            this._micWarned = true;
+        // A standby leg's own refusal would only repeat the live one's.
+        if ((state === 'denied' || state === 'error') && !this._standby) {
             Toast.warning(t(state === 'denied' ? 'stream.micDenied' : 'stream.micError'));
         }
     }
@@ -4620,6 +4789,7 @@ export class StreamView {
             container: this._rootEl || document.body,
             padKey: key || null,
             mode: 'auto',
+            touchPad: this._touchPadDialogEntry(),
             onOpen: () => this._holdPads('remap'),
             onClose: () => {
                 this._releasePads('remap');
@@ -4628,6 +4798,11 @@ export class StreamView {
             onPadChange: (k) => {
                 if (!this._playerMode) return;
                 this._padKey = k;
+                // Picking a real pad is putting the on-screen one away.
+                if (gm?.hasVirtual()) {
+                    this._unplugTouchPad();
+                    if (this._touchPadRemember) this._touchPadRemember('auto');
+                }
                 if (gm) gm.setPreferredPad(k);
             },
         });
@@ -4686,6 +4861,7 @@ export class StreamView {
             panY: this._panY,
             kbdVisible: this._kbdVisible === true,
             statsClosed: this._statsClosed === true,
+            touchPad: this._touchPadSnapshot(),
         };
     }
 
@@ -4701,6 +4877,7 @@ export class StreamView {
         // ahead of the deferral below — the overlays tick on their own timer,
         // independently of frames.
         this._adoptOverlayDismissals(state);
+        this._adoptTouchPad(state.touchPad);
         if (!this._firstFrameRendered) {
             this._pendingViewState = state;
             return;
@@ -4916,7 +5093,8 @@ export class StreamView {
 
     /**
      * A renderer that gave up (VideoRenderer.failed: a WebGPU renderer no
-     * frame could reach, or whose device did not come back) hands the picture
+     * frame could reach, whose device did not come back, or whose pass uses a
+     * pipeline the device refused) hands the picture
      * over, on the 500 ms tick and once. The main-thread path only: the
      * worker's canvas stays the worker's, its renderer gives up all the same
      * and says so in the console.
@@ -4926,6 +5104,7 @@ export class StreamView {
         if (!r || !r.failed || r === this._failedRenderer) return;
         if (this._quitting || this._swappingRenderer) return;
         this._failedRenderer = r;
+        if (this.autoCeilingMeter) this.autoCeilingMeter.noteSick('renderer_failed', true);
         this._replaceFailedRenderer();
     }
 
@@ -5829,7 +6008,7 @@ export class StreamView {
 
             // Start polling connected gamepads (Xbox/PlayStation). Sends a
             // controller snapshot over the input transport only on change.
-            if (!this._gamepadManager && navigator.getGamepads) {
+            if (!this._gamepadManager && (navigator.getGamepads || this._touchPadEligible())) {
                 this._gamepadManager = new GamepadManager(
                     (msg) => {
                         if (!this._quitting) this.webrtc.send(msg);
@@ -5850,6 +6029,7 @@ export class StreamView {
                         // On a TV a pad has no Stop button either: its
                         // Select + Start + LB + RB opens the remote's menu.
                         onMenuChord: RemoteNav.isActive() ? () => this._openRemoteMenu() : null,
+                        onVirtualYield: () => this._onTouchPadYielded(),
                         // A pad nothing maps is not forwarded; say so, or the
                         // player pushes buttons at a game that never hears
                         // them — and offer the wizard that fixes it. Longer
@@ -5905,6 +6085,8 @@ export class StreamView {
             }
             // Standby: created but not polling — started in activate().
             if (this._gamepadManager && !this._standby) this._gamepadManager.start();
+            // Its picture may have come first: now it has a manager to plug into.
+            if (this._firstFrameRendered) this._mountTouchPad();
 
             // The audio track's playout buffer, on either WebRTC transport.
             this._startAudioStatsPolling();
@@ -6458,8 +6640,9 @@ export class StreamView {
      * pacer would pin its reserve — so they are re-primed here, and the
      * transport is told the silence was ours. Frames the host evicted while
      * we were away arrive as a frameId gap and take the ordinary path: named
-     * to the host, healed with a delta. Nothing is requested here — except
-     * that the next link report carries `resumed`, so the host's governor
+     * to the host, healed with a delta. Nothing is requested here — but a
+     * keyframe when the decoder lost its reference meanwhile (below), and
+     * the next link report carries `resumed`, so the host's governor
      * does not read those gaps as the link's and undoes the cut it made when
      * our reports stopped (a frozen page cost five quiet reports to climb
      * back, measured 04/09/2026).
@@ -6472,8 +6655,9 @@ export class StreamView {
         if (!this.connected) return;
         console.log('[StreamView] Back from the background — timing re-primed, pads repeated');
         // What the congestion monitor counted while we were away was the
-        // freeze, not the link (see _recordCongestionEvent).
-        this._congEvents.length = 0;
+        // freeze, not the link (see _recordCongestionEvent). A view that never
+        // started its monitor has nothing counted.
+        if (this._congEvents) this._congEvents.length = 0;
         this._resumedAt = performance.now();
         this._stallDetector.reset();
         this._clearPacingTimer();
@@ -6489,6 +6673,16 @@ export class StreamView {
             this.webrtc.noteResumed();
         }
         if (this._gamepadManager) this._gamepadManager.resendAll();
+        // The one thing that cannot wait for a gap: a decoder rebuilt while
+        // the page was hidden (iOS takes it back, see _onDecoderError) needs a
+        // keyframe, and the request it made then went out from a page about to
+        // freeze. Without this one the picture came back on the transport's
+        // own starvation requests: 5.7 s after the page, 11 s in all, on an
+        // iPhone (11/11). Main-thread decode only: the worker keeps its own.
+        if (!this._videoWorker && !this._referenceValid)
+            this._requestIdr('back from the background');
+        // The next spell in the background forgives its own lost decoder.
+        this._hiddenLossForgiven = false;
         // What the detection measured before is of another page: start over.
         if (this._stepper) this._stepper.linkChanged('back from the background', performance.now());
     }
@@ -7165,9 +7359,10 @@ export class StreamView {
             t('stream.statResolution') +
             '</span>' +
             '<span class="stats-value">' +
-            (this._resolution || '?') +
+            this._resolutionStat() +
             '</span>' +
             '</div>';
+        html += this._autoCeilingRow();
 
         // Framerate
         html +=
@@ -7965,6 +8160,129 @@ export class StreamView {
             this._applyEnhancerGovernor(diag, now);
         }
         this._applyDecodeRateGovernor(diag, fps, now);
+        this._tickAutoCeiling(diag, now);
+        this._tickAv1Watch(diag, now);
+    }
+
+    /**
+     * An 8-bit AV1 that does not keep up raises no error (util/CodecAuto.js,
+     * Av1Watch): the decoder's queue says so, or the host asked for fewer
+     * pictures. Under Auto it is a failure: the stream comes back in H.264 at
+     * once, the way an HEVC that fails does, and the next launches ask H.264.
+     * A stream whose moving pictures ran smoothly is remembered, whoever
+     * chose AV1. Not an HDR or a 4:4:4 AV1, which are other decoders.
+     * @param {{decodeQueueAvg?: number, arrivalAvgMs?: number}|null} diag
+     * @param {number} now
+     */
+    _tickAv1Watch(diag, now) {
+        if (this._av1Watch === null) return;
+        if (this._av1Watch === undefined) {
+            const plainAv1 =
+                String(this.videoCodec).toLowerCase() === 'av1' &&
+                !this._hdrEnabled &&
+                !this._yuv444;
+            this._av1Watch = plainAv1 ? new Av1Watch() : null;
+            if (!plainAv1) return;
+        }
+        if (!diag) return;
+        const verdict = this._av1Watch.sample(
+            {
+                queue: diag.decodeQueueAvg || 0,
+                fps: diag.arrivalAvgMs > 0 ? 1000 / diag.arrivalAvgMs : 0,
+                capped: this._decodeRateCap > 0,
+            },
+            now,
+        );
+        if (!verdict) return;
+        this._av1Watch = null;
+        if (verdict === 'proven') {
+            noteAv1Proven();
+            console.log('[MW] AV1 ran smoothly here for two minutes — remembered');
+        } else if (this._codecAuto) {
+            // Kept whatever follows: H.264 from the next launch on.
+            noteAv1Failed();
+            // And this stream back in H.264 now (Bruno, 11/11/2026): left to
+            // run, it only falls further behind. A guest stays where it is:
+            // the feed is the owner's.
+            const relaunch = !this._playerMode;
+            console.warn(
+                '[MW] Auto: AV1 does not keep up in this browser — ' +
+                    (relaunch ? 'back in H.264' : 'H.264 from the next launch on'),
+            );
+            if (relaunch) this._requestCodecFallback();
+        }
+    }
+
+    /**
+     * Feed the meter of Auto's ceiling (stream/AutoCeilingMeter.js). What a
+     * share, a transition or a hidden page does to the numbers says nothing of
+     * this machine: those windows count for nothing. A step of the cadence can
+     * only count for it.
+     */
+    _tickAutoCeiling(diag, now) {
+        const meter = this.autoCeilingMeter;
+        if (!meter || this._quitting) return;
+        const idle = !!(this.autoCeilingIdle && this.autoCeilingIdle());
+        meter.tick(now, {
+            neutral:
+                (typeof document !== 'undefined' && document.hidden) ||
+                this.hasActiveShare() ||
+                idle,
+            stepped: !!(this._stepper && this._stepper.stepFps > 0),
+            arrivalFps: diag && diag.arrivalAvgMs > 0 ? 1000 / diag.arrivalAvgMs : 0,
+            sizeMatches: frameMatchesAsked(this._resolution, meter.asked),
+            frames: this.stats.received,
+            drops: diag ? (diag.dropQueueFull || 0) + (diag.dropBackpressure || 0) : 0,
+            rebuilds: diag ? diag.recoverReset || 0 : 0,
+            fpsCap: this._decodeRateCap,
+            presentsFps: this._hostPresentsFps,
+        });
+    }
+
+    /** The stats card's resolution: the decoded frame's size, "host limit"
+     *  beside it when the native host's own screen is what capped it. */
+    _resolutionStat() {
+        const size = this._resolution || '?';
+        const m = /^(\d+)[×x](\d+)/.exec(this._resolution || '');
+        const frame = m ? { width: +m[1], height: +m[2] } : null;
+        const hs = this._hostScreen;
+        return hs && hostScreenCaps(hs.asked, hs.display, frame)
+            ? t('stream.statResolutionHostLimit', { size })
+            : size;
+    }
+
+    /** The stats card's line on what Auto learned from this host; '' when it
+     *  has nothing to say. */
+    _autoCeilingRow() {
+        const line = this.autoCeilingLine ? this.autoCeilingLine() : null;
+        if (!line) return '';
+        return (
+            '<div class="stats-row">' +
+            '<span class="stats-label">' +
+            t('stream.statAuto') +
+            '</span>' +
+            '<span class="stats-value">' +
+            t(line.trial ? 'stream.statAutoTrial' : 'stream.statAutoLearned', { size: line.size }) +
+            '</span>' +
+            '</div>'
+        );
+    }
+
+    /** The fastest step of the cadence Auto's ceiling allows at this frame; 0: no bound. */
+    _autoCeilingMaxFps() {
+        const m = /^(\d+)[×x](\d+)/.exec(this._resolution || '');
+        if (!(this.autoCeilingMaxPixelRate > 0) || !m) return 0;
+        return Math.floor(this.autoCeilingMaxPixelRate / (Number(m[1]) * Number(m[2])));
+    }
+
+    /** The enhancer is about to run @p algo: a step down is a signal for the
+     *  meter of Auto's ceiling. Starting low on its memory is none: only a step
+     *  taken in this stream comes through here. */
+    _noteEnhancerStep(algo) {
+        if (!this.autoCeilingMeter) return;
+        const from = ENHANCER_LADDER.indexOf(ladderRung(this._videoEnhancementAlgo));
+        const to = ENHANCER_LADDER.indexOf(ladderRung(algo));
+        if (from >= 0 && to > from) this.autoCeilingMeter.noteSick('enhancer');
     }
 
     /**
@@ -7994,6 +8312,7 @@ export class StreamView {
             now,
         });
         if (cap === null) return;
+        this._decodeRateCap = cap > 0 ? cap : 0;
         console.log(
             '[StreamView] Decode rate: ' +
                 (cap > 0
@@ -8038,6 +8357,7 @@ export class StreamView {
         if (!algo) return;
         const pass = rendererAlgo(algo, this._renderer.kind);
         if (!this._renderer.setAlgo(pass)) return;
+        this._noteEnhancerStep(pass);
         this._videoEnhancementAlgo = pass;
         this._enhancerDegraded = this._governor.degraded;
         this._rememberEnhancer(this._renderer.kind, algo, this._governor.recoverAfterMs);
@@ -8064,6 +8384,9 @@ export class StreamView {
      *  a guest's ladder follows its own fixed rule). */
     _rememberEnhancer(kind, rung, recoverAfterMs) {
         if (this._playerMode) return;
+        // A verdict from a rung on trial would follow the viewer back down to a
+        // size where it means nothing: the memory holds no size.
+        if (this.autoCeilingOnTrial && this.autoCeilingOnTrial()) return;
         rememberRung(kind, ladderRung(this._enhancerCeiling), rung, recoverAfterMs);
     }
 
@@ -8223,6 +8546,21 @@ export class StreamView {
         this._wiimoteStatusToast = Toast.info(message, { sticky: true });
     }
 
+    /** The pad-number notice, made the first time the host speaks of it. */
+    _padNumberNotice() {
+        if (!this._padNumber) {
+            this._padNumber = new PadNumberNotice({
+                hosts: () => BackendClient.getHosts(),
+                stopSession: (uuid) => BackendClient.stopHostSession(uuid),
+                replug: () => this._gamepadManager && this._gamepadManager.replugAll(),
+                warn: (text, options) => Toast.warning(text, options),
+                error: (text) => Toast.error(text),
+                t,
+            });
+        }
+        return this._padNumber;
+    }
+
     // ── Stats message handler (ping/pong + periodic backend stats) ─────────
 
     _handleStatsMessage(msg) {
@@ -8241,6 +8579,13 @@ export class StreamView {
         }
         if (msg.type === 'rumble') {
             if (this._gamepadManager) this._gamepadManager.rumble(msg.index, msg.low, msg.high);
+            return;
+        }
+        if (msg.type === 'padnumber') {
+            // Native Windows host: a pad another session left plugged in took
+            // player 1 (stream/HostPadNumber.js). The owner's to settle: a
+            // guest cannot close the host's sessions.
+            if (this._nativeHost && !this._playerMode) this._padNumberNotice().note(msg);
             return;
         }
         if (msg.type === 'inputgate') {
@@ -8272,6 +8617,8 @@ export class StreamView {
                         frameSize: this._frameSize,
                     });
             }
+            if (this._hostScreen && msg.displayWidth > 0 && msg.displayHeight > 0)
+                this._hostScreen.display = { width: msg.displayWidth, height: msg.displayHeight };
             if (this.onHostDisplayFormat) this.onHostDisplayFormat(msg);
             return;
         }
@@ -8438,6 +8785,7 @@ export class StreamView {
      */
     _noteHostCadence(cadence) {
         const now = performance.now();
+        this._hostPresentsFps = cadence.presents > 0 ? cadence.presents : 0;
         if (!this._stepper) {
             if (!this._autostep || this._standby || this._quitting || !this._nativeHost) return;
             if (!this._immediateRender || this._useWorker || this._framePacer) return;
@@ -8451,6 +8799,7 @@ export class StreamView {
                 },
                 // The steps this device failed at, for this host at this size.
                 memory: stepMemory((this.host.uuid || '') + '|' + (this._resolution || '')),
+                maxFps: this._autoCeilingMaxFps(),
             });
             window.mwCadenceStepper = this._stepper;
             this._stepper.start();
@@ -8611,6 +8960,7 @@ export class StreamView {
         // is the last point that is common to every transport and to both the
         // worker and main-thread decode paths, and the only one where the time
         // measured is still purely the link's.
+        if (this._decoderTrail) this._decoderTrail.noteArrival(performance.now());
         const stall = this._stallDetector.note(backendTs, performance.now(), isKeyframe);
         if (stall) this._notePeriodicStall(stall);
 
@@ -9060,6 +9410,8 @@ export class StreamView {
                     if (result.supported) {
                         try {
                             this.decoder.configure(cfg);
+                            // Applied again after a queue flush (_flushDecodeQueue).
+                            this._activeDecoderCfg = cfg;
                             this.decoderConfigured = true;
                             this.decoderConfiguring = false;
                             console.log(
@@ -9127,6 +9479,53 @@ export class StreamView {
             return;
         }
 
+        // The brakes H.264 and HEVC have in decodeFrame, which AV1 had none
+        // of: a decoder too slow for the stream was fed every picture, and a
+        // thousand were waiting after 50 s (stream/DecodeBrake.js). Deltas
+        // wait for a keyframe while the reference is lost, as there.
+        if (!isKeyframe && !this._referenceValid) {
+            this.stats.dropped++;
+            this._diag.noteDrop('backpressure');
+            // Retry while waiting — the original request may have been lost.
+            this._requestIdr('reference invalid');
+            return;
+        }
+
+        // The decoder's queue, as the other codecs and the worker report it:
+        // without it the overlay read an empty queue under an AV1 that had a
+        // thousand pictures waiting, and nothing that watches the queue (the
+        // enhancer's ladder, the decode-rate governor, Av1Watch) saw it.
+        this._diag.noteDecodeQueue(this.decoder.decodeQueueSize);
+
+        const brake = queueBrake({
+            isKeyframe,
+            queued: this.decoder.decodeQueueSize,
+            queueMax: this.DECODE_QUEUE_MAX,
+            stallStart: this._queueStallStart,
+            now: performance.now(),
+            stallMs: this.QUEUE_STALL_MS,
+            resetMs: this.QUEUE_RESET_MS,
+        });
+        this._queueStallStart = brake.stallStart;
+        if (brake.verdict === 'reset') {
+            console.warn(
+                '[StreamView] AV1 decode queue stalled >' +
+                    this.QUEUE_RESET_MS +
+                    'ms (queueSize=' +
+                    this.decoder.decodeQueueSize +
+                    ') — resetting decoder',
+            );
+            this._handleDecoderError(new Error('Decode queue stalled'));
+            return;
+        }
+        if (brake.verdict === 'drop') {
+            this.stats.dropped++;
+            this._diag.noteDrop('backpressure');
+            this._referenceValid = false;
+            this._requestIdr('decode queue overflow');
+            return;
+        }
+
         const timestamp = this.frameCount * 16667;
         this.frameCount++;
 
@@ -9136,6 +9535,21 @@ export class StreamView {
         // Delimiter and Padding OBUs must be stripped: the WebCodecs sample
         // format forbids them and Safari/VideoToolbox rejects the frame.
         const obuData = stripNonEssentialObus(data);
+
+        // A keyframe behind a saturated queue recovers nothing: flush the
+        // stale pictures in front of it, when they are worth it (see
+        // decodeFrame and DecodeQueuePolicy).
+        if (
+            isKeyframe &&
+            shouldFlushAtKeyframe({
+                queued: this.decoder.decodeQueueSize,
+                arrivalMs: this._diag.arrivalAvgMs,
+                sinceLastFlushMs: performance.now() - this._lastQueueFlushMs,
+            })
+        ) {
+            this._flushDecodeQueue();
+        }
+
         try {
             const chunk = new EncodedVideoChunk({
                 type: type,
@@ -9157,9 +9571,18 @@ export class StreamView {
                 key: isKeyframe,
                 hostTs: backendTs > 0 ? backendTs : 0,
             });
+            if (this._decoderTrail)
+                this._decoderTrail.noteDecode(isKeyframe, this.decoder.decodeQueueSize);
             this.decoder.decode(chunk);
             this.stats.received++;
             this._tellDecodeQueue();
+            // Keyframe submitted: the reference is valid again, and the
+            // saturation clock starts over (as in decodeFrame).
+            if (isKeyframe) {
+                this._referenceValid = true;
+                this._idrRequested = false;
+                this._queueStallStart = 0;
+            }
         } catch (err) {
             console.error('[StreamView] decodeAv1Frame() error:', err.message, err);
             this.stats.dropped++;
@@ -9219,6 +9642,17 @@ export class StreamView {
         // All platforms: keep Escape inside the host while in fullscreen.
         document.addEventListener('fullscreenchange', this._onFsChangeLock);
         window.addEventListener(EXIT_FULLSCREEN_EVENT, this._onExitFullscreenRequest);
+
+        // Debug mode switched on in Admin after this page loaded (an iPad web
+        // app left open for days, 27/10/2026): the console mirror was off, and
+        // the archive held no browser line at all. Asked again at each stream.
+        void refreshClientLog();
+        console.log(
+            `[StreamView] Mouse: ${this._gamingMode ? 'gaming' : 'desktop'} mode,` +
+                ` pointer lock ${typeof this.inputEl?.requestPointerLock === 'function' ? 'offered' : 'absent'}` +
+                ` by this browser${IS_IOS ? ' (iOS/iPadOS' + (navigator.standalone ? ', home-screen app)' : ')') : ''}` +
+                (this._lockFreeLook ? ', lock-free look on once the lock is refused' : ''),
+        );
 
         // Mode-specific events
         if (this._gamingMode) {
@@ -9360,6 +9794,7 @@ export class StreamView {
 
     _bindGamingEvents() {
         document.addEventListener('pointerlockchange', this._onPointerLockChange);
+        document.addEventListener('pointerlockerror', this._onPointerLockError);
 
         // Pre-focus: default cursor until the first move; the first mousemove
         // hides it over the picture (the host cursor tracks the position and is
@@ -9375,6 +9810,15 @@ export class StreamView {
                 if (this._rawPointerLive()) return;
                 this._sendRelativeMouse(e.movementX, e.movementY);
                 this._noteMouseSent(e);
+            } else if (this._pointerLockRefused && this._lockFreeLook) {
+                // Lock-free look (iOS, or key mw_lookfree): no lock to be had, so the browser's own
+                // motion goes out relative — the game turns as long as the
+                // browser reports movement, edge or not. The host's cursor no
+                // longer follows the local one: a look mode, not for menus.
+                if (e.movementX || e.movementY) {
+                    this._sendRelativeMouse(e.movementX, e.movementY);
+                    this._noteMouseSent(e);
+                }
             } else {
                 this._lastMouseClientX = e.clientX;
                 this._lastMouseClientY = e.clientY;
@@ -9409,6 +9853,13 @@ export class StreamView {
         // Click to capture focus: set host cursor at clicked position, then grab pointer.
         this._onGamingClick = (e) => {
             if (this._mouseFocused) return; // Already focused — click handled by mousedown/mouseup
+            // Refused already: the click went out as a click (mousedown/up).
+            // On iOS asking again would only be refused again; elsewhere the
+            // refusal may have been a moment's, so this click asks once more.
+            if (this._pointerLockRefused) {
+                if (!this._lockRefusalFinal) this._lockPointerOnClick();
+                return;
+            }
             e.preventDefault();
 
             // Send absolute position so the host cursor teleports to the clicked point
@@ -9424,20 +9875,17 @@ export class StreamView {
                 referenceWidth: refW,
                 referenceHeight: refH,
             });
-            const p = this._lockPointer();
-            if (p && typeof p.catch === 'function')
-                p.catch(() => {
-                    /* the "click to capture" hint stays up */
-                });
+            this._lockPointerOnClick();
         };
         this.inputEl.addEventListener('click', this._onGamingClick);
 
-        // Mouse button events: only send when focused (pre-focus click only captures)
+        // Mouse button events: only send when focused (pre-focus click only
+        // captures), or once the browser has refused the lock for good.
         this._onGamingMouseDown = (e) => {
-            if (this._mouseFocused) this.handleMouseDown(e);
+            if (this._mouseFocused || this._pointerLockRefused) this.handleMouseDown(e);
         };
         this._onGamingMouseUp = (e) => {
-            if (this._mouseFocused) this.handleMouseUp(e);
+            if (this._mouseFocused || this._pointerLockRefused) this.handleMouseUp(e);
         };
         this.inputEl.addEventListener('mousedown', this._onGamingMouseDown);
         this.inputEl.addEventListener('mouseup', this._onGamingMouseUp);
@@ -10284,7 +10732,9 @@ export class StreamView {
             this._pendingPasteKey = null;
         }
         document.removeEventListener('pointerlockchange', this._onPointerLockChange);
+        document.removeEventListener('pointerlockerror', this._onPointerLockError);
         this._disarmPointerCapture();
+        clearTimeout(this._lockWatch);
         window.removeEventListener('beforeunload', this._onBeforeUnload);
         window.removeEventListener('pagehide', this._onPageHide);
         window.removeEventListener('blur', this._onWindowBlur);
@@ -10426,6 +10876,70 @@ export class StreamView {
     }
 
     /**
+     * Ask for the lock on a click on the picture, and stop waiting for it if
+     * the browser says no.
+     *
+     * Until the lock arrives, gaming mode keeps a click for itself: it is the
+     * "click to capture". On an engine that never grants it — Safari on an
+     * iPad with a Magic Keyboard trackpad (27/10/2026) — every click went to
+     * the lock request and none reached the game. So a refusal (pointerlockerror,
+     * a rejected promise, or no pointerlockchange LOCK_WATCH_MS after a click)
+     * ends the wait for this stream: clicks go through as clicks, and the
+     * viewer is told once why aiming stops at the screen edge. Only a click
+     * counts: the first picture's attempt has no gesture of its own, and a
+     * refusal there means nothing.
+     */
+    _lockPointerOnClick() {
+        // The mouse is off for this viewer: nothing is asked, nothing refused.
+        if (!this._mouseAllowed) return;
+        clearTimeout(this._lockWatch);
+        this._lockWatch = setTimeout(() => {
+            if (!this.pointerLocked)
+                this._pointerLockRefusedForGood('no pointerlockchange after a click');
+        }, StreamView.LOCK_WATCH_MS);
+        let p = null;
+        try {
+            p = this._lockPointer();
+        } catch (e) {
+            this._pointerLockRefusedForGood(`request threw ${e && e.name}`);
+            return;
+        }
+        if (p && typeof p.catch === 'function')
+            p.catch((err) =>
+                this._pointerLockRefusedForGood(`request rejected (${err && err.name})`),
+            );
+    }
+
+    /** How long a click waits for the lock before the browser is taken at its silence. */
+    static LOCK_WATCH_MS = 500;
+
+    _handlePointerLockError() {
+        console.log('[StreamView] Mouse: pointerlockerror');
+        // A click is waiting on it: that is the refusal. Otherwise (the first
+        // picture's own attempt), the "click to capture" hint stays up.
+        if (this._lockWatch) this._pointerLockRefusedForGood('pointerlockerror after a click');
+    }
+
+    _pointerLockRefusedForGood(why) {
+        clearTimeout(this._lockWatch);
+        this._lockWatch = 0;
+        if (this._pointerLockRefused || this.pointerLocked || !this._gamingMode) return;
+        this._pointerLockRefused = true;
+        console.log(
+            `[StreamView] Mouse: pointer lock refused (${why}) — clicks now go to the host`,
+        );
+        // "Click to capture" would ask for something this browser won't give.
+        if (this.hintEl) this.hintEl.style.display = 'none';
+        if (!StreamView._lockRefusedToastShown) {
+            StreamView._lockRefusedToastShown = true;
+            const text = this._lockFreeLook
+                ? 'stream.pointerLockRefusedLookFree'
+                : 'stream.pointerLockRefused';
+            Toast.info(t(text), { durationMs: 8000 });
+        }
+    }
+
+    /**
      * Take the pointer, asking for the mouse's own counts.
      *
      * Without `unadjustedMovement`, movementX/Y is what the viewer's OS made
@@ -10448,6 +10962,12 @@ export class StreamView {
     _lockPointer() {
         const el = this.inputEl;
         if (!el || !this._mouseAllowed) return null;
+        // No API at all: the old-engine retry below would throw a TypeError.
+        if (typeof el.requestPointerLock !== 'function') {
+            return Promise.reject(
+                Object.assign(new Error('no requestPointerLock'), { name: 'NotSupportedError' }),
+            );
+        }
         let p = null;
         try {
             p = el.requestPointerLock({ unadjustedMovement: true });
@@ -11147,6 +11667,14 @@ export class StreamView {
                 return;
             }
 
+            // Microphone open / cut: Ctrl+Alt+Shift+P (Win) / Cmd+Option+Ctrl+P
+            // (Mac).
+            if (chk('p', 'KeyP')) {
+                e.preventDefault();
+                if (!e.repeat) this._toggleMicSaid();
+                return;
+            }
+
             // Stats overlay open / closed: Ctrl+Alt+Shift+I (Win) /
             // Cmd+Option+Ctrl+I (Mac) — the same toggle as the menu's entry.
             if (chk('i', 'KeyI')) {
@@ -11238,6 +11766,19 @@ export class StreamView {
         // Cmd itself keeps its normal press/release: it is the host's Windows
         // key, and Cmd alone must still open the Start menu.
         if (this._appleKeyboard && e.metaKey && !StreamView.MODIFIER_CODES.has(e.code)) {
+            // Cmd+C with the shared clipboard copies on the host, as Cmd+V
+            // pastes there: sent as is it would be Win+C, which copies nothing.
+            if (
+                this._clipboardEnabled &&
+                !e.ctrlKey &&
+                !e.altKey &&
+                !e.shiftKey &&
+                (e.key === 'c' || e.key === 'C')
+            ) {
+                this._sendCopyChord();
+                this._metaTapCodes.add(e.code);
+                return;
+            }
             // No `hold`: a tap has nothing to hold through a stall.
             const tap = {
                 keyCode: vkCode,
@@ -12322,11 +12863,26 @@ export class StreamView {
      * the host ignores. The cost is that a Cmd held ACROSS the paste is no
      * longer down for whatever follows it; nobody chords off a Cmd they just
      * pasted with, and the paste working matters more.
+     *
+     * The host saw the Windows key alone so far, and letting go of it now would
+     * open the Start menu, which then takes the paste. A Ctrl tap while it is
+     * held says it was part of a chord. A Cmd really pressed alone never comes
+     * through here, and still opens the menu.
      */
     _releaseHeldMeta() {
         for (const code of ['MetaLeft', 'MetaRight']) {
             const held = this._heldPhysKeys.get(code);
             if (!held) continue;
+            const ctrl = {
+                keyCode: StreamView.codeToWindowsVk('ControlLeft'),
+                code: 'ControlLeft',
+                key: 'Control',
+                shiftKey: false,
+                altKey: false,
+                metaKey: true,
+            };
+            this._sendKeyEvent({ ...ctrl, type: 'keydown', ctrlKey: true });
+            this._sendKeyEvent({ ...ctrl, type: 'keyup', ctrlKey: false });
             this._sendKeyEvent({
                 ...held,
                 ctrlKey: false,
@@ -12335,6 +12891,44 @@ export class StreamView {
                 metaKey: false,
             });
         }
+    }
+
+    /**
+     * Cmd+C on an Apple keyboard, as the host's Ctrl+C.
+     *
+     * The Windows key Cmd streams as is let go of first (with its Ctrl tap, so
+     * no Start menu opens), then the whole chord goes out as a tap: macOS never
+     * delivers the C's release while Cmd is down. The host always gets VK_C,
+     * whichever key types "c" on the Mac's layout: Windows copies with VK_C.
+     */
+    _sendCopyChord() {
+        this._releaseHeldMeta();
+        const ctrl = {
+            keyCode: StreamView.codeToWindowsVk('ControlLeft'),
+            code: 'ControlLeft',
+            key: 'Control',
+            shiftKey: false,
+            altKey: false,
+            metaKey: false,
+        };
+        const c = {
+            keyCode: StreamView.codeToWindowsVk('KeyC'),
+            code: 'KeyC',
+            key: 'c',
+            char: null,
+            nonUs: false,
+            dead: false,
+            gaming: !!this._gamingMode,
+            altGraph: false,
+            ctrlKey: true,
+            shiftKey: false,
+            altKey: false,
+            metaKey: false,
+        };
+        this._sendKeyEvent({ ...ctrl, type: 'keydown', ctrlKey: true });
+        this._sendKeyEvent({ ...c, type: 'keydown' });
+        this._sendKeyEvent({ ...c, type: 'keyup' });
+        this._sendKeyEvent({ ...ctrl, type: 'keyup', ctrlKey: false });
     }
 
     /** The swallowed paste chord's 'paste' event brought no text (or never
@@ -12490,16 +13084,30 @@ export class StreamView {
     // =========================================================================
 
     handlePointerLockChange() {
+        const was = !!this.pointerLocked;
         this.pointerLocked = document.pointerLockElement === this.inputEl;
+        if (was !== this.pointerLocked)
+            console.log(
+                `[StreamView] Mouse: pointer ${this.pointerLocked ? 'locked' : 'released'}`,
+            );
         // However the mouse was taken, the one-shot that was waiting for a
-        // keystroke to ask for it has nothing left to do.
-        if (this.pointerLocked) this._disarmPointerCapture();
+        // keystroke to ask for it has nothing left to do — nor the watch on a
+        // click's request, and a refusal is history.
+        if (this.pointerLocked) {
+            this._disarmPointerCapture();
+            clearTimeout(this._lockWatch);
+            this._lockWatch = 0;
+            this._pointerLockRefused = false;
+        }
         this._mouseFocused = this.pointerLocked;
         // The hint asks for a click only gaming mode answers. Leaving gaming
         // mode lets the lock go afterwards, asynchronously: shown again there,
         // the hint stayed over the desktop-mode picture for good (12/10/2026).
         if (this.hintEl) {
-            this.hintEl.style.display = this._gamingMode && !this.pointerLocked ? 'flex' : 'none';
+            this.hintEl.style.display =
+                this._gamingMode && !this.pointerLocked && !this._pointerLockRefused
+                    ? 'flex'
+                    : 'none';
         }
         // Capturing/releasing the mouse drives both the full keyboard lock and
         // the gaming-mode exit-reminder overlay.
@@ -12655,6 +13263,7 @@ export class StreamView {
         const opts = {
             touch,
             touchScreen: this._touchScreen,
+            touchPad: this._touchPadAvailable(),
             isMac: /Mac/.test(navigator.platform),
             remote: RemoteNav.isActive(),
         };
@@ -13292,6 +13901,7 @@ export class StreamView {
     _holdPads(who) {
         this._padHolds.add(who);
         if (this._gamepadManager) this._gamepadManager.setPaused(true);
+        if (this._touchPadView) this._syncTouchPad();
     }
 
     _releasePads(who) {
@@ -13299,6 +13909,7 @@ export class StreamView {
         if (this._gamepadManager && this._padHolds.size === 0) {
             this._gamepadManager.setPaused(false);
         }
+        if (this._touchPadView) this._syncTouchPad();
     }
 
     /**
@@ -13653,6 +14264,7 @@ export class StreamView {
             this._padBtn.remove();
             this._padBtn = null;
         }
+        this._destroyTouchPad();
         if (this._gamepadDialog) {
             this._gamepadDialog.close();
             this._gamepadDialog = null;
@@ -14056,6 +14668,7 @@ export class StreamView {
             this._padBtn.remove();
             this._padBtn = null;
         }
+        this._destroyTouchPad();
         if (this._gamepadDialog) {
             this._gamepadDialog.close();
             this._gamepadDialog = null;
@@ -14123,7 +14736,12 @@ export class StreamView {
 // methods live in separate files for readability but operate on the StreamView
 // instance (`this`). Class prototype methods are non-enumerable, so copy them
 // explicitly (Object.assign would skip them).
-for (const Mixin of [StreamViewKeyboard, StreamViewTouch, StreamViewFullscreen]) {
+for (const Mixin of [
+    StreamViewKeyboard,
+    StreamViewTouch,
+    StreamViewTouchPad,
+    StreamViewFullscreen,
+]) {
     for (const name of Object.getOwnPropertyNames(Mixin.prototype)) {
         if (name === 'constructor') continue;
         Object.defineProperty(

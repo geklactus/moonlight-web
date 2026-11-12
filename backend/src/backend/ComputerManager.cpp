@@ -16,16 +16,20 @@
  */
 
 #include "ComputerManager.h"
+#include "backend/CloseWhenDoneNam.h"
+#include "backend/ManualHostMerge.h"
 
 #include "streambackend/BackendProbe.h"
 #include "streambackend/GameStreamBackend.h"
 #include "streambackend/StreamBackendRegistry.h"
 #include "NvComputer.h"
+#include "HostCertCheck.h"
 #include "NvPairingManager.h"
 #include "PairingChain.h"
 #include "WolfApiClient.h"
 #include "streambackend/NativeHostBackend.h"
 #include "streambackend/NativeProbeService.h"
+#include "streaming/RemoteDesktopReturn.h"
 #include "VirtualDisplay.h"
 #include "mw/native/Capabilities.h"
 #include "mw/native/HidPassthrough.h"
@@ -35,6 +39,10 @@
 #include "common/Logger.h"
 #include "server/AppSettings.h"
 #include "server/HostAppImage.h"
+
+extern "C" {
+#include "Limelight.h" // SCM_H264
+}
 
 #include <qmdnsengine/server.h>
 #include <qmdnsengine/browser.h>
@@ -178,7 +186,9 @@ private:
 
 ComputerManager::ComputerManager(QObject* parent)
     : QObject(parent)
-    , m_Nam(new QNetworkAccessManager(this))
+    // The poll's, the scan's, the probes' and every backend's on these hosts: no
+    // connection of theirs is kept once its request ends (see CloseWhenDoneNam).
+    , m_Nam(new CloseWhenDoneNam(this))
     , m_Http(new NvHTTP(m_Nam, this))
 {
     m_Nam->setProxy(QNetworkProxy::NoProxy);
@@ -196,6 +206,7 @@ void ComputerManager::registerStreamBackends()
             NvComputer* host = findHostByUuid(uuid);
             if (!host) return;
             host->serverCertPem = serverCertPem;
+            host->certificateChanged = false;
             host->pairState = NvComputer::PS_PAIRED;
             host->state = NvComputer::CS_ONLINE;
             saveHosts();
@@ -284,6 +295,11 @@ void ComputerManager::init()
     // when the answer arrives — and takes it down when the user logs off.
     connect(&NativeProbeService::instance(), &NativeProbeService::changed, this,
             &ComputerManager::refreshNativeHost);
+    // A Windows session left by Remote Desktop has no screen at all, and gets
+    // one back when it returns to the console: the card follows both.
+    connect(&RemoteDesktopReturn::instance(), &RemoteDesktopReturn::changed, this,
+            &ComputerManager::refreshNativeHost);
+    RemoteDesktopReturn::instance().start();
     startPolling();
 
     // Single-shot timer that closes each mDNS discovery window and frees 5353.
@@ -373,7 +389,17 @@ void ComputerManager::refreshNativeHost()
     // What this machine can really encode, in the same terms every other host
     // reports. Without it the codec auto-selection and the transport filter —
     // which read this field for every host — conclude that it supports nothing.
-    host->serverCodecModeSupport = NativeHostBackend::codecModeSupport();
+    //
+    // A session Remote Desktop left sees no display, and its probe then names
+    // no encoder at all. The sign-in screen's stream is captured and encoded
+    // by a worker on the console, by the same GPU: it keeps what this machine
+    // could encode last, H.264 at the very least.
+    const int codecs = NativeHostBackend::codecModeSupport();
+    if (codecs == 0 && RemoteDesktopReturn::instance().leftByRemoteDesktop())
+        host->serverCodecModeSupport =
+            host->serverCodecModeSupport != 0 ? host->serverCodecModeSupport : SCM_H264;
+    else
+        host->serverCodecModeSupport = codecs;
 
     if (noDisplay)
         Logger::info(QString("Native host has no display: %1 — card kept for the virtual display")
@@ -395,17 +421,48 @@ QJsonObject ComputerManager::nativeDisplayJson()
     // Display" is installed here (then it is a card of its own, on or off).
     QJsonObject obj;
     const mw::native::Capabilities caps = NativeProbeService::instance().snapshot();
-    obj["state"] = caps.available ? QStringLiteral("ok")
+    // Nothing attached because Remote Desktop left this session without a
+    // screen is not a cable to plug in, nor a virtual display to open: the
+    // card says what happened (Windows, RemoteDesktopReturn).
+    const bool leftByRemoteDesktop = !caps.available &&
+                                     caps.reason == mw::native::Unavailability::NoDisplay &&
+                                     RemoteDesktopReturn::instance().leftByRemoteDesktop();
+    obj["state"] = caps.available        ? QStringLiteral("ok")
+                   : leftByRemoteDesktop ? QStringLiteral("session_disconnected")
                    : caps.reason == mw::native::Unavailability::NoDisplay
                        ? QStringLiteral("no_display")
                    : caps.reason == mw::native::Unavailability::CapturePermission
                        ? QStringLiteral("no_capture_permission")
                        : QStringLiteral("unavailable");
+    // Left by Remote Desktop, and its card brings it back when opened ("This
+    // PC's screen"): the card shows that one app rather than the text alone.
+    obj["remote_desktop_return"] =
+        leftByRemoteDesktop && RemoteDesktopReturn::instance().offersReturn();
+    // Or "This PC's sign-in screen" in its place: the console's sign-in
+    // screen, streamed, and signed in through. A kiosk's page shows the
+    // card's text only, and the server refuses it the stream.
+    obj["sign_in_screen"] = leftByRemoteDesktop && RemoteDesktopReturn::instance().offersSignIn();
     // macOS alone can withhold it (Accessibility): false means a stream would
     // show a picture and take none of the viewer's input — said on the card
     // and when the stream starts, since macOS itself says nothing.
     obj["input_permission"] = caps.inputPermission;
-    obj["virtual_display"] = VirtualDisplay::toJson(VirtualDisplay::probe());
+    const VirtualDisplay::Status vd = VirtualDisplay::probe();
+    obj["virtual_display"] = VirtualDisplay::toJson(vd);
+    // The other displays off while a stream runs on ours (issue #39, Windows):
+    // whether the admin allows it (Settings then offers each viewer the
+    // choice), and what a browser that never chose gets.
+    {
+        AppSettings settings;
+#ifdef Q_OS_WIN
+        const bool offered = vd.installed;
+#else
+        const bool offered = false;
+#endif
+        obj["others_off"] = QJsonObject{
+            {QStringLiteral("allowed"), offered && settings.virtualDisplayExclusive()},
+            {QStringLiteral("inherited"), settings.virtualDisplayExclusiveInherited()},
+        };
+    }
     // The HID passthrough's verdict for Settings' « As itself » switch, before
     // any stream: "ok", or why not in a word the page explains (the stream's
     // hidcaps stays the authority once it runs).
@@ -556,8 +613,10 @@ void ComputerManager::onPollTick()
             if (!m_LastPairCheck.contains(uuid) ||
                 m_LastPairCheck[uuid].secsTo(now) >= PAIR_CHECK_INTERVAL_SEC) {
                 m_LastPairCheck[uuid] = now;
+                // Only the address in use can say the pairing is gone: the answer
+                // clears the certificate that a move is checked against.
                 const NvAddress pairAddr = pollAddressFor(host);
-                if (!pairAddr.isNull()) {
+                if (!pairAddr.isNull() && pairAddr == host->activeAddress) {
                     IdentityManager* im = IdentityManager::get();
                     quint16 httpsPort =
                         host->activeHttpsPort > 0 ? host->activeHttpsPort : MW_HTTPS_PORT;
@@ -567,8 +626,9 @@ void ComputerManager::onPollTick()
                                      .arg(pairAddr.address())
                                      .arg(httpsPort)
                                      .arg(host->name));
-                    QNetworkReply* reply = m_Http->getAppListAsync(
-                        pairAddr, httpsPort, im->getCertificate(), im->getPrivateKey());
+                    QNetworkReply* reply =
+                        m_Http->getAppListAsync(pairAddr, httpsPort, im->getCertificate(),
+                                                im->getPrivateKey(), host->serverCertPem);
                     reply->setProperty("mwHostUuid", uuid);
                     connect(reply, &QNetworkReply::finished, this,
                             &ComputerManager::onPairCheckFinished);
@@ -721,7 +781,13 @@ void ComputerManager::onPollReplyFinished()
 
             NvComputer newState(xml, pollAddr);
 
-            if (newState.uuid == host->uuid) {
+            if (newState.uuid == host->uuid && host->movesOnlyWithProof(pollAddr)) {
+                // Not this host yet: it stays down until the machine here has
+                // shown its certificate, and the poll moves on meanwhile.
+                registerFailure(QStringLiteral("%1 has not shown the host's certificate yet")
+                                    .arg(pollAddr.toString()));
+                updateHostOnProof(newState, xml, pollAddr);
+            } else if (newState.uuid == host->uuid) {
                 host->consecutivePollFailures = 0;
                 // This address works: update() has just made it activeAddress, so
                 // index 0 is it. Stay there until it stops answering.
@@ -938,7 +1004,13 @@ void ComputerManager::tryAddHostFromAddress(const NvAddress& addr, bool fromMdns
 
             try {
                 NvHTTP::verifyResponseStatus(xml);
-                addOrUpdateHost(xml, addr);
+                const NvComputer answer(xml, addr);
+                const NvComputer* known = findHostByUuid(answer.uuid);
+                if (known && known->movesOnlyWithProof(addr)) {
+                    updateHostOnProof(answer, xml, addr);
+                } else {
+                    addOrUpdateHost(xml, addr);
+                }
             } catch (const std::exception& e) {
                 Logger::warning(
                     QString("Failed to query host at %1: %2").arg(addr.toString(), e.what()));
@@ -980,6 +1052,41 @@ void ComputerManager::addOrUpdateHost(const QString& serverInfo, const NvAddress
         Logger::info(QString("Host added: %1 (%2) at %3")
                          .arg(computer->name, computer->uuid, addr.toString()));
     }
+}
+
+void ComputerManager::updateHostOnProof(const NvComputer& answer, const QString& serverInfo,
+                                        const NvAddress& addr)
+{
+    const NvComputer* host = findHostByUuid(answer.uuid);
+    if (!host || m_AddressProofs.contains(answer.uuid)) return;
+    if (host->serverCertPem.isEmpty()) {
+        Logger::warning(QString("%1 stays where it is: it has no certificate for %2 to show")
+                            .arg(host->name, addr.toString()));
+        return;
+    }
+    m_AddressProofs.insert(answer.uuid);
+
+    IdentityManager* identity = IdentityManager::get();
+    HostCertCheck::verify(
+        addr.address(), answer.activeHttpsPort, host->serverCertPem, identity->getCertificate(),
+        identity->getPrivateKey(), this, NvHTTP::REQUEST_TIMEOUT_MS,
+        [this, uuid = answer.uuid, serverInfo, addr](bool proven) {
+            m_AddressProofs.remove(uuid);
+            NvComputer* known = findHostByUuid(uuid);
+            if (!known) return;
+            if (!proven) {
+                Logger::warning(QString("%1 stays where it is: %2 answers for it without its "
+                                        "certificate")
+                                    .arg(known->name, addr.toString()));
+                return;
+            }
+            known->consecutivePollFailures = 0;
+            // It has just shown the certificate on record: this is the host,
+            // whatever answered at the address it leaves.
+            known->certificateChanged = false;
+            m_PollAddrIndex.remove(uuid);
+            addOrUpdateHost(serverInfo, addr);
+        });
 }
 
 NvComputer* ComputerManager::findHostByUuid(const QString& uuid) const
@@ -1076,7 +1183,8 @@ void ComputerManager::handleScanRequest()
     Logger::info("Scan started");
 }
 
-std::pair<int, QJsonObject> ComputerManager::handleAddManualHost(const QString& address)
+std::pair<int, QJsonObject> ComputerManager::handleAddManualHost(const QString& address,
+                                                                 bool mayMoveHost)
 {
     // Parse address: "IP" or "IP:port"
     QString addrStr = address.trimmed();
@@ -1157,32 +1265,7 @@ std::pair<int, QJsonObject> ComputerManager::handleAddManualHost(const QString& 
         return {400, {{"status", "error"}, {"message", e.what()}}};
     }
 
-    addOrUpdateHost(xml, nvAddr);
-
-    // Look up the resulting host to return its JSON
-    NvComputer parsedHost(xml, nvAddr);
-    NvComputer* host = findHostByUuid(parsedHost.uuid);
-    if (!host) {
-        return {500,
-                {{"status", "error"}, {"message", "Host was added but could not be retrieved"}}};
-    }
-
-    // Remember it as the manual address. This is the operator's answer to a host
-    // discovery cannot reach, so it has to outlive the process — until now it
-    // only landed in activeAddress and was gone at the next restart.
-    if (host->manualAddress != nvAddr) {
-        host->manualAddress = nvAddr;
-        saveHosts();
-    }
-
-    Logger::info(
-        QString("Manual host added: %1 (%2) at %3").arg(host->name, host->uuid, nvAddr.toString()));
-
-    QJsonObject obj;
-    QJsonArray arr;
-    arr.append(host->toJson());
-    obj["hosts"] = arr;
-    return {200, obj};
+    return mergeManualHost(*this, xml, nvAddr, mayMoveHost);
 }
 
 std::pair<int, QJsonObject> ComputerManager::handleDeleteHost(const QString& uuid)
@@ -1479,7 +1562,8 @@ void ComputerManager::startPairingChain(const QString& uuid)
     // No announcer: on a Sunshine host a person is already reading the PIN off
     // our UI and typing it in.
     PairingChain::run(
-        pm, m_PairingPins.value(uuid), {}, [this, uuid](const PairingChain::Result& result) {
+        pm, m_PairingPins.value(uuid), nullptr, {},
+        [this, uuid](const PairingChain::Result& result) {
             // Re-resolve the session: while in flight nothing frees it, but the host
             // could still be gone if the whole ComputerManager path changed.
             auto it = m_ActivePairings.find(uuid);
@@ -1494,6 +1578,7 @@ void ComputerManager::startPairingChain(const QString& uuid)
                 NvComputer* host = findHostByUuid(uuid);
                 if (host) {
                     host->serverCertPem = result.serverCertPem;
+                    host->certificateChanged = false;
                     host->pairState = NvComputer::PS_PAIRED;
                     host->state = NvComputer::CS_ONLINE;
                     saveHosts();
@@ -1539,6 +1624,15 @@ void ComputerManager::handleSetBackend(const QString& uuid, const QString& type,
     NvComputer* host = findHostByUuid(uuid);
     if (!host) {
         respond(HttpResponse::json({{"status", "error"}, {"message", "Host not found"}}, 404));
+        return;
+    }
+
+    // The token and pair fields hold secrets; the address is shown back.
+    if (!QUrl(apiUrl).userInfo().isEmpty()) {
+        respond(
+            HttpResponse::json({{"status", "error"},
+                                {"message", "The address cannot carry a user name or a password"}},
+                               400));
         return;
     }
 
@@ -1989,6 +2083,16 @@ void ComputerManager::onPairCheckFinished()
 
     bool pairLost = false;
 
+    // Another machine's certificate says nothing about the pairing: the one on
+    // record stays. Only a machine that showed it can say the pairing is gone.
+    const bool refused = NvHTTP::serverCertRefused(reply);
+    if (refused || reply->error() == QNetworkReply::NoError) {
+        if (host->certificateChanged != refused) {
+            host->certificateChanged = refused;
+            emit hostsChanged();
+        }
+    }
+
     if (reply->error() == QNetworkReply::NoError) {
         QString xml = QString::fromUtf8(reply->readAll());
         try {
@@ -2168,6 +2272,7 @@ void ComputerManager::startBoxArtFetch(const QString& uuid, int appId)
     artReq.setSslConfiguration(sslConfig);
 
     QNetworkReply* artReply = m_Nam->get(artReq);
+    NvHTTP::requireServerCert(artReply, host->serverCertPem);
 
     QTimer::singleShot(5000, artReply, [artReply]() {
         if (!artReply->isFinished()) artReply->abort();
@@ -2347,6 +2452,20 @@ void ComputerManager::handleGetAppList(const QString& uuid, const QString& devic
                 case BackendError::NoAddress:
                     respond(HttpResponse::json(
                         {{"status", "error"}, {"message", "Host has no reachable address"}}, 400));
+                    return;
+
+                case BackendError::CertificateChanged:
+                    if (!host->certificateChanged) {
+                        host->certificateChanged = true;
+                        emit hostsChanged();
+                    }
+                    respond(HttpResponse::json(
+                        {{"status", "error"},
+                         {"code", "certificate_changed"},
+                         {"message", "This host is not showing the certificate it was paired "
+                                     "with. If its software was reinstalled, remove the host "
+                                     "and add it again."}},
+                        409));
                     return;
 
                 case BackendError::Timeout:

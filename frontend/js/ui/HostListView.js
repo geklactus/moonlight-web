@@ -27,8 +27,9 @@
  * per-host "…" menu.
  */
 import { BackendClient } from '../api/BackendClient.js';
+import { shortGpuNames } from '../util/gpuName.js';
 import { Host } from '../models/Host.js';
-import { App } from '../models/App.js';
+import { App, sortApps } from '../models/App.js';
 import { PairDialog } from './PairDialog.js';
 import { BackendDialog } from './BackendDialog.js';
 import { ShareBoard } from './ShareBoard.js';
@@ -62,23 +63,6 @@ import { hostUpdate, canSelfUpdate } from './HostUpdate.js';
  * app started on its own.
  */
 const SUNSHINE_DOWNLOAD_URL = 'https://github.com/LizardByte/Sunshine/releases/latest';
-
-/**
- * The order a host card shows its apps in: "MoonlightWeb Virtual Display"
- * always first, then alphabetical.
- *
- * Not the host's order: that one moves under the user — the native host lists
- * the primary display first, and the display just streamed becomes primary —
- * so the card they clicked would jump to the front. A fixed order keeps every
- * app where the hand expects it.
- */
-function sortApps(apps) {
-    return apps.sort(
-        (a, b) =>
-            (b.isVirtualDisplay ? 1 : 0) - (a.isVirtualDisplay ? 1 : 0) ||
-            a.name.localeCompare(b.name, undefined, { sensitivity: 'base', numeric: true }),
-    );
-}
 
 export class HostListView {
     // First backoff before re-attempting an app-list fetch that failed
@@ -122,7 +106,7 @@ export class HostListView {
         this.memoryKey = '';
         // Whether this browser holds the server's admin rights (the app's
         // /api/auth/status reading): the virtual display's GPU is chosen on its
-        // card by the administrator only.
+        // card, and a host's backend from its menu, by the administrator only.
         this.canAdminister = false;
         // The cards on screen came from that memory and the machine has not
         // answered yet: its first answer replaces them, and drops any host it
@@ -445,6 +429,8 @@ export class HostListView {
 
             // ── App card launch ───────────────────────────────────────────
             const appCard = e.target.closest('.app-card');
+            // A display a stream turned off opens nothing until it is back.
+            if (appCard && appCard.classList.contains('app-card--off')) return;
             if (appCard) {
                 // A launch already in flight blocks ALL app cards (not just the
                 // launching one): a second click would start a concurrent
@@ -527,7 +513,9 @@ export class HostListView {
         this._drawRememberedHosts();
         this._autoScan();
         this.scheduleNextPoll(0); // immediate first refresh
-        this._checkForUpdate(); // discreet "new version available" banner
+        // Discreet "new version available" banner. Fresh: opening the app and
+        // coming back from a stream are when the answer gets read.
+        this._checkForUpdate({ fresh: true });
         this._scheduleUpdateCheck();
     }
 
@@ -571,14 +559,17 @@ export class HostListView {
     // Not a one-shot: the backend's own check is stale-while-revalidate, so the
     // very first answer after its boot is "no update" even when there is one.
     // Asking once per page load meant a long-lived tab could never see a banner.
-    async _checkForUpdate() {
+    //
+    // `fresh` has the host look at the releases now instead of answering from
+    // its cache; the host itself bounds how often that really happens.
+    async _checkForUpdate({ fresh = false } = {}) {
         // Nothing to learn while the banner shows an update in flight, and don't
         // re-ask more often than the backend could plausibly change its answer.
         if (hostUpdate.busy) return;
         const now = Date.now();
         if (now - this._updateCheckedAt < HostListView.UPDATE_CHECK_MIN_MS) return;
         this._updateCheckedAt = now;
-        const info = await BackendClient.checkForUpdate();
+        const info = await BackendClient.checkForUpdate({ fresh });
         if (this._destroyed) return;
         // `checked_at` empty means the host has never completed a check — its
         // fetch is in flight right now and this "no update" is a placeholder.
@@ -916,6 +907,7 @@ export class HostListView {
             // The native host's display state: a screen appearing or leaving
             // must repaint the card from empty state to grid and back.
             JSON.stringify(host.nativeDisplay),
+            host.certificateChanged,
         ].join('|');
     }
 
@@ -1076,9 +1068,25 @@ export class HostListView {
 
         // Fill in app grids for available hosts (cache hit = instant).
         for (const host of this.hosts) {
-            if (host.isAvailable && !host.needsVirtualDisplay && !host.needsCapturePermission)
+            if (
+                host.isAvailable &&
+                !host.needsVirtualDisplay &&
+                (!host.leftByRemoteDesktop || this._remoteDesktopHasApp(host)) &&
+                !host.needsCapturePermission
+            )
                 this._ensureAppsLoaded(host);
         }
+    }
+
+    /**
+     * A host whose session Remote Desktop left: whether its card shows its one
+     * app ("This PC's screen", or "This PC's sign-in screen" outside a kiosk)
+     * rather than the text alone.
+     */
+    _remoteDesktopHasApp(host) {
+        return (
+            host.returnsFromRemoteDesktop || (host.opensSignInScreen && !BackendClient.adminLocked)
+        );
     }
 
     renderCard(host) {
@@ -1160,6 +1168,7 @@ export class HostListView {
                                 // the test is a Sunshine one, a Sunshine card
                                 // still shows nothing at all.
                                 !booth &&
+                                this.canAdminister &&
                                 (host.backendType ||
                                     host.multiSeatDetected ||
                                     host.mayHaveControlApi)
@@ -1197,9 +1206,22 @@ export class HostListView {
         if (host.needsVirtualDisplay) {
             // Nothing plugged in and no "MoonlightWeb Virtual Display" to
             // open either: say what is missing. (With it installed the card
-            // is an ordinary grid — the display is its one app.)
+            // is an ordinary grid — the display is its one app.) Where none
+            // is shipped, the installer is never named.
+            const text = host.canHaveVirtualDisplay
+                ? t('vdisplay.emptyBody')
+                : t('vdisplay.emptyBodyNoDriver');
             return `<div class="host-body-center host-empty-display">
-                        <p class="host-empty-display-text">${t('vdisplay.emptyBody')}</p>
+                        <p class="host-empty-display-text">${text}</p>
+                    </div>`;
+        }
+        if (host.leftByRemoteDesktop && !this._remoteDesktopHasApp(host)) {
+            // Windows: closing Remote Desktop left the session with no screen
+            // at all, virtual ones included. Only its return to the PC's
+            // screen brings one back: with the admin's setting on, the grid
+            // below has "This PC's screen", which does that when opened.
+            return `<div class="host-body-center host-empty-display">
+                        <p class="host-empty-display-text">${t('hosts.sessionLeftByRemoteDesktop')}</p>
                     </div>`;
         }
         if (host.needsCapturePermission) {
@@ -1214,6 +1236,11 @@ export class HostListView {
                                 : `<button class="btn btn-secondary btn-mac-perm" data-pane="screen">${t('setup.openScreenRecording')}</button>`
                         }
                     </div>`;
+        }
+        if (host.isOnline && host.certificateChanged) {
+            // Another machine answers at this address, and nothing is asked of
+            // it. "Remove", in the menu, is the way out this text names.
+            return `<div class="host-body-center host-offline-msg">${t('hosts.certificateChangedMessage')}</div>`;
         }
         if (host.isAvailable) {
             // App grid filled asynchronously by _ensureAppsLoaded(). A Mac that
@@ -1261,6 +1288,7 @@ export class HostListView {
      * @property {Promise<AppsEntry>} [pending] fetch in flight
      * @property {string} [error]
      * @property {boolean} [sticky] the error is definitive — don't retry
+     * @property {boolean} [certificateChanged] the host showed another certificate
      */
 
     // Ensure the app grid for an available host is on screen, and current.
@@ -1375,6 +1403,8 @@ export class HostListView {
                 // answer forever, and the spinner below would never come down,
                 // so show what it said instead.
                 console.error('[MW] Failed to load app list:', err);
+                if (err.responseBody?.code === 'certificate_changed')
+                    return /** @type {AppsEntry} */ ({ certificateChanged: true });
                 const verdict = err.statusCode >= 400 && err.statusCode < 500;
                 return /** @type {AppsEntry} */ ({
                     error: err.message,
@@ -1383,6 +1413,18 @@ export class HostListView {
             })
             .then((result) => {
                 if (this._destroyed) return result;
+
+                // The card says this one itself, and nothing stays behind here:
+                // a sticky verdict would outlast it once the right machine is
+                // back, and the grid would never return without a reload.
+                if (result.certificateChanged) {
+                    delete this.appsByHost[uuid];
+                    const refused = this.hosts.find((h) => h.uuid === uuid);
+                    if (refused) refused.certificateChanged = true;
+                    this.renderList();
+                    return result;
+                }
+
                 const current = this.appsByHost[uuid];
                 const shown = current && current.apps ? current.apps : null;
 
@@ -1607,19 +1649,25 @@ export class HostListView {
         // The app a stopped stream left running (issue #24): the card resumes
         // it, and says so; a small Quit closes it on the host.
         const running = runningId > 0 && app.id === runningId;
-        const aria = running
-            ? t('apps.resumeAria', { name: app.displayName })
-            : t('apps.launchAria', { name: app.displayName });
+        // A display a stream turned off (issue #39): drawn dark, opens nothing.
+        const off = app.isOff;
+        const aria = off
+            ? t('apps.displayOffAria', { name: app.displayName })
+            : running
+              ? t('apps.resumeAria', { name: app.displayName })
+              : t('apps.launchAria', { name: app.displayName });
+        const state = off ? ' app-card--off' : running ? ' app-card--running' : '';
         return `
-            <div class="app-card${running ? ' app-card--running' : ''}" data-app-id="${app.id}"
-                 role="button" tabindex="0"
+            <div class="app-card${state}" data-app-id="${app.id}"
+                 role="button" tabindex="0"${off ? ' aria-disabled="true"' : ''}
                  aria-label="${this.esc(aria)}">
                 <div class="app-card-image${drawsMachine ? ' app-card-image--host' : ''}">
                     ${image}
-                    ${running ? `<span class="app-card-badge">${this.esc(t('apps.running'))}</span>` : ''}
+                    ${running && !off ? `<span class="app-card-badge">${this.esc(t('apps.running'))}</span>` : ''}
+                    ${off ? `<span class="app-card-off-note">${this.esc(t('apps.displayOff'))}</span>` : ''}
                 </div>
                 <div class="app-card-name">${this.esc(app.displayName)}</div>
-                ${drawsMachine ? this._gpuLine(app) : ''}
+                ${drawsMachine ? this._gpuLine(app, devices) : ''}
                 ${
                     running
                         ? `<button type="button" class="app-card-quit" data-app-id="${app.id}"
@@ -1640,13 +1688,24 @@ export class HostListView {
      * a list, "Auto" — the driver's own choice — first, then the GPUs by name,
      * the only thing the driver tells them apart by. Anyone else, and a booth,
      * sees the line only.
+     *
+     * Names read short (util/gpuName.js), each kept apart from the other cards'
+     * and the list's; the full name stays in the tooltip and goes to the driver.
      */
-    _gpuLine(app) {
+    _gpuLine(app, devices = []) {
         const d = app.device;
         const name = typeof d.gpu === 'string' ? d.gpu : '';
-        const label =
-            name && d.gpuNumber > 0 ? t('apps.gpuNumbered', { name, n: d.gpuNumber }) : name;
+        const numbered = (text) =>
+            text && d.gpuNumber > 0 ? t('apps.gpuNumbered', { name: text, n: d.gpuNumber }) : text;
         const choice = d.gpuChoice;
+        const offered = choice && Array.isArray(choice.options) ? choice.options : [];
+        const shown = shortGpuNames(
+            [...devices.map((o) => o.gpu), ...offered, choice && choice.selected, name].filter(
+                (n) => typeof n === 'string' && n,
+            ),
+        );
+        const label = numbered(shown.get(name) || name);
+        const fullLabel = numbered(name);
         if (
             choice &&
             Array.isArray(choice.options) &&
@@ -1662,15 +1721,21 @@ export class HostListView {
                 `<option value="${this.esc(value)}"${value === selected ? ' selected' : ''}>${this.esc(text)}</option>`;
             const options = [
                 option('', auto),
-                ...names.map((n) => option(n, n === selected && n === name ? label : n)),
+                ...names.map((n) =>
+                    option(n, n === selected && n === name ? label : shown.get(n) || n),
+                ),
             ];
+            const hint = t('apps.gpuChoiceHint');
+            const tip = selected || fullLabel ? `${selected || fullLabel}\n${hint}` : hint;
             return `
-                <label class="app-card-gpu app-card-gpu--choice" title="${this.esc(t('apps.gpuChoiceHint'))}">
+                <label class="app-card-gpu app-card-gpu--choice" title="${this.esc(tip)}">
                     <select class="app-card-gpu-select" data-selected="${this.esc(selected)}"
                             aria-label="${this.esc(t('apps.gpuChoiceAria', { name: app.displayName }))}">${options.join('')}</select>
                 </label>`;
         }
-        return label ? `<div class="app-card-gpu">${this.esc(label)}</div>` : '';
+        return label
+            ? `<div class="app-card-gpu" title="${this.esc(fullLabel)}">${this.esc(label)}</div>`
+            : '';
     }
 
     // Switch a card into the "launching" state: a discreet Cyberpunk scan/glow

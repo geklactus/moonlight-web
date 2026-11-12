@@ -45,6 +45,7 @@
 #include "../../input/windows/Win32Input.h"
 #include "DisplayModeHold.h"
 #include "DisplayOutputs.h"
+#include "../SignInScreen.h"
 #include "InputDesktop.h"
 #include "StreamPriority.h"
 #include "Win32PointerSystem.h"
@@ -297,7 +298,14 @@ public:
         }
 
         // The guests' shared feed carries the pictures: input and audio only.
-        if (m_Config.videoSource == VideoSource::External) return startExternal(*display, error);
+        if (m_Config.videoSource == VideoSource::External) {
+            // The guests' shared feed is somebody's desktop by definition.
+            if (platform::signInScreenOnly()) {
+                error = "the sign-in screen mode streams its own capture only";
+                return false;
+            }
+            return startExternal(*display, error);
+        }
 
         // Out of EcoQoS and ahead of the game on the GPU before anything is
         // built: a D3D12 queue takes the priority of the class it is made
@@ -550,15 +558,22 @@ public:
         // Rumble travels the opposite way from every other input: the game
         // asks the pad to shake, and that has to reach the browser. Handed
         // straight to the session callback — it arrives on a ViGEm thread,
-        // and the consumer is the one that knows how to marshal it.
-        auto sink = std::make_unique<input::Win32Input>(rect, [this](const RumbleEvent& event) {
-            if (m_Callbacks.onRumble) m_Callbacks.onRumble(event);
-        });
+        // and the consumer is the one that knows how to marshal it. The
+        // player number Windows gives each pad goes back the same way.
+        auto sink = std::make_unique<input::Win32Input>(
+            rect,
+            [this](const RumbleEvent& event) {
+                if (m_Callbacks.onRumble) m_Callbacks.onRumble(event);
+            },
+            [this](uint8_t controllerNumber, int hostNumber) {
+                if (m_Config.onPadNumber) m_Config.onPadNumber(controllerNumber, hostNumber);
+            });
         sink->setAllowElevated(m_Config.allowElevatedInput);
         if (m_Config.tuning.clickTrace) sink->setClickTrace(&m_ClickTrace);
         // On a host with no pointing device, a mouse of its own: the pointer,
         // and a device for games (SystemMouse.h). Mouse Keys when it cannot.
         sink->setVirtualMouse(m_Config.tuning.virtualMouse);
+        sink->setVirtualKeyboard(m_Config.tuning.virtualKeyboard);
         std::string inputError;
         if (sink->start(inputError)) {
             std::lock_guard<std::mutex> lock(m_InputMutex);
@@ -577,6 +592,12 @@ public:
     /// all still streams its screen.
     void startAudio()
     {
+        // The sign-in screen has nothing to say, and the mode carries
+        // pictures and keyboard and mouse only.
+        if (platform::signInScreenOnly()) {
+            log::info("[native] audio: off on the sign-in screen");
+            return;
+        }
         if (m_Callbacks.onAudio) {
             // Before the loopback opens: the mute may move the default output
             // to a device without speakers, and the capture must open on THAT
@@ -588,10 +609,14 @@ public:
                 m_Info.hostMuted = strategy != audio::HostMute::Strategy::None;
                 log::info(std::string("[native] audio: ") + how);
             }
+            // Known once the capture located its output; refreshed there.
+            if (!m_Target.displayOsName.empty()) m_StreamedDisplay->set(m_Target.displayOsName);
             auto audio = std::make_unique<audio::WasapiLoopback>(
                 m_Callbacks.onAudio, m_Config.tuning.audioFrameSamples(),
                 m_Config.tuning.audioGraceUs < 0 ? audio::WasapiLoopback::kDefaultGraceUs
-                                                 : m_Config.tuning.audioGraceUs);
+                                                 : m_Config.tuning.audioGraceUs,
+                AppAudioOptions{m_Config.audioSource, m_StreamedDisplay,
+                                m_Config.onAudioAppChanged});
             std::string audioError;
             if (audio->start(audioError)) {
                 m_Audio = std::move(audio);
@@ -1231,9 +1256,16 @@ private:
         bool started = false;
         std::thread helper([&] {
             std::string desktop;
-            platform::attachThread(&desktop);
+            const bool on = platform::attachThread(&desktop);
             log::info("[native] the capture opens from a thread on the \"" + desktop +
                       "\" desktop");
+            // Sign-in screen mode: a thread that did not reach Winlogon stands
+            // on the process's own desktop, which is somebody's once they sign
+            // in on this session. Nothing is opened from there.
+            if (platform::signInScreenOnly() && !(on && platform::isSignInDesktop(desktop))) {
+                error = "the sign-in screen is not up (the screen shows \"" + desktop + "\")";
+                return;
+            }
             started = capture.start(error);
         });
         helper.join();
@@ -1272,6 +1304,12 @@ private:
             const DWORD n = ::GetEnvironmentVariableA("MW_CAPTURE", value, sizeof(value));
             forceWgc = n > 0 && n < sizeof(value) && ::_stricmp(value, "wgc") == 0;
         }
+        // Sign-in screen mode: Desktop Duplication alone, which copies the
+        // desktop this thread stands on — Winlogon, and never another one
+        // (platform::attachThread). Windows.Graphics.Capture copies whatever
+        // the screen shows, whoever's desktop it is.
+        const bool signInOnly = platform::signInScreenOnly();
+        if (signInOnly) forceWgc = false;
 
         // The bench's key (capture=, EncoderTuning::Capture; plan « Gels du
         // lien », route B). wgc asks for Windows.Graphics.Capture first and
@@ -1280,7 +1318,8 @@ private:
         // above fails the session instead. A duplication found to paint the
         // pointer in stays on WGC, as without the key.
         const EncoderTuning::Capture asked = m_Config.tuning.capture;
-        if (asked == EncoderTuning::Capture::Wgc && !forceWgc && !m_DuplicationPaintsPointer) {
+        if (asked == EncoderTuning::Capture::Wgc && !forceWgc && !m_DuplicationPaintsPointer &&
+            !signInOnly) {
             std::string wgcError;
             if (!capture::WgcCapture::available(&wgcError))
                 wgcError = "Windows.Graphics.Capture is unavailable here: " + wgcError;
@@ -1318,6 +1357,13 @@ private:
             // does on such a machine.
             log::info("[native] capture=dda: Desktop Duplication refused this display (" +
                       ddaError + "), and no fallback is taken");
+            error = ddaError;
+            return false;
+        }
+
+        if (signInOnly) {
+            log::info("[native] sign-in screen: Desktop Duplication refused this display (" +
+                      ddaError + "), and no other capture is taken there");
             error = ddaError;
             return false;
         }
@@ -1722,9 +1768,46 @@ private:
         encoder.intraRefresh = m_Config.intraRefresh;
         encoder.tuning = m_Config.tuning;
         encoder.encoder12 = encoder12;
-        if (!m_Pipeline->buildEncoder(*m_Capture, encoder, error)) return false;
+        encoder.hardwareOnly = hardwareCodecFirst();
+        if (!m_Pipeline->buildEncoder(*m_Capture, encoder, error)) {
+            if (!encoder.hardwareOnly) return false;
+            // Issue #54: Qualcomm's hardware HEVC refused to start (0x80070057),
+            // and the software HEVC that took over ran at 32 fps beside a
+            // hardware H.264 that works. Auto is an offer, and H.264 is in it.
+            log::warning(std::string("[native] ") + toString(m_Target.codec) +
+                         " has no working hardware encoder here (" + error +
+                         ") — Auto takes H.264 instead of " + toString(m_Target.codec) +
+                         " in software");
+            m_Target.codec = Codec::H264;
+            encoder.codec = Codec::H264;
+            encoder.hardwareOnly = false;
+            if (!m_Pipeline->buildEncoder(*m_Capture, encoder, error)) return false;
+        }
+        m_CodecSettled = true;
         m_EncoderKbps = encoder.bitrateKbps;
         return true;
+    }
+
+    /// Whether this build takes the hardware encoder of the codec picked, or
+    /// none, so that a failure can still change the codec. Media Foundation's
+    /// hardware tier lists H.264 and HEVC together, but one may refuse to
+    /// start while the other works, and the transform then falls to the
+    /// software encoder of the same codec (MfEncoder). Only where all of it
+    /// holds:
+    ///  - the session's first build: the client has seen no picture yet, so
+    ///    the codec is still the host's to change (m_Info.codec is read after);
+    ///  - Media Foundation on its hardware tier, for a codec other than H.264;
+    ///  - the viewer left the codec to Auto, and the browser decodes H.264;
+    ///  - no bench asked for a given transform (fallback=mf, mfsw, ...).
+    bool hardwareCodecFirst() const
+    {
+        if (m_CodecSettled || !m_Config.codecAuto) return false;
+        if (m_Target.encoder != EncoderApi::MediaFoundation || m_Target.codec == Codec::H264)
+            return false;
+        if (m_Config.tuning.fallback != EncoderTuning::Fallback::None) return false;
+        for (Codec c : m_Config.clientCodecs)
+            if (c == Codec::H264) return true;
+        return false;
     }
 
     /// The duplication was lost — a resolution change, a mode set, a desktop
@@ -2012,6 +2095,10 @@ private:
         // the paths go missing. Matched by name, it is the same one; matched
         // by path, the path stays the key.
         if (!name.empty()) m_Target.displayOsName = name;
+        // "Stream audio from: Automatic" follows focus on this display only
+        // (AudioSource.h): a window on another screen is not what the viewer
+        // sees, so its sound stays out.
+        m_StreamedDisplay->set(m_Target.displayOsName);
         return true;
     }
 
@@ -2953,6 +3040,13 @@ private:
             countPresents(status == capture::AcquireStatus::Ok && !frame.retaken);
             if (m_RetakePending) noteRetake(status, frame);
 
+            // Sign-in screen mode: on every wake-up, before the picture or
+            // the pointer is looked at, the screen is still the sign-in
+            // screen, this thread still stands on it, and nobody is signed in
+            // on the session. The first time not, the stream ends here, the
+            // picture in hand unsent (platform/SignInScreen.h).
+            if (!signInStillShown()) return;
+
             // Anything but a timeout means the screen is alive again, and the
             // frame about to be encoded is a moving one. Restore the ordinary
             // budget BEFORE it is encoded, never after: that ordering is the
@@ -3296,7 +3390,7 @@ private:
                 noteFirstKeyframe(encoded);
                 d.bytes = encoded.size;
                 d.qp = encoded.avgQp;
-                if (encoded.data && encoded.size > 0 && m_Callbacks.onVideo) {
+                if (encoded.data && encoded.size > 0 && m_Callbacks.onVideo && signInMaySend()) {
                     d.frame = encodedFrame(encoded, frameNumber++, stamps, encoderKbps);
                     m_Callbacks.onVideo(d.frame);
                     d.frame.data = nullptr;
@@ -3469,7 +3563,7 @@ private:
         m_LastEmitQp = encoded.avgQp;
         m_Link.sent(steadyNowUs(), encoded.size, m_LinkKbps);
 
-        if (encoded.data && encoded.size > 0 && m_Callbacks.onVideo) {
+        if (encoded.data && encoded.size > 0 && m_Callbacks.onVideo && signInMaySend()) {
             EncodedFrame out = encodedFrame(encoded, frameNumber++, stamps, m_EncoderKbps);
             attachMwsrZones(out);
             // Before the send, which is not the picture's own cost.
@@ -4523,6 +4617,50 @@ private:
         if (m_Pipeline) m_Pipeline->logEndOfSession();
     }
 
+    /// Sign-in screen mode, on the capture thread (platform/SignInScreen.h):
+    /// true while a picture captured from this thread's desktop may go out.
+    /// False ends the session, once and for good. Outside the mode, true and
+    /// nothing read. For the bench, one line a second: the pictures sent and
+    /// the desktops seen, and one at once when a desktop name changes.
+    bool signInStillShown()
+    {
+        if (!platform::signInScreenOnly()) return true;
+        std::string why;
+        platform::SignInLook look;
+        if (!platform::signInScreenStillShown(true, &why, &look)) {
+            log::info("[native] sign-in screen: " + std::to_string(m_SignInSent.load()) +
+                      " picture(s) sent in all, every one from the sign-in screen");
+            finish("sign-in screen mode: " + why);
+            return false;
+        }
+        const int64_t nowUs = steadyNowUs();
+        const std::string seen = look.threadDesktop + "/" + look.inputDesktop;
+        if (seen != m_SignInLastDesktop || nowUs - m_SignInLogUs >= 1000000) {
+            const uint64_t sent = m_SignInSent.load();
+            log::info("[native] sign-in screen: " + std::to_string(sent - m_SignInSentLogged) +
+                      " picture(s) sent since the last line; capture on \"" + look.threadDesktop +
+                      "\", input on \"" + look.inputDesktop + "\", nobody signed in");
+            m_SignInSentLogged = sent;
+            m_SignInLogUs = nowUs;
+            m_SignInLastDesktop = seen;
+        }
+        return true;
+    }
+
+    /// Sign-in screen mode, where an encoded picture is handed out (the
+    /// capture thread, or the pipeline's): the screen is still the sign-in
+    /// screen and nobody is signed in. False holds the picture back; the
+    /// failure is latched, and the capture loop ends the session at its next
+    /// look (signInStillShown).
+    bool signInMaySend()
+    {
+        if (!platform::signInScreenOnly()) return true;
+        std::string why;
+        if (!platform::signInScreenStillShown(false, &why)) return false;
+        m_SignInSent.fetch_add(1);
+        return true;
+    }
+
     void finish(const std::string& reason) noexcept
     {
         m_Running.store(false);
@@ -4533,6 +4671,12 @@ private:
             // Nothing left to report it to.
         }
     }
+
+    /// Sign-in screen mode's figures (signInStillShown, signInMaySend).
+    std::atomic<uint64_t> m_SignInSent{0};
+    uint64_t m_SignInSentLogged = 0;
+    int64_t m_SignInLogUs = 0;
+    std::string m_SignInLastDesktop;
 
     SessionConfig m_Config;
     /// The Selector's decision. Read, never re-derived.
@@ -4754,6 +4898,8 @@ private:
     /// thread. Null when the consumer asked for none or no device could open.
     std::unique_ptr<audio::WasapiLoopback> m_Audio;
     audio::HostMute m_HostMute;
+    /// The display "Stream audio from: Automatic" follows focus on.
+    std::shared_ptr<StreamedDisplay> m_StreamedDisplay = std::make_shared<StreamedDisplay>();
 
     std::thread m_Thread;
     std::atomic<bool> m_Running{false};
@@ -4887,6 +5033,9 @@ private:
     /// setBitrate() it took — scaled to the cadence frames arrive at, boost
     /// included. Stamped on each frame (EncodedFrame::encoderKbps).
     int m_EncoderKbps = 0;
+    /// The codec is the client's to decode from the first picture on: only
+    /// the session's first build may still change it (see hardwareCodecFirst).
+    bool m_CodecSettled = false;
 };
 
 } // namespace

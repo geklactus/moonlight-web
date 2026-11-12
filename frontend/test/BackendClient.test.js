@@ -17,13 +17,15 @@ function jsonResponse(body, { ok = true, status = 200 } = {}) {
 
 // Mock fetch that answers the admin-key probe every write performs, and routes
 // everything else to `handler`. Returns the mock so callers can inspect the
-// non-token calls via `apiCalls()`.
+// non-token calls via `apiCalls()`. The sharing board's challenge is a probe of
+// the same kind (shareOwnerProof.test.js covers it): left out of apiCalls() too.
+const PROBES = ['/api/admin/token', '/api/share/owner-proof'];
 function mockFetch(handler, { adminKey = 'ADMIN-KEY' } = {}) {
     const fetchMock = vi.fn().mockImplementation((path, init) => {
         if (path === '/api/admin/token') return Promise.resolve(jsonResponse({ token: adminKey }));
         return typeof handler === 'function' ? handler(path, init) : Promise.resolve(handler);
     });
-    fetchMock.apiCalls = () => fetchMock.mock.calls.filter((c) => c[0] !== '/api/admin/token');
+    fetchMock.apiCalls = () => fetchMock.mock.calls.filter((c) => !PROBES.includes(c[0]));
     vi.stubGlobal('fetch', fetchMock);
     return fetchMock;
 }
@@ -593,6 +595,16 @@ describe('BackendClient request shaping', () => {
         expect(BackendClient.clientUniqueIdForSlot(1)).toBe(standby);
     });
 
+    // An app slot (past the owner's two) is where a second device on one Wolf,
+    // or a second app, lands. Its launch carried the regular id, so its Stop
+    // must too, or the server finds no stream to end (UM790Pro, 12/11/2026).
+    it('clientUniqueIdForSlot keeps the regular id for an app slot', () => {
+        const base = BackendClient.clientUniqueId();
+        expect(BackendClient.clientUniqueIdForSlot(2)).toBe(base);
+        expect(BackendClient.clientUniqueIdForSlot(5)).toBe(base);
+        expect(BackendClient.clientUniqueIdForSlot(undefined)).toBe(base);
+    });
+
     it('redeemHostKey records that a session is now held', async () => {
         mockFetch(jsonResponse({ ok: true }));
         await BackendClient.redeemHostKey('K1');
@@ -635,5 +647,89 @@ describe('BackendClient best-effort probes', () => {
 
         vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new TypeError('failed to fetch')));
         await expect(BackendClient.probeHealth()).resolves.toBeNull();
+    });
+
+    it('probeHealthOutcome tells no answer at all from an HTTP error', async () => {
+        vi.stubGlobal('fetch', vi.fn().mockResolvedValue(jsonResponse({ version: '0.4.3' })));
+        await expect(BackendClient.probeHealthOutcome()).resolves.toEqual({
+            health: { version: '0.4.3' },
+            network: false,
+        });
+
+        vi.stubGlobal(
+            'fetch',
+            vi.fn().mockResolvedValue(jsonResponse({}, { ok: false, status: 502 })),
+        );
+        await expect(BackendClient.probeHealthOutcome()).resolves.toEqual({
+            health: null,
+            network: false,
+        });
+
+        // A host down and a certificate the browser no longer accepts look the
+        // same from here: no HTTP answer.
+        vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new TypeError('Failed to fetch')));
+        await expect(BackendClient.probeHealthOutcome()).resolves.toEqual({
+            health: null,
+            network: true,
+        });
+    });
+
+    it('probeHealthOutcome gives up on a request that never settles', async () => {
+        vi.useFakeTimers();
+        try {
+            vi.stubGlobal(
+                'fetch',
+                vi.fn(
+                    (_path, init) =>
+                        new Promise((_resolve, reject) => {
+                            init.signal.addEventListener('abort', () =>
+                                reject(new DOMException('aborted', 'AbortError')),
+                            );
+                        }),
+                ),
+            );
+            const pending = BackendClient.probeHealthOutcome({ timeoutMs: 5000 });
+            await vi.advanceTimersByTimeAsync(5000);
+            await expect(pending).resolves.toEqual({ health: null, network: true });
+        } finally {
+            vi.useRealTimers();
+        }
+    });
+
+    it('checkForUpdate asks for a fresh look only when told to', async () => {
+        const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ update_available: false }));
+        vi.stubGlobal('fetch', fetchMock);
+        await BackendClient.checkForUpdate();
+        expect(fetchMock.mock.calls[0][0]).toBe('/api/update/check');
+        await BackendClient.checkForUpdate({ fresh: true });
+        expect(fetchMock.mock.calls[1][0]).toBe('/api/update/check?fresh=1');
+        // Bounded: the host waits a few seconds at most, this a little longer.
+        expect(fetchMock.mock.calls[1][1].signal).toBeDefined();
+    });
+
+    it('getUpdateStatus with a timeout turns a hung request into server_timeout', async () => {
+        vi.useFakeTimers();
+        try {
+            vi.stubGlobal(
+                'fetch',
+                vi.fn(
+                    (_path, init) =>
+                        new Promise((_resolve, reject) => {
+                            init.signal.addEventListener('abort', () =>
+                                reject(new DOMException('aborted', 'AbortError')),
+                            );
+                        }),
+                ),
+            );
+            const pending = BackendClient.getUpdateStatus({ timeoutMs: 5000 });
+            const settled = expect(pending).rejects.toMatchObject({
+                message: 'server_timeout',
+                aborted: true,
+            });
+            await vi.advanceTimersByTimeAsync(5000);
+            await settled;
+        } finally {
+            vi.useRealTimers();
+        }
     });
 });

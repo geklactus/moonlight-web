@@ -20,6 +20,7 @@
 #include "../../backend/VirtualDisplay.h"
 #include "../../common/Logger.h"
 #include "../../server/AppSettings.h"
+#include "../../streaming/RemoteDesktopReturn.h"
 
 extern "C" {
 #include "Limelight.h"
@@ -29,12 +30,15 @@ extern "C" {
 #include "NativeProbeService.h"
 
 #include "NativeCapabilitiesJson.h"
+#include "mw/native/NativeHost.h"
 
 #include <QCollator>
 #include <QFile>
 #include <QHash>
 #include <QJsonArray>
 #include <QHostInfo>
+#include <QMutex>
+#include <QMutexLocker>
 
 #include <algorithm>
 #include <vector>
@@ -102,6 +106,9 @@ QList<int> displayAppIds(const mw::native::Capabilities& caps)
 /// ids, 1100 + their rank; every app since is numbered from
 /// AppSettings::kHostAppIdFirst. Below 1100: displays and the virtual display.
 constexpr int kHostAppIdFloor = 1100;
+static_assert(RemoteDesktopReturnPolicy::kReturnAppId > kVirtualDisplayAppId &&
+                  RemoteDesktopReturnPolicy::kReturnAppId < kHostAppIdFloor,
+              "\"This PC's screen\" sits between the virtual display and the owner's apps");
 
 /// The engine's entry for the owner's apps in gamescope, or nullptr.
 const mw::native::DisplayInfo* gamescopeAppsDisplay(const mw::native::Capabilities& caps)
@@ -303,6 +310,45 @@ NvApp virtualDisplayApp(const mw::native::Capabilities& caps,
     return app;
 }
 
+/// "This PC's screen": the card of a session Remote Desktop left without a
+/// screen. It draws the PC with its monitor, the screen it brings the session
+/// back to; the browser names it in its own language.
+NvApp remoteDesktopReturnApp(const mw::native::Capabilities& caps)
+{
+    NvApp app(RemoteDesktopReturnPolicy::kReturnAppId, QStringLiteral("This PC's screen (locked)"),
+              /*hdr=*/false);
+    app.setHasBoxArt(false);
+    app.setDevice(QJsonObject{
+        {QStringLiteral("os"), HostOsProbe::toString(HostOsProbe::thisMachine())},
+        {QStringLiteral("display"),
+         caps.hasBattery ? QStringLiteral("builtin") : QStringLiteral("external")},
+        {QStringLiteral("model"), QString()},
+        {QStringLiteral("key"), QStringLiteral("remote-desktop-return")},
+        {QStringLiteral("battery"), caps.hasBattery},
+    });
+    return app;
+}
+
+/// "This PC's sign-in screen": the one card of a session Remote Desktop left,
+/// when this version offers it (RemoteDesktopReturnPolicy::kSignInOffered).
+/// Opening it streams the console's sign-in screen, where the user signs in
+/// with their own account and Windows brings their session back.
+NvApp signInScreenApp(const mw::native::Capabilities& caps)
+{
+    NvApp app(RemoteDesktopReturnPolicy::kSignInAppId, QStringLiteral("This PC's sign-in screen"),
+              /*hdr=*/false);
+    app.setHasBoxArt(false);
+    app.setDevice(QJsonObject{
+        {QStringLiteral("os"), HostOsProbe::toString(HostOsProbe::thisMachine())},
+        {QStringLiteral("display"),
+         caps.hasBattery ? QStringLiteral("builtin") : QStringLiteral("external")},
+        {QStringLiteral("model"), QString()},
+        {QStringLiteral("key"), QStringLiteral("console-sign-in")},
+        {QStringLiteral("battery"), caps.hasBattery},
+    });
+    return app;
+}
+
 /// One card per app of the owner's (AppSettings::hostApps), in the settings'
 /// order, after @p apps' displays. The card says where its program opens
 /// (device.screen) and, when the owner gave it one, its image's hash
@@ -346,6 +392,39 @@ void appendHostApps(const mw::native::Capabilities& caps, QVector<NvApp>& apps)
 int NativeHostBackend::virtualDisplayAppId()
 {
     return kVirtualDisplayAppId;
+}
+
+int NativeHostBackend::remoteDesktopReturnAppId()
+{
+    return RemoteDesktopReturnPolicy::kReturnAppId;
+}
+
+int NativeHostBackend::signInScreenAppId()
+{
+    return RemoteDesktopReturnPolicy::kSignInAppId;
+}
+
+int NativeHostBackend::primaryDisplayAppId(QString* error)
+{
+    const mw::native::Capabilities caps = probeEngine();
+    if (!caps.available) {
+        if (error)
+            *error = caps.diagnostic.empty() ? QString::fromUtf8(mw::native::toString(caps.reason))
+                                             : QString::fromStdString(caps.diagnostic);
+        return -1;
+    }
+    const mw::native::DisplayInfo* primary = primaryDisplay(caps);
+    if (!primary) {
+        if (error) *error = QStringLiteral("This PC has no screen to stream");
+        return -1;
+    }
+    const QList<int> ids = displayAppIds(caps);
+    const int appId = ids.value(static_cast<int>(primary - caps.displays.data()));
+    if (appId <= 0) {
+        if (error) *error = QStringLiteral("This PC's screen has no card");
+        return -1;
+    }
+    return appId;
 }
 
 bool NativeHostBackend::virtualDisplayGpuChoosable(const QString& gpu)
@@ -606,6 +685,44 @@ void NativeHostBackend::releaseSeat(const QString& seatId)
     Q_UNUSED(seatId);
 }
 
+namespace {
+
+// The displays' cards as last listed with every display on (issue #39).
+QMutex s_LitMutex;
+QVector<NvApp> s_LitDisplays;
+
+void appendDarkDisplays(const QVector<NvApp>& physical, QVector<NvApp>& apps)
+{
+#ifdef Q_OS_WIN
+    // While a stream has the other displays off, Windows has detached them:
+    // they leave the list. Their cards stay, from the last listing that had
+    // them on, marked "off" so the grid draws them dark and opens nothing.
+    const bool othersOff = QFile::exists(VirtualDisplay::othersOffPath());
+    QMutexLocker lock(&s_LitMutex);
+    if (!othersOff) {
+        s_LitDisplays = physical;
+        return;
+    }
+    QList<int> lit, listed;
+    for (const NvApp& app : std::as_const(s_LitDisplays))
+        lit.append(app.id());
+    for (const NvApp& app : std::as_const(apps))
+        listed.append(app.id());
+    for (int id : VirtualDisplay::darkDisplays(lit, listed, othersOff)) {
+        NvApp app = s_LitDisplays.at(lit.indexOf(id));
+        QJsonObject device = app.device();
+        device[QStringLiteral("off")] = true;
+        app.setDevice(device);
+        apps.append(app);
+    }
+#else
+    Q_UNUSED(physical);
+    Q_UNUSED(apps);
+#endif
+}
+
+} // namespace
+
 void NativeHostBackend::getAppList(const QString& seatId, BackendAppListCallback cb)
 {
     Q_UNUSED(seatId);
@@ -616,9 +733,27 @@ void NativeHostBackend::getAppList(const QString& seatId, BackendAppListCallback
     // off alike: opening it is what turns it on.
     const bool virtualInstalled = VirtualDisplay::probe().installed;
     if (!caps.available) {
+        // Remote Desktop left this session with no screen, and may bring it
+        // back: "This PC's screen" is the one card, and opening it is what
+        // brings the session back (RemoteDesktopReturn).
+        if (caps.reason == mw::native::Unavailability::NoDisplay &&
+            RemoteDesktopReturn::instance().offersReturn()) {
+            cb(true, BackendError{}, {remoteDesktopReturnApp(caps)});
+            return;
+        }
+        // Or its sign-in screen is streamed instead, and the user signs in
+        // through it: "This PC's sign-in screen" is then the one card.
+        if (caps.reason == mw::native::Unavailability::NoDisplay &&
+            RemoteDesktopReturn::instance().offersSignIn()) {
+            cb(true, BackendError{}, {signInScreenApp(caps)});
+            return;
+        }
         // A machine with nothing attached and our display to offer has one
         // card; any other reason to be unavailable has none.
-        if (virtualInstalled && caps.reason == mw::native::Unavailability::NoDisplay) {
+        // Not when Remote Desktop left this session: no display reaches a
+        // disconnected session, ours included (bench of 09/11/2026).
+        if (virtualInstalled && caps.reason == mw::native::Unavailability::NoDisplay &&
+            !RemoteDesktopReturn::instance().leftByRemoteDesktop()) {
             // The owner's apps open on that same display.
             QVector<NvApp> apps;
             appendHostApps(caps, apps);
@@ -660,6 +795,7 @@ void NativeHostBackend::getAppList(const QString& seatId, BackendAppListCallback
     const QList<int> ids = displayAppIds(caps);
     QVector<NvApp> apps;
     apps.reserve(caps.displays.size() + 1);
+    QVector<NvApp> physical; // the displays' own cards, not ours nor an app's
     bool virtualListed = false;
     for (const mw::native::DisplayInfo* entry : ordered) {
         const mw::native::DisplayInfo& display = *entry;
@@ -699,7 +835,9 @@ void NativeHostBackend::getAppList(const QString& seatId, BackendAppListCallback
         addGpu(device, NativeCapabilitiesJson::displayGpu(caps, display.gpuId));
         app.setDevice(device);
         apps.append(app);
+        physical.append(app);
     }
+    appendDarkDisplays(physical, apps);
     // The owner's apps (AppSettings::hostApps), in the settings' order.
     appendHostApps(caps, apps);
     if (virtualInstalled && !virtualListed) apps.append(virtualDisplayApp(caps));
@@ -729,8 +867,19 @@ void NativeHostBackend::launch(const QString& seatId, const LaunchRequest& req,
     // A worker's display card comes resolved by the server, and an app card
     // known or not by it: this process may not read the settings the cards
     // are numbered in (LaunchRequest).
-    const int displayId = req.displayKey ? displayWithKey(caps, *req.displayKey, &why)
-                                         : displayOf(caps, req.appId, &why, req.hostAppKnown);
+    //
+    // The sign-in screen's worker streams the primary display of the session
+    // it runs in, whatever the request names: the server, in the session
+    // Remote Desktop left, sees no display at all to name.
+    int displayId = -1;
+    if (mw::native::NativeHost::signInScreenOnly()) {
+        const mw::native::DisplayInfo* primary = primaryDisplay(caps);
+        displayId = primary ? primary->id : -1;
+        if (!primary) why = QStringLiteral("The sign-in screen has no display to stream");
+    } else {
+        displayId = req.displayKey ? displayWithKey(caps, *req.displayKey, &why)
+                                   : displayOf(caps, req.appId, &why, req.hostAppKnown);
+    }
     if (displayId < 0) {
         cb(false, BackendError::make(BackendError::NotFound, why), MediaDescriptor{});
         return;

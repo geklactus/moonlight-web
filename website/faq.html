@@ -79,7 +79,7 @@
         {
           "@type": "Question",
           "name": "Can I play PC games on an iPhone or iPad?",
-          "acceptedAnswer": {"@type": "Answer", "text": "Yes — open the URL in Safari, nothing from the App Store. Your phone becomes a full client: multi-touch trackpad (1 finger aims, 2 scroll and pinch), a native virtual keyboard with modifier keys, and game controllers with rumble, at up to 240 fps with under 20 ms Wi-Fi latency."}
+          "acceptedAnswer": {"@type": "Answer", "text": "Yes — open the URL in Safari, nothing from the App Store. Your phone becomes a full client: multi-touch trackpad (1 finger aims, 2 scroll and pinch), a native virtual keyboard with modifier keys, and game controllers, at up to 120 fps with under 20 ms Wi-Fi latency."}
         },
         {
           "@type": "Question",
@@ -114,12 +114,12 @@
         {
           "@type": "Question",
           "name": "What is MWSR?",
-          "acceptedAnswer": {"@type": "Answer", "text": "MWSR (MoonlightWeb Super Resolution) is MoonlightWeb's own real-time upscaler, the one Video Enhancement runs in Auto. It rebuilds each decoded frame at your screen's size from that frame alone, in one GPU pass: no frame history and no neural network, so it adds no frame of delay and stays light enough for a phone. It sharpens edges without halos, reduces a stream larger than the screen, and works in HDR. Its code is open under the MIT License, so any program may use it. Compare it with FSR1, NIS and SGSR1 on your own GPU at https://moonlightweb.top/mwsr/."}
+          "acceptedAnswer": {"@type": "Answer", "text": "MWSR (MoonlightWeb Super Resolution) is MoonlightWeb's own real-time upscaler, the one Video Enhancement runs in Auto. It rebuilds each decoded frame at your screen's size from that frame alone, in one GPU pass: no frame history and no neural network, so it adds no frame of delay. On an iPhone 13 Pro it adds about 2 ms to a frame at most. On an entry-level phone (Mali-G57) it adds 4 ms or more, too much to hold 60 fps, so Auto leaves it off there. It sharpens edges with little halo, reduces a stream larger than the screen, and works in HDR. Its code is open under the MIT License, so any program may use it. Compare it with FSR1, NIS and SGSR1 on your own GPU at https://moonlightweb.top/mwsr/."}
         },
         {
           "@type": "Question",
           "name": "Does it work with game controllers?",
-          "acceptedAnswer": {"@type": "Answer", "text": "Yes — Xbox and PlayStation controllers work with rumble, alongside keyboard, pointer-lock mouse, touch trackpad and a virtual keyboard. Most other pads are recognized automatically, and any pad can be remapped in Settings (Switch Pro controllers: over USB). Racing wheels, flight sticks and RC radios work too: from Chrome or Edge on a computer, MoonlightWeb's own host can hand the game the real device, every axis included, with force feedback for wheels on Windows and Linux hosts."}
+          "acceptedAnswer": {"@type": "Answer", "text": "Yes — Xbox and PlayStation controllers work with rumble, alongside keyboard, pointer-lock mouse, touch trackpad and a virtual keyboard. Most other pads are recognized automatically, and any pad can be remapped in Settings (Switch Pro controllers: over USB). On a touch screen with no controller at hand, an on-screen one is built in. Racing wheels, flight sticks and RC radios work too: from Chrome or Edge on a computer, MoonlightWeb's own host can hand the game the real device, every axis included, with force feedback for wheels on Windows and Linux hosts."}
         },
         {
           "@type": "Question",
@@ -202,7 +202,7 @@
     <summary data-i18n="q5.s">Can I play PC games on an iPhone or iPad?</summary>
     <div class="a" data-i18n-html="q5.a"><p>Yes — open the URL in Safari, nothing from the App Store. Your phone becomes a full client:
       multi-touch trackpad (1 finger aims, 2 scroll &amp; pinch), a native virtual keyboard with modifier keys,
-      and game controllers with rumble — up to 240 fps with under 20 ms Wi-Fi latency.</p></div>
+      and game controllers — up to 120 fps with under 20 ms Wi-Fi latency.</p></div>
   </details>
   <details>
     <summary data-i18n="q6.s">Can I play on a smart TV?</summary>
@@ -215,7 +215,8 @@
     <summary data-i18n="q7.s">Does it work with game controllers?</summary>
     <div class="a" data-i18n-html="q7.a"><p>Yes — Xbox and PlayStation controllers work, rumble included, alongside keyboard,
       pointer-lock mouse, touch trackpad and a virtual keyboard. Most other pads are recognized automatically,
-      and any pad can be remapped in Settings (Switch Pro controllers: over USB).</p>
+      and any pad can be remapped in Settings (Switch Pro controllers: over USB). On a touch screen with no controller
+      at hand, an on-screen one is built in.</p>
       <p><a href="/controllers.html">Racing wheels, flight sticks and RC radios</a> work too: from Chrome or Edge on a
       computer, MoonlightWeb's own host can hand the game the real device, every axis included, with force feedback
       for wheels on Windows and Linux hosts.</p></div>
@@ -243,8 +244,10 @@
     <summary data-i18n="q18.s">What is MWSR?</summary>
     <div class="a" data-i18n-html="q18.a"><p>MWSR (MoonlightWeb Super Resolution) is MoonlightWeb's own real-time upscaler, the one
       Video Enhancement runs in Auto. It rebuilds each decoded frame at your screen's size from that frame alone, in one
-      GPU pass: no frame history and no neural network, so it adds no frame of delay and stays light enough for a phone.
-      It sharpens edges without halos, reduces a stream larger than the screen, and works in HDR. Its code is open under
+      GPU pass: no frame history and no neural network, so it adds no frame of delay. On an iPhone 13 Pro it adds about
+      2 ms to a frame at most. On an entry-level phone (Mali-G57) it adds 4 ms or more, too much to hold 60 fps, so Auto
+      leaves it off there.
+      It sharpens edges with little halo, reduces a stream larger than the screen, and works in HDR. Its code is open under
       the MIT License, so any program may use it. <a href="/mwsr/">Compare it with FSR1, NIS and SGSR1 on your own
       GPU</a>.</p></div>
   </details>

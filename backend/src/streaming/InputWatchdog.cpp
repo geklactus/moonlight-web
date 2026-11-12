@@ -20,6 +20,7 @@
 #include <QDebug>
 #include <QMetaObject>
 #include <QMutexLocker>
+#include <QPair>
 #include <QSet>
 #include <QThread>
 #include <QTimer>
@@ -53,6 +54,24 @@ bool InputWatchdog::noteKey(const HeldKey& key, bool down)
     }
     arm();
     return repeat;
+}
+
+bool InputWatchdog::noteChar(const QString& ch, const CharKeyHints& hints, bool down)
+{
+    if (ch.isEmpty()) return true;
+    bool forward = true;
+    {
+        QMutexLocker lock(&m_Mutex);
+        if (down) {
+            m_ReleasedChars.remove(ch);
+            m_HeldChars.insert(ch, hints);
+        } else {
+            forward = !m_ReleasedChars.remove(ch);
+            m_HeldChars.remove(ch);
+        }
+    }
+    arm();
+    return forward;
 }
 
 void InputWatchdog::noteButton(int button, bool down, bool hold)
@@ -158,8 +177,8 @@ void InputWatchdog::tick()
         release(true);
     } else if (shortFire) {
         qInfo() << "[InputWatchdog] Input link silent for" << silentMs
-                << "ms — releasing held inputs (hold-flagged ones kept)";
-        release(false);
+                << "ms — releasing held inputs (hold-flagged ones and modifiers kept)";
+        release(false, true);
     }
 }
 
@@ -171,20 +190,49 @@ void InputWatchdog::setClock(std::function<qint64()> nowMs)
 
 // --- Release and resync ------------------------------------------------------
 
-void InputWatchdog::release(bool includeHold)
+bool InputWatchdog::isModifierVk(short vk)
+{
+    switch (vk) {
+    case 0x10: // VK_SHIFT
+    case 0x11: // VK_CONTROL
+    case 0x12: // VK_MENU
+    case 0xA0: // VK_LSHIFT
+    case 0xA1: // VK_RSHIFT
+    case 0xA2: // VK_LCONTROL
+    case 0xA3: // VK_RCONTROL
+    case 0xA4: // VK_LMENU
+    case 0xA5: // VK_RMENU
+    case 0x5B: // VK_LWIN
+    case 0x5C: // VK_RWIN
+        return true;
+    default: return false;
+    }
+}
+
+void InputWatchdog::release(bool includeHold, bool keepModifiers)
 {
     QVector<HeldKey> keys;
+    QVector<QPair<QString, CharKeyHints>> chars;
     quint32 buttons = 0;
     QHash<short, short> pads;
     {
         QMutexLocker lock(&m_Mutex);
         for (auto it = m_HeldKeys.begin(); it != m_HeldKeys.end();) {
-            if (it->hold && !includeHold) {
+            if (!includeHold && (it->hold || (keepModifiers && isModifierVk(it.key())))) {
                 ++it;
                 continue;
             }
             keys.append(it.value());
             it = m_HeldKeys.erase(it);
+        }
+        for (auto it = m_HeldChars.begin(); it != m_HeldChars.end();) {
+            if (it->hold && !includeHold) {
+                ++it;
+                continue;
+            }
+            chars.append({it.key(), it.value()});
+            m_ReleasedChars.insert(it.key());
+            it = m_HeldChars.erase(it);
         }
         if (m_HeldButtons != 0 && (includeHold || !m_HeldButtonsHold)) {
             buttons = m_HeldButtons;
@@ -204,6 +252,10 @@ void InputWatchdog::release(bool includeHold)
     if (m_Sink.releaseKey) {
         for (const HeldKey& k : keys)
             m_Sink.releaseKey(k);
+    }
+    if (m_Sink.releaseChar) {
+        for (const auto& [ch, hints] : chars)
+            m_Sink.releaseChar(ch, hints);
     }
     if (m_Sink.releaseButton) {
         for (int b = 1; b <= 32; ++b) {

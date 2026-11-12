@@ -40,15 +40,21 @@ fn vs(@builtin(vertex_index) vid : u32) -> VSOut {
 struct U {
     texel : vec2f,
     scale : vec2f,
-    tau : f32,
-    sharp : f32,
-    gaze : f32,
-    pad : f32,
+    dims : vec2f,
+    across : vec2f,
+    kc : f32,
+    ft : f32,
+    kg : f32,
+    kwc : f32,
     zc : vec2f,
     zr : vec2f,
     zring : f32,
-    ztau : f32,
-    zsharp : f32,
+    zft : f32,
+    zkg : f32,
+    gaze : f32,
+    kl : f32,
+    zref : f32,
+    pad1 : f32,
     pad2 : f32,
 };
 
@@ -59,39 +65,17 @@ struct U {
 fn S(uv : vec2f) -> vec3f {
     return textureSampleLevel(tex, samp, uv, 0.0).rgb;
 }
-fn L(c : vec2i) -> vec3f {
-    return textureLoad(tex, c, 0).rgb;
-}
 
 alias hf = f32;
 alias h3 = vec3<f32>;
-const EPS_H : hf = 0.00001;
 
 override SHOW : u32 = 0u;
-override W_ALONG : f32 = 0.15;
-override W_ACROSS : f32 = 0.3;
-override R_ALONG : f32 = 0.5;
-override R_ACROSS : f32 = 1.0;
-override S_FULL : f32 = 1.5;
-override W_MIN : f32 = -0.5;
-override DERING : u32 = 2u;
 override CHROMA444 : u32 = 0u;
-override FLAT_TAPS : u32 = 5u;
-override FLAT_C : f32 = 0.5;
 override GAZE : u32 = 0u;
-override FLAT_ZONE : u32 = 0u;
 override R_DOWN : f32 = 1.0;
 override LINEAR_LIGHT : u32 = 1u;
 
 const LUMA : vec3f = vec3f(0.25, 0.625, 0.125);
-
-fn luma(c : vec3f) -> f32 {
-    return dot(c, LUMA);
-}
-
-fn lumah(c : h3) -> hf {
-    return dot(c, h3(LUMA));
-}
 
 // The sRGB transfer, both ways, for LINEAR_LIGHT 2 (the encode alone for 3);
 // past 1.0 (HDR) the same formula continues, as the renderer's HDR pass 0
@@ -131,10 +115,24 @@ fn enc(c : vec3f) -> vec3f {
 @fragment
 fn fs(in : VSOut) -> @location(0) vec4f {
     let uv = in.uv;
-    // The pixel's footprint in the input, 1 / scale texels per axis, spanned
-    // by the grid (R_DOWN 1); 1×1 samples at its 1×1 centres.
-    let span = u.texel / u.scale * R_DOWN;
-    var acc = vec3f(0.0);
-    acc += dec(S(uv + vec2f(0.0, 0.0) * span));
-    return vec4f(enc(acc * 1.0), 1.0);
+    // One sample at the pixel's centre is the whole filter.
+    let c = dec(S(uv));
+    let l = dot(sqrt(max(c, vec3f(0.0))), LUMA);
+    let g = vec2f(dpdxCoarse(l), dpdyCoarse(l));
+    if (u.kg == 0.0 || abs(g.x) + abs(g.y) < u.ft) {
+        return vec4f(enc(c), 1.0);
+    }
+    let px = u.texel / u.scale;
+    let a = dec(S(uv - vec2f(px.x, 0.0)));
+    let b = dec(S(uv + vec2f(px.x, 0.0)));
+    let d = dec(S(uv - vec2f(0.0, px.y)));
+    let e = dec(S(uv + vec2f(0.0, px.y)));
+    let mean = 0.25 * (a + b + d + e);
+    let mn = min(c, min(a, min(b, min(d, e))));
+    let mx = max(c, max(a, max(b, max(d, e))));
+    // kwc and zref: the gain and the margin at a strong edge
+    let t = smoothstep(0.2, 0.5, dot(sqrt(max(mx, vec3f(0.0))) - sqrt(max(mn, vec3f(0.0))), LUMA));
+    let R = c + mix(u.kg, u.kwc, t) * (c - mean);
+    let mg = (mx - mn) * mix(u.kl, u.zref, t);
+    return vec4f(enc(clamp(R, max(mn - mg, vec3f(0.0)), mx + mg)), 1.0);
 }

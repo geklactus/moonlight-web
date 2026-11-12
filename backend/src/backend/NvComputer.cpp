@@ -328,6 +328,14 @@ QVector<NvAddress> NvComputer::uniqueAddresses() const
     return addrs;
 }
 
+bool NvComputer::movesOnlyWithProof(const NvAddress& address) const
+{
+    if (address == activeAddress) return false;
+    if (!serverCertPem.isEmpty()) return true;
+    return !activeAddress.isNull() &&
+           (!backendApiToken.isEmpty() || !backendPairPassword.isEmpty());
+}
+
 // --- Local-machine detection ------------------------------------------------
 
 bool NvComputer::isLocalMachine() const
@@ -421,6 +429,7 @@ QJsonObject NvComputer::toJson() const
     // stored; the password only ever surfaces as a boolean.
     obj["backendPairUser"] = backendPairUser;
     obj["backendPairConfigured"] = !backendPairPassword.isEmpty();
+    obj["certificateChanged"] = certificateChanged;
 
     // A MultiSeat control API answered on this host. The UI offers its setup
     // only when this is true, which is how a plain Sunshine card stays plain

@@ -70,12 +70,20 @@ add_executable(run_tests
     test_request_guard.cpp
     test_api_csrf.cpp
     test_session_pool.cpp
+    test_loopback_key.cpp
+    test_host_backend_writes.cpp
+    test_host_cert_check.cpp
     test_port_fallback.cpp
     test_host_persistence.cpp
     test_rendezvous_id.cpp
     test_rendezvous_line.cpp
     test_address_race.cpp
+    test_relay_start.cpp
+    test_wolf_seat_pairing.cpp
+    test_nv_pairing_signature.cpp
     test_backend_probe.cpp
+    test_close_when_done_nam.cpp
+    test_viewer_notices.cpp
     test_host_os_probe.cpp
     test_send_backlog.cpp
     test_relay_frame_log.cpp
@@ -103,6 +111,7 @@ add_executable(run_tests
     test_host_lag_tracker.cpp
     test_tunnel_frame.cpp
     test_tunnel_peer_policy.cpp
+    test_tunnel_diag.cpp
     test_app_manifest.cpp
     test_wolf_coop.cpp
     test_start_choice.cpp
@@ -115,13 +124,22 @@ add_executable(run_tests
     test_keyboard_layout.cpp
     test_native_capabilities_json.cpp
     test_edition.cpp
+    test_remote_desktop_return.cpp
     test_mdns_advertiser.cpp
     test_router_port_core.cpp
     test_logger_rotation.cpp
     test_control_channel.cpp
     test_feed_ipc.cpp
     test_cert_manager.cpp
+    test_update_checker.cpp
     test_mic_uplink.cpp
+    test_phone_pairing.cpp
+    test_pair_request_routes.cpp
+    test_auth_status_route.cpp
+    test_host_key_route.cpp
+    test_pairing_chain.cpp
+    test_local_channel.cpp
+    test_host_key_vault.cpp
     # In-scope production units (+ their real deps)
     # The router-port allocation policy, behind its gateway seam: the rules
     # that keep two MoonlightWeb hosts on one LAN out of each other's holes.
@@ -129,6 +147,11 @@ add_executable(run_tests
     # Which MoonlightWeb this is: the names, ports and version a DEV build
     # must answer to so it can sit beside a production install.
     ${_src}/src/common/Edition.cpp
+    # What the tray says about who watches this screen (A137): held notices,
+    # the red dot, the recent viewers. QtCore only, without the tray itself.
+    ${_src}/src/ViewerNotices.cpp
+    # The rules of "a session left by Remote Desktop goes back to the screen".
+    ${_src}/src/streaming/RemoteDesktopReturnPolicy.cpp
     ${_src}/src/network/MdnsAdvertiser.cpp
     # The probe result as it crosses from the console session to the service.
     # Capabilities.cpp is the engine's plain-C++ enum/lookup file: no Windows
@@ -162,6 +185,18 @@ add_executable(run_tests
     ${_src}/src/server/RestRouter.cpp
     ${_src}/src/server/AppSettings.cpp
     ${_src}/src/server/AuthManager.cpp
+    # A device paired from the QR code it shows: the book of its requests, and
+    # its routes, driven without the server around them.
+    ${_src}/src/server/PhonePairing.cpp
+    ${_src}/src/server/routes/PairRequestRoutes.cpp
+    # What a browser may do here, asked before and after a PIN: the route, driven
+    # the same way.
+    ${_src}/src/server/routes/AuthStatusRoute.cpp
+    # The browser on the host machine spending the key of its owner's link: the
+    # route, driven the same way.
+    ${_src}/src/server/routes/HostKeyRoute.cpp
+    # The keys those links carry: made on demand, good once, kept in memory.
+    ${_src}/src/server/HostKeyVault.cpp
     # The local self-signed cert: its key outlives a restart (clients pin it).
     ${_src}/src/server/CertManager.cpp
     ${_src}/src/server/ConnectionGuard.cpp
@@ -172,6 +207,10 @@ add_executable(run_tests
     ${_src}/src/server/SessionPool.cpp
     # The single-tab control channel: the port it lands on when its own is taken.
     ${_src}/src/server/ControlChannel.cpp
+    # The channel to the other programs of this install: its wire, and both of
+    # its ends against each other.
+    ${_src}/src/server/LocalChannel.cpp
+    ${_src}/src/common/LoopbackKey.cpp
     ${_src}/src/common/RendezvousId.cpp
     # The host's line to the introduction server, against a local stand-in:
     # how fast it comes back when the line fails under it.
@@ -179,10 +218,13 @@ add_executable(run_tests
     # Which of the server's addresses the line opens on: the race behind it,
     # with legs the test answers by hand.
     ${_src}/src/network/AddressRace.cpp
+    # The update check: how often a client may have it look afresh.
+    ${_src}/src/network/UpdateChecker.cpp
     # The session location lookup: the request it sends, built and never sent.
     ${_src}/src/network/GeoIpService.cpp
     # Host persistence: the restart path for a paired host (issue #9).
     ${_src}/src/backend/NvComputer.cpp
+    ${_src}/src/backend/HostCertCheck.cpp
     ${_src}/src/backend/NvHTTP.cpp
     # Backend detection: what a host runs, worked out rather than asked for.
     ${_src}/src/backend/streambackend/BackendProbe.cpp
@@ -191,6 +233,11 @@ add_executable(run_tests
     # Wolf's control API: the wire shapes native co-op depends on. The selection
     # rules themselves are header-only (WolfCoop.h), so nothing else comes in.
     ${_src}/src/backend/WolfApiClient.cpp
+    # A browser's first launch on Wolf: the seat's pairing, through the real backend.
+    ${_src}/src/backend/NvPairingManager.cpp
+    ${_src}/src/backend/PairingChain.cpp
+    ${_src}/src/backend/streambackend/GameStreamBackend.cpp
+    ${_src}/src/backend/streambackend/WolfBackend.cpp
     # MultiSeat's control API: how a seat reads off the wire, and whether it can
     # be streamed. Both are pure enough to test without the service.
     ${_src}/src/backend/MultiSeatApiClient.cpp
@@ -198,6 +245,9 @@ add_executable(run_tests
     # AppSettings and AuthManager both reach into MW-BIND-v1 now: the host
     # identity key, and the pairing key bound to a session.
     ${_src}/src/common/PairingCrypto.cpp
+    # MW-TLS-v1 and MW-PIN-v1, through their very routes (test_auth_manager.cpp).
+    ${_src}/src/common/PinBinding.cpp
+    ${_src}/src/server/routes/PinProofRoutes.cpp
     # The session census: what leaves the machine, and what must not.
     ${_src}/src/network/SessionMetrics.cpp
     # The guests' shared feed: the pipe between the feed worker and theirs.
@@ -264,16 +314,18 @@ endif()
 # (once, left alone when it already is). docs/design/ice-tcp-passive.md
 find_package(Git REQUIRED)
 set(_juice ${_src}/third_party/libdatachannel/deps/libjuice)
-set(_juice_patch ${_src}/third_party/patches/libjuice-ice-tcp-passive.patch)
-execute_process(COMMAND "${GIT_EXECUTABLE}" -C "${_juice}" apply --reverse --check "${_juice_patch}"
-                RESULT_VARIABLE _juice_patched OUTPUT_QUIET ERROR_QUIET)
-if(NOT _juice_patched EQUAL 0)
-    execute_process(COMMAND "${GIT_EXECUTABLE}" -C "${_juice}" apply "${_juice_patch}"
-                    RESULT_VARIABLE _juice_failed ERROR_VARIABLE _juice_why)
-    if(NOT _juice_failed EQUAL 0)
-        message(FATAL_ERROR "libjuice-ice-tcp-passive.patch does not apply: ${_juice_why}")
+foreach(_juice_name IN ITEMS libjuice-ice-tcp-passive.patch libjuice-udp-long-datagram.patch)
+    set(_juice_patch ${_src}/third_party/patches/${_juice_name})
+    execute_process(COMMAND "${GIT_EXECUTABLE}" -C "${_juice}" apply --reverse --check "${_juice_patch}"
+                    RESULT_VARIABLE _juice_patched OUTPUT_QUIET ERROR_QUIET)
+    if(NOT _juice_patched EQUAL 0)
+        execute_process(COMMAND "${GIT_EXECUTABLE}" -C "${_juice}" apply "${_juice_patch}"
+                        RESULT_VARIABLE _juice_failed ERROR_VARIABLE _juice_why)
+        if(NOT _juice_failed EQUAL 0)
+            message(FATAL_ERROR "${_juice_name} does not apply: ${_juice_why}")
+        endif()
     endif()
-endif()
+endforeach()
 set(NO_SERVER ON CACHE BOOL "" FORCE)
 set(NO_TESTS ON CACHE BOOL "" FORCE)
 add_subdirectory(${_juice} ${CMAKE_BINARY_DIR}/libjuice EXCLUDE_FROM_ALL)

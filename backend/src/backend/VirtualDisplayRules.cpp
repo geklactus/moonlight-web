@@ -65,6 +65,7 @@ QString toString(Request::Action action)
     case Request::Action::Uninstall: return QStringLiteral("uninstall");
     case Request::Action::Activate: return QStringLiteral("activate");
     case Request::Action::Deactivate: return QStringLiteral("deactivate");
+    case Request::Action::OthersBack: return QStringLiteral("others_back");
     }
     return QString();
 }
@@ -81,8 +82,9 @@ std::optional<Request> parseRequest(const QByteArray& json, QString* error)
     Request req;
     const QString action = obj.value(QLatin1String("action")).toString();
     bool known = false;
-    for (const Request::Action a : {Request::Action::Install, Request::Action::Uninstall,
-                                    Request::Action::Activate, Request::Action::Deactivate}) {
+    for (const Request::Action a :
+         {Request::Action::Install, Request::Action::Uninstall, Request::Action::Activate,
+          Request::Action::Deactivate, Request::Action::OthersBack}) {
         if (action == toString(a)) {
             req.action = a;
             known = true;
@@ -135,6 +137,18 @@ std::optional<Request> parseRequest(const QByteArray& json, QString* error)
         }
         if (req.action == Request::Action::Activate) req.gpu = gpu.toString();
     }
+    const QJsonValue benchHdr = obj.value(QLatin1String("bench_hdr"));
+    if (!benchHdr.isUndefined() && !benchHdr.isBool()) {
+        if (error) *error = QStringLiteral("bench_hdr must be a boolean");
+        return std::nullopt;
+    }
+    req.benchHdr = req.action == Request::Action::Activate && benchHdr.toBool(false);
+    const QJsonValue benchSecondary = obj.value(QLatin1String("bench_secondary"));
+    if (!benchSecondary.isUndefined() && !benchSecondary.isBool()) {
+        if (error) *error = QStringLiteral("bench_secondary must be a boolean");
+        return std::nullopt;
+    }
+    req.benchSecondary = req.action == Request::Action::Activate && benchSecondary.toBool(false);
     return req;
 }
 
@@ -146,6 +160,30 @@ QString gpuOfSettings(const QString& xml)
     if (!m.hasMatch()) return QString();
     const QString name = m.captured(1).trimmed();
     return name.compare(QLatin1String("default"), Qt::CaseInsensitive) == 0 ? QString() : name;
+}
+
+bool othersGoOff(Asker asker, bool optionOn, bool guestOn, bool othersOff)
+{
+    return asker == Asker::Owner && optionOn && (!guestOn || othersOff);
+}
+
+bool ownerWantsOthersOff(bool allowed, bool hasChoice, bool choice, bool inherited)
+{
+    return allowed && (hasChoice ? choice : inherited);
+}
+
+QList<int> darkDisplays(const QList<int>& lit, const QList<int>& listed, bool othersOff)
+{
+    QList<int> dark;
+    if (!othersOff) return dark;
+    for (int id : lit)
+        if (!listed.contains(id) && !dark.contains(id)) dark.append(id);
+    return dark;
+}
+
+bool othersComeBack(bool ownerOn, bool othersOff)
+{
+    return othersOff && !ownerOn;
 }
 
 bool savesLayout(LayoutStep step, bool othersOff)
@@ -211,6 +249,8 @@ QByteArray toJson(const Request& req)
     if (req.refreshMilliHz > 0) obj["refresh_mhz"] = req.refreshMilliHz;
     if (req.exclusive) obj["exclusive"] = true;
     if (!req.gpu.isEmpty()) obj["gpu"] = req.gpu;
+    if (req.benchHdr) obj["bench_hdr"] = true;
+    if (req.benchSecondary) obj["bench_secondary"] = true;
     return QJsonDocument(obj).toJson(QJsonDocument::Compact);
 }
 
@@ -321,6 +361,13 @@ int refreshForStream(int streamFps, int benchHz, bool faster)
     if (faster) return kRateMax;
     if (streamFps <= 0) return 0;
     return std::min(kRateMax, std::max(kRateMin, streamFps));
+}
+
+ModeSize sizeForStream(int width, int height, bool match)
+{
+    if (width <= 0 || height <= 0) return {};
+    if (match || qint64(width) * height > qint64(kWidth) * kHeight) return {width, height};
+    return {};
 }
 
 std::optional<Result> parseResult(const QByteArray& json)

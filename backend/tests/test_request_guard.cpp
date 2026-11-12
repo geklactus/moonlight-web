@@ -141,6 +141,72 @@ void run_request_guard_tests()
     CHECK(!isLocalHostName("evil.example"));
     CHECK(!isLocalHostName("203.0.113.7"));
 
+    SECTION("RequestGuard — a request a proxy forwarded");
+
+    // Each header a reverse proxy, a CDN or a tunnel writes on the way.
+    for (const char* name :
+         {"x-forwarded-for", "x-forwarded-host", "x-forwarded-proto", "x-forwarded-server",
+          "forwarded", "x-real-ip", "via", "cf-connecting-ip", "cf-ray", "cf-visitor",
+          "true-client-ip", "x-client-ip", "x-cluster-client-ip", "fastly-client-ip",
+          "tailscale-funnel-request", "x-original-url", "x-arr-ssl"}) {
+        CHECK(forwardedByProxy(hdr({{"host", "127.0.0.1:8080"}, {name, "203.0.113.7"}})));
+    }
+    // What a browser or a script on this machine sends carries none of them.
+    CHECK(!forwardedByProxy(hdr({})));
+    CHECK(!forwardedByProxy(hdr({{"host", "localhost"},
+                                 {"sec-fetch-site", "same-origin"},
+                                 {"origin", "https://localhost"},
+                                 {"referer", "https://localhost/admin"},
+                                 {"cookie", "mw_session=abc"},
+                                 {"user-agent", "curl/8.5"}})));
+
+    // A local peer under a local name is this machine — unless a proxy stands
+    // between: the peer is then the proxy, and the caller is whoever reached it.
+    {
+        const auto local = [&](std::initializer_list<std::pair<const char*, const char*>> more) {
+            Request r;
+            r.method = "GET";
+            r.path = "/api/admin/settings";
+            r.headers = hdr({{"host", "127.0.0.1:8080"}});
+            for (const auto& kv : more)
+                r.headers[QString::fromLatin1(kv.first)] = QString::fromLatin1(kv.second);
+            Context c;
+            c.peerLocal = true;
+            return evaluate(r, c);
+        };
+        // The witness: nothing in between.
+        const Decision direct = local({});
+        CHECK(direct.outcome == Outcome::Allow);
+        CHECK(direct.localPrivilege);
+        CHECK(direct.hostMachine);
+        CHECK(direct.adminPrivilege);
+
+        for (const char* name : {"x-forwarded-for", "x-real-ip", "forwarded", "via",
+                                 "cf-connecting-ip", "x-forwarded-proto"}) {
+            const Decision proxied = local({{name, "203.0.113.7"}});
+            CHECK(proxied.outcome == Outcome::Allow); // served, as any visitor is
+            CHECK(!proxied.localPrivilege);
+            CHECK(!proxied.hostMachine);
+            CHECK(!proxied.adminPrivilege);
+        }
+
+        // The host's own browser behind such a proxy keeps what its session is
+        // worth: the header takes the address away, not the session.
+        {
+            Request r;
+            r.method = "GET";
+            r.path = "/api/admin/settings";
+            r.headers = hdr({{"host", "127.0.0.1:8080"}, {"x-forwarded-for", "192.168.1.9"}});
+            Context c;
+            c.peerLocal = true;
+            c.hostSession = true;
+            const Decision d = evaluate(r, c);
+            CHECK(!d.localPrivilege);
+            CHECK(d.hostMachine);
+            CHECK(d.adminPrivilege);
+        }
+    }
+
     SECTION("RequestGuard — body content type");
 
     CHECK(isBodyContentTypeAllowed("application/json", 12));
@@ -509,8 +575,17 @@ void run_request_guard_tests()
     CHECK(lockedByNoAdmin("POST", "/api/auth/validate"));
     CHECK(lockedByNoAdmin("POST", "/api/auth/admin-unlock"));
     CHECK(lockedByNoAdmin("POST", "/api/auth/regenerate"));
+    CHECK(lockedByNoAdmin("POST", "/api/auth/pin/start"));
+    CHECK(lockedByNoAdmin("POST", "/api/auth/pin/finish"));
     CHECK(lockedByNoAdmin("POST", "/api/share/slots/2/activate"));
     CHECK(lockedByNoAdmin("POST", "/api/share/player/pin"));
+    // Nor by the QR code a device shows: its request, its claim, the answer.
+    CHECK(lockedByNoAdmin("POST", "/api/auth/pair-request"));
+    CHECK(lockedByNoAdmin("POST", "/api/auth/pair-request/AbCdEfGhIjKlMnOp/claim"));
+    CHECK(lockedByNoAdmin("POST", "/api/auth/pair-request/AbCdEfGhIjKlMnOp/approve"));
+    CHECK(lockedByNoAdmin("POST", "/api/auth/pair-request/AbCdEfGhIjKlMnOp/refuse"));
+    CHECK(lockedByNoAdmin("POST", "/api/auth/pair-request/AbCdEfGhIjKlMnOp/approve", true));
+    CHECK(!lockedByNoAdmin("GET", "/api/auth/pair-request/AbCdEfGhIjKlMnOp"));
 
     // What the booth is for, allowed: read, wake, play, stop, leave.
     CHECK(!lockedByNoAdmin("GET", "/api/hosts"));
@@ -534,10 +609,128 @@ void run_request_guard_tests()
     CHECK(lockedByNoAdmin("POST", "/api/auth/validate", true));
     CHECK(lockedByNoAdmin("POST", "/api/auth/admin-unlock", true));
     CHECK(lockedByNoAdmin("POST", "/api/auth/regenerate", true));
+    CHECK(lockedByNoAdmin("POST", "/api/auth/pin/start", true));
     CHECK(lockedByNoAdmin("POST", "/api/hosts/manual", true));
     CHECK(lockedByNoAdmin("POST", "/api/hosts/uuid-1/pair", true));
     CHECK(lockedByNoAdmin("POST", "/api/update/start", true));
     CHECK(lockedByNoAdmin("POST", "/api/system/restart", true));
+
+    SECTION("RequestGuard — the local channel is the host machine by its door, not by a name");
+
+    {
+        // What the channel hands over: no Host, no cookie, no address that is
+        // this machine's, no admin key. It is the host machine and may
+        // administer, writes included.
+        Request r;
+        r.method = "POST";
+        r.path = "/api/admin/pin/generate";
+        r.headers = hdr({{"content-type", "application/json"}});
+        r.bodySize = 2;
+        Context c;
+        c.localChannel = true;
+        const Decision d = evaluate(r, c);
+        CHECK(d.outcome == Outcome::Allow);
+        CHECK(d.localPrivilege);
+        CHECK(d.hostMachine);
+        CHECK(d.adminPrivilege);
+        CHECK(!d.hostUntrusted);
+
+        // The witness: the same request without the channel is nobody's.
+        Context plain;
+        const Decision without = evaluate(r, plain);
+        CHECK(without.outcome == Outcome::Allow);
+        CHECK(!without.localPrivilege);
+        CHECK(!without.hostMachine);
+        CHECK(!without.adminPrivilege);
+
+        // Nothing a request carries moves it either way: a foreign Host, a
+        // forwarding header. Its privilege is the channel's alone.
+        r.headers = hdr({{"content-type", "application/json"},
+                         {"host", "evil.example"},
+                         {"x-forwarded-for", "203.0.113.7"}});
+        const Decision odd = evaluate(r, c);
+        CHECK(odd.hostMachine);
+        CHECK(odd.adminPrivilege);
+        CHECK(!odd.hostUntrusted);
+
+        // --noadmin: still the host machine, and nobody administers.
+        Context booth;
+        booth.localChannel = true;
+        booth.adminLocked = true;
+        const Decision locked = evaluate(r, booth);
+        CHECK(locked.hostMachine);
+        CHECK(!locked.adminPrivilege);
+        r.method = "GET";
+        CHECK(!evaluate(r, booth).adminPrivilege);
+
+        // The two checks every request goes through are kept as they are: a
+        // body is JSON and says so, and another site's page is refused.
+        Request untyped;
+        untyped.method = "POST";
+        untyped.path = "/api/admin/pin/generate";
+        untyped.bodySize = 2;
+        CHECK(evaluate(untyped, c).outcome == Outcome::BlockContentType);
+        Request crossSite;
+        crossSite.method = "GET";
+        crossSite.path = "/api/server/status";
+        crossSite.headers = hdr({{"sec-fetch-site", "cross-site"}});
+        const Decision refused = evaluate(crossSite, c);
+        CHECK(refused.outcome == Outcome::BlockCrossSite);
+        CHECK(!refused.hostMachine);
+        CHECK(!refused.adminPrivilege);
+    }
+
+    // What may be asked over the channel: the routes of the tray icon, the
+    // command line and a second launch, each with its verb.
+    CHECK(localChannelRoute("GET", "/api/health"));
+    CHECK(localChannelRoute("GET", "/api/server/status"));
+    CHECK(localChannelRoute("GET", "/api/server/remote-link"));
+    CHECK(localChannelRoute("GET", "/api/server/stream-activity"));
+    CHECK(localChannelRoute("GET", "/api/setup/status"));
+    CHECK(localChannelRoute("GET", "/api/auth/status"));
+    CHECK(localChannelRoute("GET", "/api/internet/status"));
+    CHECK(localChannelRoute("GET", "/api/internet/upnp-probe"));
+    CHECK(localChannelRoute("POST", "/api/internet/enable"));
+    CHECK(localChannelRoute("GET", "/api/settings/streaming"));
+    CHECK(localChannelRoute("POST", "/api/settings/streaming"));
+    CHECK(localChannelRoute("POST", "/api/admin/pin/generate"));
+    CHECK(localChannelRoute("POST", "/api/admin/password"));
+    CHECK(localChannelRoute("POST", "/api/system/restart"));
+    CHECK(localChannelRoute("POST", "/api/system/quit"));
+    CHECK(localChannelRoute("POST", "/api/local/focus"));
+
+    // And nothing else. The other verb of a listed route.
+    CHECK(!localChannelRoute("POST", "/api/health"));
+    CHECK(!localChannelRoute("GET", "/api/admin/pin/generate"));
+    CHECK(!localChannelRoute("DELETE", "/api/settings/streaming"));
+    CHECK(!localChannelRoute("get", "/api/health"));
+    // A stream, a host, a pairing, a session, a key: none of this channel's business.
+    CHECK(!localChannelRoute("POST", "/api/hosts/uuid-1/start"));
+    CHECK(!localChannelRoute("GET", "/api/hosts"));
+    CHECK(!localChannelRoute("POST", "/api/hosts/manual"));
+    CHECK(!localChannelRoute("POST", "/api/auth/validate"));
+    CHECK(!localChannelRoute("POST", "/api/auth/host-key"));
+    CHECK(!localChannelRoute("POST", "/api/auth/pairing-key"));
+    CHECK(!localChannelRoute("GET", "/api/admin/token"));
+    CHECK(!localChannelRoute("GET", "/api/admin/settings"));
+    CHECK(!localChannelRoute("POST", "/api/admin/settings"));
+    CHECK(!localChannelRoute("GET", "/api/auth/sessions"));
+    CHECK(!localChannelRoute("POST", "/api/share/slots/2/activate"));
+    CHECK(!localChannelRoute("POST", "/api/update/start"));
+    CHECK(!localChannelRoute("GET", "/api/logs/download"));
+    // Not a page, not a file, not a socket.
+    CHECK(!localChannelRoute("GET", "/"));
+    CHECK(!localChannelRoute("GET", "/admin"));
+    CHECK(!localChannelRoute("GET", "/index.html"));
+    CHECK(!localChannelRoute("GET", "/ws"));
+    CHECK(!localChannelRoute("GET", "/ws/control"));
+    // The exact path: nothing under it, beside it or written another way.
+    CHECK(!localChannelRoute("GET", "/api/health/"));
+    CHECK(!localChannelRoute("GET", "/api/health/x"));
+    CHECK(!localChannelRoute("GET", "/api/server/status/../../admin/token"));
+    CHECK(!localChannelRoute("GET", "/API/HEALTH"));
+    CHECK(!localChannelRoute("GET", "/api/healthz"));
+    CHECK(!localChannelRoute("GET", ""));
 
     SECTION("RequestGuard — a session on another browser's key");
 
@@ -558,5 +751,24 @@ void run_request_guard_tests()
         CHECK(!tunnelKeyRefused(false, QByteArray(), keyA));
         // A signalling socket opened through the tunnel carries the key alone.
         CHECK(tunnelKeyRefused(false, keyB, keyA));
+    }
+
+    SECTION("RequestGuard — the admin key matches itself, and nothing else");
+
+    {
+        const QByteArray key("0123456789abcdef0123456789abcdef");
+        CHECK(secretMatches(key, key));
+        CHECK(!secretMatches(QByteArray("0123456789abcdef0123456789abcdee"), key));
+        CHECK(!secretMatches(key.left(31), key));
+        CHECK(!secretMatches(QByteArray(), key));
+        // Longer by any amount is another key, whatever the extra bytes are.
+        for (int extra : {1, 255, 256, 512}) {
+            CHECK(!secretMatches(key + QByteArray(extra, '\0'), key));
+            CHECK(!secretMatches(key + QByteArray(extra, 'x'), key));
+        }
+        CHECK(!secretMatches(key, key + QByteArray(256, '\0')));
+        // No key set: nothing matches, not even nothing.
+        CHECK(!secretMatches(QByteArray(), QByteArray()));
+        CHECK(!secretMatches(key, QByteArray()));
     }
 }

@@ -12,12 +12,19 @@
 > **23/10/2026** : « go » de B0 (Bruno), en attendant que l'UM790Pro sous
 > Windows soit libre (invitations spectateur jusqu'au 24/10 au soir, puis le
 > banc N95). Protocole au §10.3 ; rien n'est lancé.
+> **04/11/2026** : **produit clos par Bruno** (§0, §13). Ce document reste comme
+> trace. Une mesure sans Booster en sort pour la v0.4.2 (§16).
 >
 > Légende : **[D]** fait documenté (source officielle, §14) ; **[C]** constat du
 > code ou des bancs de ce dépôt (chemin ou section cités) ; **[H]** hypothèse à
 > mesurer.
 
 ## 0. Verdict
+
+**Clos le 04/11/2026, décision de Bruno : le Booster ne se fera pas.** Au clic →
+photon, B0 n'a rien trouvé à reprendre en SDR (§10.4). Les intérêts hors latence,
+rejugés le 04/11 (§9.3), ne paient pas son coût. B0 en HDR n'a pas été mesuré et
+ne le sera pas. La suite de ce verdict est celle de l'étude, gardée telle quelle.
 
 **Faisable sous une seule forme, et pas celle qu'on imagine d'abord.**
 
@@ -543,6 +550,35 @@ une même configuration peut changer de marche d'une passe à l'autre [C,
 - Moins de travail sur le fil principal de la page : le décodage et le dessin
   sortent du fil principal (aujourd'hui les deux y sont [C]).
 
+**Rejugé le 04/11/2026, sans banc : aucun de ces intérêts ne justifie le
+Booster.** Sonde locale de `VideoDecoder.isConfigSupported`, décodage matériel
+coupé, sans rien décoder [C] :
+
+| Accepté en logiciel | Chrome 156 | Firefox 158 |
+|---|---|---|
+| H.264 High | oui | oui |
+| H.264 High 4:4:4 | oui | non |
+| HEVC, Main à RExt 4:4:4 | non | non |
+| AV1 Main, 8 et 10 bits | oui | oui |
+| AV1 High 4:4:4, 8 et 10 bits | oui | non |
+
+Firefox répond aussi oui à `prefer-hardware` avec le matériel coupé : sa réponse
+ne prouve pas un décodage matériel. Son HEVC avec le matériel actif n'est pas
+sondé ; au champ, il a échoué sur l'UM790Pro le 28/10 [C, `CodecAuto.js`].
+
+- **HEVC sous Firefox** : l'AV1 existe déjà dans le navigateur, sans rien
+  installer (§16). Sous Windows, qui accepte d'installer un programme peut aussi
+  prendre Chrome.
+- **Décodage matériel sous Chrome Linux** : la superposition est impossible sous
+  GNOME Wayland (§7.3), et moonlight-qt couvre déjà Sunshine. L'état réel de
+  VA-API en 2026 n'est ni tranché par les sources ni mesuré ici [H].
+- **4:4:4** : le 8 bits passe déjà sur RTX (wiki, ch. 15 §15.6). L'AV1 4:4:4
+  manque à l'encodeur (NVENC), et un Booster n'y change rien. Reste le 10 bits,
+  vert sous Chrome Windows : une niche.
+- **HDR natif** : seule inconnue mesurable, B0 étant en SDR. Aucun client natif
+  n'a été mesuré en HDR. Même avec un gain, les coûts du §11 resteraient, pour les
+  seuls joueurs HDR sous Windows : ce banc ne sera pas fait.
+
 ### 9.4 Risques de régression
 
 - **Chrome se croit masqué** et ralentit la page : entrées et transport
@@ -837,6 +873,10 @@ version de navigateur peut casser la superposition ou le canal.
 
 ## 13. Décisions pour Bruno
 
+**Clos le 04/11/2026** : « Produit Web Booster => A » (Bruno). Les décisions 2 à
+10 ci-dessous n'ont plus d'objet. Il reste une seule suite, hors Booster : « Auto
+en AV1 quand le HEVC échoue => B », à mesurer pour la v0.4.2 (§16).
+
 1. ~~**Ouvrir B0** après la v0.4.0~~ — faite le 24/10/2026, non franchie (§10.4) :
    l'écart vu côté hôte natif n'a pas été reproduit le soir même (§10.4) ;
    rien à loger dans les plans de l'hôte.
@@ -942,3 +982,115 @@ Ce que le projet ne règle pas : le Wi-Fi, l'encodage sur l'hôte, les
 téléphones, les tablettes et les TV, et les bureaux Linux GNOME. Et il peut
 très bien s'arrêter à sa première mesure, si un client natif ne fait pas
 mieux que la page.
+
+**C'est ce qui s'est passé (04/11/2026).** Le projet est clos : il n'y aura rien
+à installer. MoonlightWeb reste une page, et elle réagit aussi vite qu'un client
+natif sur le banc mesuré, en SDR.
+
+## 16. Hors Booster : Auto en AV1 quand le HEVC échoue (protocole, v0.4.2)
+
+**Rien n'est lancé ni codé** : le créneau vient de 59.
+
+**La question.** Quand le HEVC échoue dans un navigateur, Auto demande le H.264
+dès le lancement suivant (`autoLaunchCodec`). L'AV1 serait-il meilleur à sa place,
+sans coûter en réactivité ? Les deux codecs se choisissent déjà dans le menu : le
+banc ne demande aucun code.
+
+**Le montage.** Hôte natif sur DualRTX, NVENC, instance `--dev` avec
+`MW_LAN_ONLY=1`. Un seul facteur bouge : le codec. Le débit est fixé à la main,
+le même pour les deux bras, à la valeur d'Auto relue à la passe préalable. Son
+coupé sur le client, aucun mode d'écran touché, aucun drapeau de débogage laissé.
+
+| Cas | Client | Ce qu'il représente | Réglages | Passes |
+|---|---|---|---|---|
+| C1 | Firefox sur l'UM790Pro sous Windows | le cas vu le 28/10 | 1080p120 et 1440p60 | 8 |
+| C2 | Firefox sur le N95 | le processeur faible, le cas limite | 1080p60 | 4 |
+| C3 | Chrome sur l'UM790Pro, `--disable-accelerated-video-decode` | Chrome Linux sans VA-API, **par approximation** | 1080p120 | 4 |
+
+C3 tourne sous Windows, car `click-photon.ps1` n'existe que là : il dit le coût du
+décodage logiciel, pas le comportement réel de Chrome sous Linux. Le vrai Linux
+reste à lire au moment d'activer, sur l'UM790Pro sous Ubuntu.
+
+**Les passes.** 270 clics chacune, soit un tour de phase entre DualRTX et
+l'UM790Pro (≈ 3 min 10). Le tour change avec la paire d'écrans : il se relit à la
+première passe du N95, et la passe s'allonge s'il est plus long. Bras alternés,
+ABAB, sur deux manches. Lecture par la moyenne, avec médiane et p95.
+
+**Ce qui est relevé à chaque passe.**
+- clic → photon (`click-photon.ps1`) ;
+- le décodeur vraiment utilisé (overlay, `frame.format`), car la réponse de
+  Firefox à `prefer-hardware` n'en est pas une preuve (§9.3) ;
+- processeur du client, en cœurs ;
+- images perdues ou répétées, retard qui s'accumule (`docs/bench-campaign.md`
+  a déjà vu l'AV1 logiciel accumuler des secondes).
+
+**La qualité, à part.** Un clip de jeu déjà au banc, cadence réelle relue, encodé
+hors stream en `h264_nvenc` et `av1_nvenc` (réglages à faible latence, proches de
+ceux de l'hôte sans être les siens), au débit d'Auto et à sa moitié, puis comparé
+en VMAF NEG (ffmpeg déjà installé sur DualRTX). Sur la RTX du bus 01, créneau de
+59. Environ 15 min.
+
+**Les portes, confirmées par Bruno le 04/11/2026** (« Portes du banc Auto en AV1
+=> A »). L'AV1 remplace le H.264 dans Auto seulement si, pour C1, C2 et C3 :
+1. le surcoût reste dans le seuil que Bruno a fixé le 26/10 pour l'AV1 en HDR :
+   médiane +5 ms, p95 +10 ms, 2 cœurs au plus, à chaque réglage ;
+2. pas plus d'images perdues qu'en H.264, et aucun retard qui s'accumule ;
+3. VMAF NEG gagne au moins 3 points à l'un des deux débits : sans gain visible,
+   changer de codec n'apporte rien.
+
+Si C2 échoue seul, l'AV1 ne peut pas être réservé aux machines à décodeur
+matériel sur la seule foi de `isConfigSupported` : ce serait une autre décision,
+à prendre avec ses mesures.
+
+**Durée.** Environ 2 h : 20 min de mise en place, 16 passes (≈ 1 h 10 avec les
+lancements), 15 min de qualité, le reste en marge et en rangement.
+
+**Machines et présence.** DualRTX (hôte, RTX du bus 01 pour la qualité), UM790Pro
+sous Windows, N95. Bruno n'a pas à être là, et mieux vaut qu'il ne se serve pas de
+DISPLAY5, où tombent les clics. Il intervient seulement pour redémarrer l'UM790Pro
+sous Windows s'il est sous Ubuntu, taper la règle de pare-feu du N95 si elle
+manque, et lire le verdict. Règles du N95 : 8 connexions ssh par série, présence
+lue avant chaque passe.
+
+**Résultats du 07/11/2026** (créneau de 59, 16:18-18:00, Bruno absent). Hôte natif
+sur DualRTX, une seule `--dev` en `MW_LAN_ONLY=1`, aucune ligne `[UPNP]`. Écart au
+protocole : le drapeau était sur l'**écran virtuel** de la carte Virtual Display, et
+non sur un écran physique (règle de 59 : aucun écran physique filmé). Débit fixé à la
+valeur d'Auto, relue au journal de l'hôte : 40 Mbit/s en 1080p120, 36 en 1440p60, 20
+en 1080p60. Passes de 270 clics, ABAB, aucune perte de clic hors 2 sur 540 (C3,
+H.264). Moyennes sur 540 clics par bras :
+
+| Cas | H.264 moy. / méd. / p95 | AV1 moy. / méd. / p95 | AV1 − H.264 (moy.) |
+|---|---|---|---|
+| C1, Firefox UM790Pro, 1080p120 | 55,6 / 57,3 / 67,1 | 49,3 / 49,4 / 58,6 | −6,3 ms |
+| C1, Firefox UM790Pro, 1440p60 | 65,5 / 66,0 / 75,8 | 55,4 / 57,5 / 61,0 | −10,1 ms |
+| C2, Firefox N95, 1080p60 | 83,8 / 84,2 / 99,5 | 80,8 / 82,5 / 93,2 | −3,0 ms |
+| C3, Chrome UM790Pro sans décodage matériel, 1080p120 | 41,0 / 41,4 / 49,7 | 32,6 / 32,6 / 40,6 | −8,4 ms |
+
+- **Porte 1 tenue partout, et dans l'autre sens :** l'AV1 est plus rapide que le
+  H.264 dans les quatre cas, d'environ une image à 120 Hz sur l'UM790Pro. Les
+  moyennes par passe d'un même bras restent à 4 ms près. La cause n'est pas
+  mesurée [H] : un décodeur H.264 logiciel qui garde une image de plus.
+- **Processeur du client** : 0,2 à 0,4 cœur pendant les clics, l'image n'étant que
+  le drapeau. Avec le clip de jeu joué sur l'écran virtuel (45 s, sans clics) :
+  N95 1,20 cœur en H.264 et 1,33 en AV1 ; Chrome UM790Pro logiciel 1,13 et 1,39.
+  Sous 2 cœurs. Pas de passe de charge pour C1 : son Firefox était déjà rangé.
+- **Porte 2** : aucun clic perdu en AV1, aucune dérive qui s'accumule (fin de passe
+  moins début, entre −2,3 et +2,2 ms en AV1 ; jusqu'à ±7 ms en H.264 à 60 Hz, la
+  phase des écrans). Les images perdues ou répétées de la page ne sont pas relevées.
+- **Décodeur réel sous Firefox : non prouvé.** La page demande `prefer-hardware`.
+  Le compteur « Video Decode » du GPU de l'UM790Pro n'a rien vu pendant 20 s d'une
+  passe sur le drapeau, qui ne donne que 2 images/s : ce n'est pas une preuve.
+- **Porte 3, qualité** (cod.webm, 20 s en 1080p60, NVENC de la RTX du bus 01, CBR,
+  P1, ULL, sans image B) : VMAF NEG H.264 98,6 et AV1 99,1 à 20 Mbit/s (+0,5) ;
+  94,8 et 97,8 à 10 Mbit/s (**+2,97**). AV1 a aussi dépensé 11 % de bits en moins
+  à 10 Mbit/s (8,9 contre 10,0). **La porte, à 3 points, n'est pas franchie de
+  0,03 point.** Le clip est facile : les deux codecs sont hauts.
+
+**Lecture.** Les portes 1 et 2 sont tenues. La porte 3 manque de 0,03 point à
+10 Mbit/s, avec 11 % de bits en moins pour l'AV1. **À trancher par Bruno** :
+(A) l'AV1 remplace le H.264 dans Auto quand le HEVC échoue,
+puisqu'il est aussi plus rapide au clic ; (B) on s'en tient à la porte : H.264 ;
+(C) une passe de qualité de plus, sur un clip plus dur, avant de décider.
+Limites : un seul hôte (NVENC), un clip, écran virtuel côté hôte, frontend de
+l'arbre partagé à `fcf0af2b` avec des changements d'autres sessions non commités.

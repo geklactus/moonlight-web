@@ -207,6 +207,18 @@ NativeMediaEngine::NativeMediaEngine(QObject* parent)
         event.activeGamepadMask = static_cast<uint16_t>(mask);
         m_Session->sendInput(event);
     };
+    sink.releaseChar = [this](const QString& ch, const CharKeyHints& hints) {
+        if (!m_Session) return;
+        // The release the client would have sent, its press's hints with it:
+        // the platform lets go of the key that press went down on.
+        mw::native::InputEvent event;
+        event.type = mw::native::InputEvent::Type::CharUp;
+        event.text = ch.toStdString();
+        event.chord = hints.chord;
+        event.keyCode = hints.positionVk;
+        event.altGraph = hints.altGraph;
+        m_Session->sendInput(event);
+    };
     m_Watchdog = new InputWatchdog(std::move(sink), this);
 }
 
@@ -219,6 +231,8 @@ NativeMediaEngine::~NativeMediaEngine()
 
 void NativeMediaEngine::startCapture(const StartParams& params)
 {
+    m_FpsLimit = params.fpsLimit > 0 ? params.fpsLimit : 0;
+    m_BitrateLimitKbps = params.bitrateLimitKbps > 0 ? params.bitrateLimitKbps : 0;
     // A guest on the shared feed captures nothing: its pictures come down the
     // feed's pipe, its session is input and audio.
     if (!params.feedPipe.isEmpty()) {
@@ -234,6 +248,7 @@ void NativeMediaEngine::startCapture(const StartParams& params)
     config.maxFps = params.maxFps;
     config.bitrateKbps = params.bitrateKbps;
     config.clientCodecs = codecsFromMask(params.clientVideoFormats);
+    config.codecAuto = params.codecAuto;
     config.hdr = params.hdr;
     config.yuv444 = params.yuv444;
     config.intraRefresh = params.intraRefresh;
@@ -253,6 +268,17 @@ void NativeMediaEngine::startCapture(const StartParams& params)
                                          VirtualDisplay::kFasterThanStream);
     config.allowElevatedInput = params.viewerAdmin;
     config.muteHostAudio = params.muteHostAudio;
+    config.audioSource = mw::native::parseAudioSource(params.audioSource);
+    config.onAudioAppChanged = params.onAudioAppChanged;
+    // Arrives on a ViGEm thread, as rumble does: queued to the engine's own.
+    config.onPadNumber = [this](uint8_t controllerNumber, int hostNumber) {
+        QMetaObject::invokeMethod(
+            this,
+            [this, controllerNumber, hostNumber]() {
+                emit padPlayer(controllerNumber, hostNumber);
+            },
+            Qt::QueuedConnection);
+    };
     // The consent this machine was already given, replayed. Empty on the very
     // first session of an install that captures through the portal, which is
     // the one time the user sees a dialog.
@@ -507,6 +533,8 @@ void NativeMediaEngine::startSubscriber(const StartParams& params)
     config.externalBottom = feed.desktopBottom;
     config.allowElevatedInput = params.viewerAdmin;
     config.muteHostAudio = params.muteHostAudio;
+    config.audioSource = mw::native::parseAudioSource(params.audioSource);
+    config.onAudioAppChanged = params.onAudioAppChanged;
 
     std::string error;
     m_Session = mw::native::NativeHost::createSession(
@@ -1077,6 +1105,18 @@ mw::native::FpsStep NativeMediaEngine::setClientFpsStep(int fps)
         refused.why = m_Subscriber ? "the shared feed keeps its pace" : "no session";
         return refused;
     }
+    // The administrator's frame rate (settings.json max_allowed_frame_rate):
+    // a step goes no higher, and none at all when the stream is there already.
+    if (m_FpsLimit > 0 && fps > m_FpsLimit) {
+        const int base = m_Session->cadenceStatus().baseFps;
+        if (base > 0 && m_FpsLimit <= base) {
+            mw::native::FpsStep refused;
+            refused.askedFps = fps;
+            refused.why = "the administrator's frame-rate limit";
+            return refused;
+        }
+        fps = m_FpsLimit;
+    }
     return m_Session->setClientFpsStep(fps);
 }
 
@@ -1108,6 +1148,8 @@ void NativeMediaEngine::setClientBitrate(int kbps)
         qWarning() << "[NativeMediaEngine] Ignoring a client bitrate of" << kbps << "kbps";
         return;
     }
+    // Nor above the administrator's (settings.json max_allowed_bitrate).
+    if (m_BitrateLimitKbps > 0 && kbps > m_BitrateLimitKbps) kbps = m_BitrateLimitKbps;
     if (m_Session) m_Session->setTargetBitrate(kbps);
 }
 
@@ -1249,6 +1291,7 @@ void NativeMediaEngine::sendKeyEvent(short keyCode, bool down, char modifiers, c
     event.modifiersKnown = true;
     event.keyFlags = static_cast<uint8_t>(flags);
     event.hold = hold;
+    event.gaming = keyFromGamingMode();
     HeldKey k;
     k.keyCode = keyCode;
     k.modifiers = modifiers;
@@ -1282,8 +1325,11 @@ void NativeMediaEngine::sendKeyChar(const QString& ch, bool down, char modifiers
     // The one host where a character can stay a real key: the platform layer
     // resolves it in the machine's own layout and presses THAT key, so the
     // scancode is real and Raw Input, DirectInput and typematic all still see
-    // it. Deliberately outside the watchdog — a re-press of a character during
-    // a stall would type it again rather than re-assert it.
+    // it. The watchdog lets go of it as of a key, on a silent link or a policy
+    // change, but never presses it again: a re-press of a character after a
+    // stall would type it once more rather than re-assert it. Its key-up after
+    // that has nothing left to let go of, and goes no further.
+    if (!m_Watchdog->noteChar(ch, hints, down)) return;
     mw::native::InputEvent event;
     event.type =
         down ? mw::native::InputEvent::Type::CharDown : mw::native::InputEvent::Type::CharUp;

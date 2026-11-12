@@ -46,9 +46,10 @@
  *   refuses them. On the float canvas (HDR `linear`) the YUV pass 0 writes the
  *   linear light itself for a reduction, which the views' grids filter and
  *   encode at the output (LINEAR_LIGHT 3, journal J47); a frame that pass did
- *   not take keeps the software light. The f16 module (`half`) runs
- *   where the adapter has shader-f16 and is not NVIDIA's: 9-10 % off the
- *   kernel on the AMD iGPU for the same pixels, nothing on the RTX (P2.3).
+ *   not take keeps the software light. The kernel runs its f32 text on every
+ *   GPU. Its f16 text (`half`) is left to the lab and the comparison page,
+ *   whose reports time it on the visitors' GPUs: it takes 11-15 % less on the
+ *   9900X's Radeon and 7-9 % more on a 780M at a held clock (journal, 04/11).
  *
  * mwsr 2 and 3 (opts.deblock 'fixed' or 'qp': the debug menu's « MoonlightWeb
  *   2 » and « 3 », never 'auto'): the same kernel after a deblocking of the
@@ -107,6 +108,7 @@ import { fitOutputSize, isIdentityScale } from './scaleRegime.js';
 import {
     MWSR_UNIFORM_FLOATS,
     mwsrClassOverrides,
+    mwsrDownConstants,
     mwsrRegime,
     mwsrRegimeKey,
     mwsrRegimes,
@@ -506,8 +508,11 @@ fn fs(in : VSOut) -> @location(0) vec4f {
 
 // NIS — NVIDIA Image Scaling (NVScaler, SDK 1.0.3, MIT). WGSL transcription of
 // the GLSL port in WebGlRenderer.js, itself the per-fragment form of the SDK's
-// compute shader. Arrays travel by pointer (function address space) so the 36
-// luma samples are gathered once per fragment and read in place.
+// compute shader. Written out, with no array, pointer or loop: WebKit keeps an
+// array indexed in a loop in memory, and the form with the 36 luma samples in
+// one ran 5.6 times slower on an iPhone (37 ms a draw against 6.6, 1080p to
+// 1440p). The arithmetic is the SDK's, in the same order, and the picture the
+// same to the bit.
 const NIS_WGSL =
     FULLSCREEN_VS +
     /* wgsl */ `
@@ -524,29 +529,17 @@ struct NisUniforms {
 @group(0) @binding(3) var<uniform> u : NisUniforms;
 
 const kPhaseCount : i32 = 64;
-alias Luma36 = array<f32, 36>;
-alias Taps6 = array<f32, 6>;
 
 fn getY(c : vec3f) -> f32 { return 0.2126 * c.r + 0.7152 * c.g + 0.0722 * c.b; }
-fn coefScaler(phase : i32, i : i32) -> f32 {
-    let v = textureLoad(coefTex, vec2<i32>(i >> 2u, phase), 0);
-    return v[i & 3];
-}
-fn coefUSM(phase : i32, i : i32) -> f32 {
-    let v = textureLoad(coefTex, vec2<i32>(2 + (i >> 2u), phase), 0);
-    return v[i & 3];
-}
-fn lumaAt(c : vec2<i32>) -> f32 {
-    let mx = vec2<i32>(textureDimensions(inputTex)) - vec2<i32>(1);
+fn lumaAt(c : vec2<i32>, mx : vec2<i32>) -> f32 {
     return getY(textureLoad(inputTex, clamp(c, vec2<i32>(0), mx), 0).rgb);
 }
-fn P(p : ptr<function, Luma36>, i : i32, j : i32) -> f32 { return (*p)[i * 6 + j]; }
-
-fn getEdgeMap(p : ptr<function, Luma36>, i : i32, j : i32) -> vec4f {
-    let g_0 = abs(P(p, 0 + i, 0 + j) + P(p, 0 + i, 1 + j) + P(p, 0 + i, 2 + j) - P(p, 2 + i, 0 + j) - P(p, 2 + i, 1 + j) - P(p, 2 + i, 2 + j));
-    let g_45 = abs(P(p, 1 + i, 0 + j) + P(p, 0 + i, 0 + j) + P(p, 0 + i, 1 + j) - P(p, 2 + i, 1 + j) - P(p, 2 + i, 2 + j) - P(p, 1 + i, 2 + j));
-    let g_90 = abs(P(p, 0 + i, 0 + j) + P(p, 1 + i, 0 + j) + P(p, 2 + i, 0 + j) - P(p, 0 + i, 2 + j) - P(p, 1 + i, 2 + j) - P(p, 2 + i, 2 + j));
-    let g_135 = abs(P(p, 1 + i, 0 + j) + P(p, 2 + i, 0 + j) + P(p, 2 + i, 1 + j) - P(p, 0 + i, 1 + j) - P(p, 0 + i, 2 + j) - P(p, 1 + i, 2 + j));
+// The edge map of the 3x3 block e00..e22, its rows then its columns.
+fn getEdgeMap(e00 : f32, e01 : f32, e02 : f32, e10 : f32, e11 : f32, e12 : f32, e20 : f32, e21 : f32, e22 : f32) -> vec4f {
+    let g_0 = abs(e00 + e01 + e02 - e20 - e21 - e22);
+    let g_45 = abs(e10 + e00 + e01 - e21 - e22 - e12);
+    let g_90 = abs(e00 + e10 + e20 - e02 - e12 - e22);
+    let g_135 = abs(e10 + e20 + e21 - e01 - e02 - e12);
     let g_0_90_max = max(g_0, g_90);
     let g_0_90_min = min(g_0, g_90);
     let g_45_135_max = max(g_45, g_135);
@@ -582,96 +575,34 @@ fn calcLTI(p0 : f32, p1 : f32, p2 : f32, p3 : f32, p4 : f32, p5 : f32, phase_ind
     return (1.0 - saturate((cont_ratio - u.detect.z) * u.detect.w)) * u.sharpA.x;
 }
 
-fn evalPoly6(pxl : ptr<function, Taps6>, phase_int : i32) -> f32 {
+// The six taps across one direction: the scaler's bank (texels 0 and 1 of the
+// phase's row) and the USM's (texels 2 and 3), each read once.
+fn evalPoly6(t0 : f32, t1 : f32, t2 : f32, t3 : f32, t4 : f32, t5 : f32, phase_int : i32) -> f32 {
+    let a = textureLoad(coefTex, vec2<i32>(0, phase_int), 0);
+    let b = textureLoad(coefTex, vec2<i32>(1, phase_int), 0);
+    let ua = textureLoad(coefTex, vec2<i32>(2, phase_int), 0);
+    let ub = textureLoad(coefTex, vec2<i32>(3, phase_int), 0);
     var y = 0.0;
-    for (var i = 0; i < 6; i++) { y += coefScaler(phase_int, i) * (*pxl)[i]; }
+    y += a.x * t0;
+    y += a.y * t1;
+    y += a.z * t2;
+    y += a.w * t3;
+    y += b.x * t4;
+    y += b.y * t5;
     var y_usm = 0.0;
-    for (var i = 0; i < 6; i++) { y_usm += coefUSM(phase_int, i) * (*pxl)[i]; }
+    y_usm += ua.x * t0;
+    y_usm += ua.y * t1;
+    y_usm += ua.z * t2;
+    y_usm += ua.w * t3;
+    y_usm += ub.x * t4;
+    y_usm += ub.y * t5;
     let y_scale = 1.0 - saturate((y - u.sharpA.z) * u.sharpA.w);
     let y_sharpness = y_scale * u.sharpB.y + u.sharpB.x;
     y_usm *= y_sharpness;
     let y_sharpness_limit = (y_scale * u.sharpB.w + u.sharpB.z) * y;
     y_usm = min(y_sharpness_limit, max(-y_sharpness_limit, y_usm));
-    y_usm *= calcLTI((*pxl)[0], (*pxl)[1], (*pxl)[2], (*pxl)[3], (*pxl)[4], (*pxl)[5], phase_int);
+    y_usm *= calcLTI(t0, t1, t2, t3, t4, t5, phase_int);
     return y + y_usm;
-}
-
-fn filterNormal(p : ptr<function, Luma36>, phase_x_frac_int : i32, phase_y_frac_int : i32) -> f32 {
-    var h_acc = 0.0;
-    for (var j = 0; j < 6; j++) {
-        var v_acc = 0.0;
-        for (var i = 0; i < 6; i++) { v_acc += P(p, i, j) * coefScaler(phase_y_frac_int, i); }
-        h_acc += v_acc * coefScaler(phase_x_frac_int, j);
-    }
-    return h_acc;
-}
-
-fn addDirFilters(p : ptr<function, Luma36>, phase_x_frac : f32, phase_y_frac : f32,
-                 phase_x_frac_int : i32, phase_y_frac_int : i32, w : vec4f) -> f32 {
-    var f = 0.0;
-    if (w.x > 0.0) {
-        var interp0Deg : Taps6;
-        for (var i = 0; i < 6; i++) { interp0Deg[i] = mix(P(p, i, 2), P(p, i, 3), phase_x_frac); }
-        f += evalPoly6(&interp0Deg, phase_y_frac_int) * w.x;
-    }
-    if (w.y > 0.0) {
-        var interp90Deg : Taps6;
-        for (var i = 0; i < 6; i++) { interp90Deg[i] = mix(P(p, 2, i), P(p, 3, i), phase_y_frac); }
-        f += evalPoly6(&interp90Deg, phase_x_frac_int) * w.y;
-    }
-    if (w.z > 0.0) {
-        var pphase_b45 = 0.5 + 0.5 * (phase_x_frac - phase_y_frac);
-        var temp : array<f32, 7>;
-        temp[1] = mix(P(p, 2, 1), P(p, 1, 2), pphase_b45);
-        temp[3] = mix(P(p, 3, 2), P(p, 2, 3), pphase_b45);
-        temp[5] = mix(P(p, 4, 3), P(p, 3, 4), pphase_b45);
-        pphase_b45 = pphase_b45 - 0.5;
-        let pos = pphase_b45 >= 0.0;
-        let a = select(P(p, 2, 0), P(p, 0, 2), pos);
-        let b = select(P(p, 3, 1), P(p, 1, 3), pos);
-        let c = select(P(p, 4, 2), P(p, 2, 4), pos);
-        let d = select(P(p, 5, 3), P(p, 3, 5), pos);
-        temp[0] = mix(P(p, 1, 1), a, abs(pphase_b45));
-        temp[2] = mix(P(p, 2, 2), b, abs(pphase_b45));
-        temp[4] = mix(P(p, 3, 3), c, abs(pphase_b45));
-        temp[6] = mix(P(p, 4, 4), d, abs(pphase_b45));
-        var interp45Deg : Taps6;
-        var pphase_p45 = phase_x_frac + phase_y_frac;
-        if (pphase_p45 >= 1.0) {
-            for (var i = 0; i < 6; i++) { interp45Deg[i] = temp[i + 1]; }
-            pphase_p45 = pphase_p45 - 1.0;
-        } else {
-            for (var i = 0; i < 6; i++) { interp45Deg[i] = temp[i]; }
-        }
-        f += evalPoly6(&interp45Deg, min(i32(pphase_p45 * 64.0), 63)) * w.z;
-    }
-    if (w.w > 0.0) {
-        var pphase_b135 = 0.5 * (phase_x_frac + phase_y_frac);
-        var temp : array<f32, 7>;
-        temp[1] = mix(P(p, 3, 1), P(p, 4, 2), pphase_b135);
-        temp[3] = mix(P(p, 2, 2), P(p, 3, 3), pphase_b135);
-        temp[5] = mix(P(p, 1, 3), P(p, 2, 4), pphase_b135);
-        pphase_b135 = pphase_b135 - 0.5;
-        let pos = pphase_b135 >= 0.0;
-        let a = select(P(p, 3, 0), P(p, 5, 2), pos);
-        let b = select(P(p, 2, 1), P(p, 4, 3), pos);
-        let c = select(P(p, 1, 2), P(p, 3, 4), pos);
-        let d = select(P(p, 0, 3), P(p, 2, 5), pos);
-        temp[0] = mix(P(p, 4, 1), a, abs(pphase_b135));
-        temp[2] = mix(P(p, 3, 2), b, abs(pphase_b135));
-        temp[4] = mix(P(p, 2, 3), c, abs(pphase_b135));
-        temp[6] = mix(P(p, 1, 4), d, abs(pphase_b135));
-        var interp135Deg : Taps6;
-        var pphase_p135 = 1.0 + (phase_x_frac - phase_y_frac);
-        if (pphase_p135 >= 1.0) {
-            for (var i = 0; i < 6; i++) { interp135Deg[i] = temp[i + 1]; }
-            pphase_p135 = pphase_p135 - 1.0;
-        } else {
-            for (var i = 0; i < 6; i++) { interp135Deg[i] = temp[i]; }
-        }
-        f += evalPoly6(&interp135Deg, min(i32(pphase_p135 * 64.0), 63)) * w.w;
-    }
-    return f;
 }
 
 @fragment
@@ -682,21 +613,161 @@ fn fs(in : VSOut) -> @location(0) vec4f {
     let fr = src - fsrc;
     let fi = min(vec2<i32>(fr * f32(kPhaseCount)), vec2<i32>(kPhaseCount - 1));
     let s = vec2<i32>(fsrc);
+    let mx = vec2<i32>(textureDimensions(inputTex)) - vec2<i32>(1);
 
-    var p : Luma36;
-    for (var i = 0; i < 6; i++) {
-        for (var j = 0; j < 6; j++) { p[i * 6 + j] = lumaAt(s + vec2<i32>(j - 2, i - 2)); }
-    }
+    // The 6x6 window of luma: pRC at row R and column C, from -2 to +3 around
+    // the source texel.
+    let p00 = lumaAt(s + vec2<i32>(-2, -2), mx);
+    let p01 = lumaAt(s + vec2<i32>(-1, -2), mx);
+    let p02 = lumaAt(s + vec2<i32>(0, -2), mx);
+    let p03 = lumaAt(s + vec2<i32>(1, -2), mx);
+    let p04 = lumaAt(s + vec2<i32>(2, -2), mx);
+    let p05 = lumaAt(s + vec2<i32>(3, -2), mx);
+    let p10 = lumaAt(s + vec2<i32>(-2, -1), mx);
+    let p11 = lumaAt(s + vec2<i32>(-1, -1), mx);
+    let p12 = lumaAt(s + vec2<i32>(0, -1), mx);
+    let p13 = lumaAt(s + vec2<i32>(1, -1), mx);
+    let p14 = lumaAt(s + vec2<i32>(2, -1), mx);
+    let p15 = lumaAt(s + vec2<i32>(3, -1), mx);
+    let p20 = lumaAt(s + vec2<i32>(-2, 0), mx);
+    let p21 = lumaAt(s + vec2<i32>(-1, 0), mx);
+    let p22 = lumaAt(s + vec2<i32>(0, 0), mx);
+    let p23 = lumaAt(s + vec2<i32>(1, 0), mx);
+    let p24 = lumaAt(s + vec2<i32>(2, 0), mx);
+    let p25 = lumaAt(s + vec2<i32>(3, 0), mx);
+    let p30 = lumaAt(s + vec2<i32>(-2, 1), mx);
+    let p31 = lumaAt(s + vec2<i32>(-1, 1), mx);
+    let p32 = lumaAt(s + vec2<i32>(0, 1), mx);
+    let p33 = lumaAt(s + vec2<i32>(1, 1), mx);
+    let p34 = lumaAt(s + vec2<i32>(2, 1), mx);
+    let p35 = lumaAt(s + vec2<i32>(3, 1), mx);
+    let p40 = lumaAt(s + vec2<i32>(-2, 2), mx);
+    let p41 = lumaAt(s + vec2<i32>(-1, 2), mx);
+    let p42 = lumaAt(s + vec2<i32>(0, 2), mx);
+    let p43 = lumaAt(s + vec2<i32>(1, 2), mx);
+    let p44 = lumaAt(s + vec2<i32>(2, 2), mx);
+    let p45 = lumaAt(s + vec2<i32>(3, 2), mx);
+    let p50 = lumaAt(s + vec2<i32>(-2, 3), mx);
+    let p51 = lumaAt(s + vec2<i32>(-1, 3), mx);
+    let p52 = lumaAt(s + vec2<i32>(0, 3), mx);
+    let p53 = lumaAt(s + vec2<i32>(1, 3), mx);
+    let p54 = lumaAt(s + vec2<i32>(2, 3), mx);
+    let p55 = lumaAt(s + vec2<i32>(3, 3), mx);
 
-    let e00 = getEdgeMap(&p, 1, 1);
-    let e01 = getEdgeMap(&p, 1, 2);
-    let e10 = getEdgeMap(&p, 2, 1);
-    let e11 = getEdgeMap(&p, 2, 2);
+    let e00 = getEdgeMap(p11, p12, p13, p21, p22, p23, p31, p32, p33);
+    let e01 = getEdgeMap(p12, p13, p14, p22, p23, p24, p32, p33, p34);
+    let e10 = getEdgeMap(p21, p22, p23, p31, p32, p33, p41, p42, p43);
+    let e11 = getEdgeMap(p22, p23, p24, p32, p33, p34, p42, p43, p44);
     let w = mix(mix(e00, e01, fr.x), mix(e10, e11, fr.x), fr.y);
 
     let baseWeight = 1.0 - w.x - w.y - w.z - w.w;
-    var opY = filterNormal(&p, fi.x, fi.y) * baseWeight;
-    opY += addDirFilters(&p, fr.x, fr.y, fi.x, fi.y, w);
+
+    // filterNormal: each column down, then across.
+    let ya = textureLoad(coefTex, vec2<i32>(0, fi.y), 0);
+    let yb = textureLoad(coefTex, vec2<i32>(1, fi.y), 0);
+    let xa = textureLoad(coefTex, vec2<i32>(0, fi.x), 0);
+    let xb = textureLoad(coefTex, vec2<i32>(1, fi.x), 0);
+    var h_acc = 0.0;
+    var v_acc = 0.0;
+    v_acc = 0.0;
+    v_acc += p00 * ya.x;
+    v_acc += p10 * ya.y;
+    v_acc += p20 * ya.z;
+    v_acc += p30 * ya.w;
+    v_acc += p40 * yb.x;
+    v_acc += p50 * yb.y;
+    h_acc += v_acc * xa.x;
+    v_acc = 0.0;
+    v_acc += p01 * ya.x;
+    v_acc += p11 * ya.y;
+    v_acc += p21 * ya.z;
+    v_acc += p31 * ya.w;
+    v_acc += p41 * yb.x;
+    v_acc += p51 * yb.y;
+    h_acc += v_acc * xa.y;
+    v_acc = 0.0;
+    v_acc += p02 * ya.x;
+    v_acc += p12 * ya.y;
+    v_acc += p22 * ya.z;
+    v_acc += p32 * ya.w;
+    v_acc += p42 * yb.x;
+    v_acc += p52 * yb.y;
+    h_acc += v_acc * xa.z;
+    v_acc = 0.0;
+    v_acc += p03 * ya.x;
+    v_acc += p13 * ya.y;
+    v_acc += p23 * ya.z;
+    v_acc += p33 * ya.w;
+    v_acc += p43 * yb.x;
+    v_acc += p53 * yb.y;
+    h_acc += v_acc * xa.w;
+    v_acc = 0.0;
+    v_acc += p04 * ya.x;
+    v_acc += p14 * ya.y;
+    v_acc += p24 * ya.z;
+    v_acc += p34 * ya.w;
+    v_acc += p44 * yb.x;
+    v_acc += p54 * yb.y;
+    h_acc += v_acc * xb.x;
+    v_acc = 0.0;
+    v_acc += p05 * ya.x;
+    v_acc += p15 * ya.y;
+    v_acc += p25 * ya.z;
+    v_acc += p35 * ya.w;
+    v_acc += p45 * yb.x;
+    v_acc += p55 * yb.y;
+    h_acc += v_acc * xb.y;
+    var opY = h_acc * baseWeight;
+
+    // addDirFilters: the four directions the edge map weighs.
+    var f = 0.0;
+    if (w.x > 0.0) {
+        f += evalPoly6(mix(p02, p03, fr.x), mix(p12, p13, fr.x), mix(p22, p23, fr.x), mix(p32, p33, fr.x), mix(p42, p43, fr.x), mix(p52, p53, fr.x), fi.y) * w.x;
+    }
+    if (w.y > 0.0) {
+        f += evalPoly6(mix(p20, p30, fr.y), mix(p21, p31, fr.y), mix(p22, p32, fr.y), mix(p23, p33, fr.y), mix(p24, p34, fr.y), mix(p25, p35, fr.y), fi.x) * w.y;
+    }
+    if (w.z > 0.0) {
+        var pphase_b45 = 0.5 + 0.5 * (fr.x - fr.y);
+        let q1 = mix(p21, p12, pphase_b45);
+        let q3 = mix(p32, p23, pphase_b45);
+        let q5 = mix(p43, p34, pphase_b45);
+        pphase_b45 = pphase_b45 - 0.5;
+        let pos = pphase_b45 >= 0.0;
+        let a = select(p20, p02, pos);
+        let b = select(p31, p13, pos);
+        let c = select(p42, p24, pos);
+        let d = select(p53, p35, pos);
+        let q0 = mix(p11, a, abs(pphase_b45));
+        let q2 = mix(p22, b, abs(pphase_b45));
+        let q4 = mix(p33, c, abs(pphase_b45));
+        let q6 = mix(p44, d, abs(pphase_b45));
+        var pphase_p45 = fr.x + fr.y;
+        let up = pphase_p45 >= 1.0;
+        if (up) { pphase_p45 = pphase_p45 - 1.0; }
+        f += evalPoly6(select(q0, q1, up), select(q1, q2, up), select(q2, q3, up), select(q3, q4, up), select(q4, q5, up), select(q5, q6, up), min(i32(pphase_p45 * 64.0), 63)) * w.z;
+    }
+    if (w.w > 0.0) {
+        var pphase_b135 = 0.5 * (fr.x + fr.y);
+        let q1 = mix(p31, p42, pphase_b135);
+        let q3 = mix(p22, p33, pphase_b135);
+        let q5 = mix(p13, p24, pphase_b135);
+        pphase_b135 = pphase_b135 - 0.5;
+        let pos = pphase_b135 >= 0.0;
+        let a = select(p30, p52, pos);
+        let b = select(p21, p43, pos);
+        let c = select(p12, p34, pos);
+        let d = select(p03, p25, pos);
+        let q0 = mix(p41, a, abs(pphase_b135));
+        let q2 = mix(p32, b, abs(pphase_b135));
+        let q4 = mix(p23, c, abs(pphase_b135));
+        let q6 = mix(p14, d, abs(pphase_b135));
+        var pphase_p135 = 1.0 + (fr.x - fr.y);
+        let up = pphase_p135 >= 1.0;
+        if (up) { pphase_p135 = pphase_p135 - 1.0; }
+        f += evalPoly6(select(q0, q1, up), select(q1, q2, up), select(q2, q3, up), select(q3, q4, up), select(q4, q5, up), select(q5, q6, up), min(i32(pphase_p135 * 64.0), 63)) * w.w;
+    }
+    opY += f;
 
     let coord = (src + 0.5) * u.scale.zw;
     let op = textureSampleLevel(inputTex, samp, coord, 0.0);
@@ -1043,8 +1114,6 @@ export class WebGpuRenderer extends VideoRenderer {
         this._passthrough = false;
         /** 4:4:4 stream: mwsr votes and sharpens per channel (CHROMA444). */
         this._yuv444 = false;
-        /** mwsr's f16 module: shader-f16 granted (asked for off NVIDIA). */
-        this._mwsrHalf = false;
         /** SDR: inputTex and the canvas carry `-srgb` view formats (mwsr's reduction). */
         this._srgbViews = false;
         /** HDR `linear`: mwsr's reduction takes the linear light pass 0 writes for it
@@ -1110,7 +1179,7 @@ export class WebGpuRenderer extends VideoRenderer {
         // ── Steps that may fail on unsupported platforms — BEFORE getContext ──
         const adapter = await navigator.gpu.requestAdapter();
         if (!adapter) throw new Error('WebGPU requestAdapter returned null');
-        const device = await WebGpuRenderer._requestDevice(adapter);
+        const device = await adapter.requestDevice();
 
         const r = new WebGpuRenderer();
         r.canvas = canvas;
@@ -1133,7 +1202,6 @@ export class WebGpuRenderer extends VideoRenderer {
         r._zoneMap = opts.zoneMap === true;
         // The eye test's split screen (BrowserDetect.mwsrSplitWanted).
         if (opts.mwsrSplit) r.setMwsrSplit(opts.mwsrSplit);
-        r._mwsrHalf = device.features.has('shader-f16');
         // HDR: rgba16float canvas in extended tone-mapping mode (values > 1.0
         // map to the display's HDR headroom). Gated on opts.hdr; _configure()
         // self-downgrades to SDR if the browser rejects the HDR canvas config.
@@ -1188,6 +1256,8 @@ export class WebGpuRenderer extends VideoRenderer {
         r._lostFrames = 0;
         r._framesOnDevice = 0;
         r._failed = false;
+        // The pipelines the device refused, and why (see _watchPipeline).
+        r._refused = new Map();
         r._drawCount = 0;
         r._drawErrors = new Set();
         r._adapter = adapter;
@@ -1217,8 +1287,6 @@ export class WebGpuRenderer extends VideoRenderer {
                 r._hdrLinear +
                 ' hdrExtTonemap=' +
                 r._hdrExtTonemap +
-                ' half=' +
-                r._mwsrHalf +
                 ' srgbViews=' +
                 r._srgbViews +
                 ' yuv444=' +
@@ -1229,27 +1297,6 @@ export class WebGpuRenderer extends VideoRenderer {
                 r._zoneMap,
         );
         return r;
-    }
-
-    /**
-     * The device, with shader-f16 where the adapter has it and is not
-     * NVIDIA's: mwsr's f16 module took 9-10 % off the kernel on the AMD iGPU
-     * for the same pixels and nothing on the RTX (upscaler-mwsr-p2.md §3), and
-     * a feature granted costs nothing to the other passes. A device refused
-     * with it is asked for bare; the kernel then runs in f32.
-     * @param {GPUAdapter} adapter
-     * @returns {Promise<GPUDevice>}
-     */
-    static async _requestDevice(adapter) {
-        const vendor = String((adapter.info && adapter.info.vendor) || '').toLowerCase();
-        if (adapter.features.has('shader-f16') && vendor !== 'nvidia') {
-            try {
-                return await adapter.requestDevice({ requiredFeatures: ['shader-f16'] });
-            } catch (e) {
-                console.warn('[WebGpuRenderer] shader-f16 refused, f32 kernel: ' + e.message);
-            }
-        }
-        return await adapter.requestDevice();
     }
 
     get ready() {
@@ -1484,7 +1531,7 @@ export class WebGpuRenderer extends VideoRenderer {
             ],
         });
         const blitModule = device.createShaderModule({ code: BLIT_WGSL });
-        this._blitPipeline = device.createRenderPipeline({
+        this._blitPipeline = this._renderPipeline({
             layout: device.createPipelineLayout({ bindGroupLayouts: [this._blitLayout] }),
             vertex: { module: blitModule, entryPoint: 'vs' },
             fragment: {
@@ -1562,11 +1609,11 @@ export class WebGpuRenderer extends VideoRenderer {
         this._dbPipelines = {
             dctLayout,
             finLayout,
-            dct: device.createComputePipeline({
+            dct: this._computePipeline({
                 layout: device.createPipelineLayout({ bindGroupLayouts: [dctLayout] }),
                 compute: { module: dct, entryPoint: 'cs' },
             }),
-            fin: device.createRenderPipeline({
+            fin: this._renderPipeline({
                 layout: device.createPipelineLayout({ bindGroupLayouts: [finLayout] }),
                 vertex: { module: fin, entryPoint: 'vs' },
                 fragment: {
@@ -1710,13 +1757,12 @@ export class WebGpuRenderer extends VideoRenderer {
         const module = this._device.createShaderModule({
             code: mwsrWgsl({
                 feed: 'tex',
-                half: this._mwsrHalf,
                 mode: reg.mode,
                 taps: reg.taps,
                 map,
             }),
         });
-        pipeline = this._device.createRenderPipeline({
+        pipeline = this._renderPipeline({
             layout: map ? this._mwsrMapPipelineLayout : this._mwsrPipelineLayout,
             vertex: { module, entryPoint: 'vs' },
             fragment: {
@@ -1730,7 +1776,7 @@ export class WebGpuRenderer extends VideoRenderer {
                               ...MWSR_CLASS,
                               ...(this._mwsrOverrides || {}),
                           }
-                        : { R_DOWN: reg.rDown, LINEAR_LIGHT: reg.linearLight },
+                        : mwsrDownConstants(reg),
                 targets: [{ format: srgb ? this._format + '-srgb' : this._format }],
             },
             primitive: { topology: 'triangle-list' },
@@ -1744,7 +1790,7 @@ export class WebGpuRenderer extends VideoRenderer {
     _buildPassthroughResources() {
         const device = this._device;
         const blitModule = device.createShaderModule({ code: BLIT_WGSL });
-        this._passthroughPipeline = device.createRenderPipeline({
+        this._passthroughPipeline = this._renderPipeline({
             layout: device.createPipelineLayout({ bindGroupLayouts: [this._blitLayout] }),
             vertex: { module: blitModule, entryPoint: 'vs' },
             fragment: { module: blitModule, entryPoint: 'fs', targets: [{ format: this._format }] },
@@ -1759,7 +1805,7 @@ export class WebGpuRenderer extends VideoRenderer {
             ],
         });
         const texModule = device.createShaderModule({ code: BLIT_TEX_WGSL });
-        this._texBlitPipeline = device.createRenderPipeline({
+        this._texBlitPipeline = this._renderPipeline({
             layout: device.createPipelineLayout({ bindGroupLayouts: [this._texBlitLayout] }),
             vertex: { module: texModule, entryPoint: 'vs' },
             fragment: { module: texModule, entryPoint: 'fs', targets: [{ format: this._format }] },
@@ -1792,7 +1838,7 @@ export class WebGpuRenderer extends VideoRenderer {
             ],
         });
         const sgsrModule = device.createShaderModule({ code: SGSR_WGSL });
-        this._enhancePipeline = device.createRenderPipeline({
+        this._enhancePipeline = this._renderPipeline({
             layout: device.createPipelineLayout({ bindGroupLayouts: [this._enhanceLayout] }),
             vertex: { module: sgsrModule, entryPoint: 'vs' },
             fragment: { module: sgsrModule, entryPoint: 'fs', targets: [{ format: this._format }] },
@@ -1838,7 +1884,7 @@ export class WebGpuRenderer extends VideoRenderer {
             ],
         });
         const nisModule = device.createShaderModule({ code: NIS_WGSL });
-        this._nisPipeline = device.createRenderPipeline({
+        this._nisPipeline = this._renderPipeline({
             layout: device.createPipelineLayout({ bindGroupLayouts: [this._nisLayout] }),
             vertex: { module: nisModule, entryPoint: 'vs' },
             fragment: { module: nisModule, entryPoint: 'fs', targets: [{ format: this._format }] },
@@ -1872,7 +1918,7 @@ export class WebGpuRenderer extends VideoRenderer {
             bindGroupLayouts: [this._fsrLayout],
         });
         const easuModule = device.createShaderModule({ code: EASU_WGSL });
-        this._easuPipeline = device.createRenderPipeline({
+        this._easuPipeline = this._renderPipeline({
             layout: fsrPipelineLayout,
             vertex: { module: easuModule, entryPoint: 'vs_main' },
             fragment: {
@@ -1883,7 +1929,7 @@ export class WebGpuRenderer extends VideoRenderer {
             primitive: { topology: 'triangle-list' },
         });
         const rcasModule = device.createShaderModule({ code: RCAS_WGSL });
-        this._rcasPipeline = device.createRenderPipeline({
+        this._rcasPipeline = this._renderPipeline({
             layout: fsrPipelineLayout,
             vertex: { module: rcasModule, entryPoint: 'vs_main' },
             fragment: {
@@ -1917,7 +1963,7 @@ export class WebGpuRenderer extends VideoRenderer {
         // pass at 1:1). One pipeline serves both when the formats agree.
         const layout = device.createPipelineLayout({ bindGroupLayouts: [this._extLayout] });
         const build = (format) =>
-            device.createRenderPipeline({
+            this._renderPipeline({
                 layout,
                 vertex: { module: mod, entryPoint: 'vs' },
                 fragment: { module: mod, entryPoint: 'fs', targets: [{ format }] },
@@ -1971,7 +2017,7 @@ export class WebGpuRenderer extends VideoRenderer {
         // format differs on the SDR tone-map path. One pipeline when they agree.
         const layout = device.createPipelineLayout({ bindGroupLayouts: [this._yuvLayout] });
         const build = (format) =>
-            device.createRenderPipeline({
+            this._renderPipeline({
                 layout,
                 vertex: { module: mod, entryPoint: 'vs' },
                 fragment: { module: mod, entryPoint: 'fs', targets: [{ format }] },
@@ -2297,7 +2343,7 @@ export class WebGpuRenderer extends VideoRenderer {
         });
         if (!this._texPass0Pipeline) {
             const module = device.createShaderModule({ code: BLIT_TEX_WGSL });
-            this._texPass0Pipeline = device.createRenderPipeline({
+            this._texPass0Pipeline = this._renderPipeline({
                 layout: device.createPipelineLayout({ bindGroupLayouts: [this._texBlitLayout] }),
                 vertex: { module, entryPoint: 'vs' },
                 fragment: { module, entryPoint: 'fs', targets: [{ format: this._interFormat }] },
@@ -2331,8 +2377,7 @@ export class WebGpuRenderer extends VideoRenderer {
             const adapter = await navigator.gpu.requestAdapter();
             if (!adapter) throw new Error('no adapter on recovery');
             this._adapter = adapter;
-            this._device = await WebGpuRenderer._requestDevice(adapter);
-            this._mwsrHalf = this._device.features.has('shader-f16');
+            this._device = await adapter.requestDevice();
             this._framesOnDevice = 0;
             this._armDeviceLost();
             this._configure();
@@ -2353,11 +2398,11 @@ export class WebGpuRenderer extends VideoRenderer {
     }
 
     /**
-     * The mwsr kernel's per-draw values (MwsrShader's MWSR_UNIFORMS: the
-     * vote threshold `tau`, the sharpness `sharp`), for the laboratory's
-     * side-by-side viewer; the product draws with the defaults. Takes effect
-     * at the next draw.
-     * @param {{tau?: number, sharp?: number}|null} tuning null: the defaults
+     * The mwsr kernel's per-draw values (MwsrShader's mwsrLaw: the vote
+     * threshold `ft`, the sharpness `kg` and the others), for the laboratory's
+     * side-by-side viewer; the product draws with the law. Takes effect at the
+     * next draw.
+     * @param {{ft?: number, kg?: number}|null} tuning null: the law
      */
     setMwsrTuning(tuning) {
         this._mwsrTuning = tuning || null;
@@ -2366,7 +2411,7 @@ export class WebGpuRenderer extends VideoRenderer {
 
     /**
      * The mwsr kernel's pipeline constants of the `up` mode beyond the
-     * product's (MwsrShader's MWSR_OVERRIDE_SPEC: FLAT_TAPS, FLAT_C…), for
+     * product's (MwsrShader's MWSR_OVERRIDE_SPEC: SHOW, CHROMA444…), for
      * the laboratory's side-by-side viewer, over the device class's
      * (mwsrClassOverrides), the only ones the product sets. A changed set
      * drops the kernel's pipelines, rebuilt at the next draw.
@@ -2385,7 +2430,7 @@ export class WebGpuRenderer extends VideoRenderer {
      * zone's values over the defaults, the kernel's pipelines built with
      * GAZE 1 and its weight following the stream's motion (noteEncodedFrame,
      * GazeZone) unless setMwsrGaze pins it.
-     * @param {{cx?: number, cy?: number, rx?: number, ry?: number, ring?: number, tau?: number, sharp?: number}|null} zone
+     * @param {{cx?: number, cy?: number, rx?: number, ry?: number, ring?: number, ft?: number, boost?: number}|null} zone
      */
     setMwsrZone(zone) {
         const next = zone ? { ...zone } : null;
@@ -2464,7 +2509,7 @@ export class WebGpuRenderer extends VideoRenderer {
         const device = this._device;
         if (!this._splitPipeline) {
             const module = device.createShaderModule({ code: SPLIT_WGSL });
-            this._splitPipeline = device.createRenderPipeline({
+            this._splitPipeline = this._renderPipeline({
                 layout: 'auto',
                 vertex: { module, entryPoint: 'vs' },
                 fragment: { module, entryPoint: 'fs', targets: [{ format: this._format }] },
@@ -2511,13 +2556,13 @@ export class WebGpuRenderer extends VideoRenderer {
         });
         for (const grid of [true, false]) {
             const p = encoder.beginRenderPass(target(this._splitTex.views[grid ? 0 : 1]));
-            p.setPipeline(this._mwsrPipeline(reg, grid));
+            this._setPipeline(p, this._mwsrPipeline(reg, grid));
             p.setBindGroup(0, grid ? this._mwsrMapGroup(input) : lawGroup);
             p.draw(3);
             p.end();
         }
         const p = encoder.beginRenderPass(target(canvasTex.createView()));
-        p.setPipeline(this._splitPipeline);
+        this._setPipeline(p, this._splitPipeline);
         p.setBindGroup(0, this._splitGroup);
         p.draw(3);
         p.end();
@@ -2822,6 +2867,61 @@ export class WebGpuRenderer extends VideoRenderer {
             );
     }
 
+    /** A render pipeline, its refusal kept (see _watchPipeline). */
+    _renderPipeline(desc) {
+        return this._watchPipeline(() => this._device.createRenderPipeline(desc));
+    }
+
+    /** A compute pipeline, its refusal kept (see _watchPipeline). */
+    _computePipeline(desc) {
+        return this._watchPipeline(() => this._device.createComputePipeline(desc));
+    }
+
+    /**
+     * Create one pipeline and keep the device's refusal of it, if it comes. A
+     * refused pipeline draws nothing and tells the frame nothing: submit and
+     * onSubmittedWorkDone succeed, so _noteFrame counts the frame as drawn
+     * (WebKit, iOS 26.5, 04/11/2026). Nothing else happens here: most of the
+     * pipelines built are not for this frame's pass. See _setPipeline.
+     * @template T
+     * @param {function(): T} create
+     * @returns {T}
+     */
+    _watchPipeline(create) {
+        const device = this._device;
+        device.pushErrorScope('validation');
+        device.pushErrorScope('internal');
+        let pipeline;
+        try {
+            pipeline = create();
+        } finally {
+            Promise.all([device.popErrorScope(), device.popErrorScope()]).then(
+                ([internal, validation]) => {
+                    const error = internal || validation;
+                    if (!error || !pipeline) return;
+                    this._refused.set(pipeline, error.message);
+                    // The scope took it from the console's uncaptured errors.
+                    console.warn('[WebGpuRenderer] a pipeline was refused: ' + error.message);
+                },
+                () => {}, // the device is gone, which device.lost handles
+            );
+        }
+        return pipeline;
+    }
+
+    /**
+     * Set a frame's pass on its pipeline. If the device refused that pipeline
+     * (_watchPipeline), the renderer gives up, for the page to move the picture
+     * (Bruno, 04/11/2026: to the pass's WebGL2 twin rather than stay black).
+     * @param {GPURenderPassEncoder|GPUComputePassEncoder} pass
+     * @param {GPURenderPipeline|GPUComputePipeline} pipeline
+     */
+    _setPipeline(pass, pipeline) {
+        const refused = this._refused.get(pipeline);
+        if (refused !== undefined) this._giveUp('its pass uses a refused pipeline: ' + refused);
+        pass.setPipeline(pipeline);
+    }
+
     /** See VideoRenderer.failed: once, and said in the console. */
     _giveUp(why) {
         if (this._failed) return;
@@ -2980,7 +3080,7 @@ export class WebGpuRenderer extends VideoRenderer {
                             },
                         ],
                     });
-                    p0.setPipeline(this._yuvPipeline);
+                    this._setPipeline(p0, this._yuvPipeline);
                     p0.setBindGroup(0, this._yuvBindGroup);
                     p0.draw(3);
                     p0.end();
@@ -2996,19 +3096,22 @@ export class WebGpuRenderer extends VideoRenderer {
                     ],
                 });
                 if (yuvScaled) {
-                    pass.setPipeline(this._texBlitPipeline);
+                    this._setPipeline(pass, this._texBlitPipeline);
                     pass.setBindGroup(0, this._texBlitBindGroup);
                 } else if (useYuv) {
-                    pass.setPipeline(this._yuvCanvasPipeline);
+                    this._setPipeline(pass, this._yuvCanvasPipeline);
                     pass.setBindGroup(0, this._yuvBindGroup);
                 } else if (copied) {
-                    pass.setPipeline(this._texBlitPipeline);
+                    this._setPipeline(pass, this._texBlitPipeline);
                     pass.setBindGroup(
                         0,
                         copied === 'bitmap' ? this._texBlitBindGroup : this._readbackBindGroup,
                     );
                 } else {
-                    pass.setPipeline(useExt ? this._extCanvasPipeline : this._passthroughPipeline);
+                    this._setPipeline(
+                        pass,
+                        useExt ? this._extCanvasPipeline : this._passthroughPipeline,
+                    );
                     pass.setBindGroup(0, blitBindGroup);
                 }
                 pass.draw(3);
@@ -3057,14 +3160,14 @@ export class WebGpuRenderer extends VideoRenderer {
                 });
                 if (useYuv) {
                     // HDR YUV → SDR (ACES) tone-map into inputTex.
-                    p0.setPipeline(this._yuvPipeline);
+                    this._setPipeline(p0, this._yuvPipeline);
                     p0.setBindGroup(0, this._yuvBindGroup);
                 } else if (copied === 'readback') {
-                    p0.setPipeline(this._texPass0Pipeline);
+                    this._setPipeline(p0, this._texPass0Pipeline);
                     p0.setBindGroup(0, this._readbackBindGroup);
                 } else {
                     // Plain blit, or the same ACES tone-map fed by the external texture.
-                    p0.setPipeline(useExt ? this._extPipeline : this._blitPipeline);
+                    this._setPipeline(p0, useExt ? this._extPipeline : this._blitPipeline);
                     p0.setBindGroup(0, blitBindGroup);
                 }
                 p0.draw(3);
@@ -3097,7 +3200,7 @@ export class WebGpuRenderer extends VideoRenderer {
                         },
                     ],
                 });
-                p1.setPipeline(this._easuPipeline);
+                this._setPipeline(p1, this._easuPipeline);
                 p1.setBindGroup(0, this._enhanceBindGroup);
                 p1.draw(3);
                 p1.end();
@@ -3113,7 +3216,7 @@ export class WebGpuRenderer extends VideoRenderer {
                         },
                     ],
                 });
-                p2.setPipeline(this._rcasPipeline);
+                this._setPipeline(p2, this._rcasPipeline);
                 p2.setBindGroup(0, this._rcasBindGroup);
                 p2.draw(3);
                 p2.end();
@@ -3166,7 +3269,7 @@ export class WebGpuRenderer extends VideoRenderer {
                         },
                     ],
                 });
-                p1.setPipeline(this._nisPipeline);
+                this._setPipeline(p1, this._nisPipeline);
                 p1.setBindGroup(0, this._enhanceBindGroup);
                 p1.draw(3);
                 p1.end();
@@ -3184,7 +3287,18 @@ export class WebGpuRenderer extends VideoRenderer {
                 // The gaze zone's weight for this draw, 0 without a zone: it
                 // moves in steps of 1/64, so the block is rewritten rarely.
                 const gaze = this._mwsrGazeFor(inW * inH);
-                const uniKey = inW + 'x' + inH + '>' + cw + 'x' + ch + '@' + gaze;
+                // The host's zones for this frame, read by the kernel's second
+                // text where they fit the scale it is drawn at (a reduction
+                // reads none); any other frame takes the first. Each has its
+                // own law: the zones' is tuned with their drops under it.
+                const zoned =
+                    this._zoneMap &&
+                    this._zonesReady(
+                        frame.timestamp,
+                        reg.mode === 'up' ? Math.min(cw / inW, ch / inH) : 0,
+                    );
+                const uniKey =
+                    inW + 'x' + inH + '>' + cw + 'x' + ch + '@' + gaze + (zoned ? 'z' : '');
                 if (this._mwsrUniKey !== uniKey) {
                     this._mwsrUniKey = uniKey;
                     this._device.queue.writeBuffer(
@@ -3192,23 +3306,16 @@ export class WebGpuRenderer extends VideoRenderer {
                         0,
                         mwsrUniforms(inW, inH, cw, ch, {
                             ...(this._mwsrTuning || {}),
+                            zones: zoned,
                             gaze,
                             zone: this._mwsrZone || undefined,
+                            hdr: this._hdrLinear,
                         }),
                     );
                 }
                 // mwsr 2 / 3: the frame deblocked into dbTex, which the kernel
                 // then reads; a frame mwsr 3 finds fine enough skips both passes.
                 const db = this._deblock && this._dbTex ? this._deblockFor(frame.timestamp) : null;
-                // The host's zones for this frame, read by the kernel's second
-                // text where they fit the scale it is drawn at (a reduction
-                // reads none); any other frame takes the first, and the law.
-                const zoned =
-                    this._zoneMap &&
-                    this._zonesReady(
-                        frame.timestamp,
-                        reg.mode === 'up' ? Math.min(cw / inW, ch / inH) : 0,
-                    );
                 if (db) {
                     const dbKey = inW + 'x' + inH + ':' + db.thr + ':' + db.cmax;
                     if (this._dbUniKey !== dbKey) {
@@ -3221,7 +3328,7 @@ export class WebGpuRenderer extends VideoRenderer {
                     }
                     encoder.clearBuffer(this._dbAcc);
                     const pc = encoder.beginComputePass();
-                    pc.setPipeline(this._dbPipelines.dct);
+                    this._setPipeline(pc, this._dbPipelines.dct);
                     pc.setBindGroup(0, this._dbDctBindGroup);
                     pc.dispatchWorkgroups(...deblockDispatch(inW, inH));
                     pc.end();
@@ -3235,12 +3342,13 @@ export class WebGpuRenderer extends VideoRenderer {
                             },
                         ],
                     });
-                    pd.setPipeline(this._dbPipelines.fin);
+                    this._setPipeline(pd, this._dbPipelines.fin);
                     pd.setBindGroup(0, this._dbFinBindGroup);
                     pd.draw(3);
                     pd.end();
                 }
-                // The eye test's split screen: both texts, side by side.
+                // The eye test's split screen: both texts, side by side, under
+                // one law, the zones': what differs is the grid.
                 if (zoned && this._split) {
                     this._drawMwsrSplit(
                         encoder,
@@ -3266,7 +3374,7 @@ export class WebGpuRenderer extends VideoRenderer {
                             },
                         ],
                     });
-                    p1.setPipeline(this._mwsrPipeline(reg, zoned));
+                    this._setPipeline(p1, this._mwsrPipeline(reg, zoned));
                     if (zoned) {
                         p1.setBindGroup(
                             0,
@@ -3302,7 +3410,7 @@ export class WebGpuRenderer extends VideoRenderer {
                         },
                     ],
                 });
-                p1.setPipeline(this._enhancePipeline);
+                this._setPipeline(p1, this._enhancePipeline);
                 p1.setBindGroup(0, this._enhanceBindGroup);
                 p1.draw(3);
                 p1.end();

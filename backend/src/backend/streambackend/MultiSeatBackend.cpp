@@ -156,6 +156,12 @@ void MultiSeatBackend::fillSeatVersion(const MultiSeatSeat& seat, const QString&
 void MultiSeatBackend::pairSeat(const MultiSeatSeat& seat, const QString& address,
                                 BackendVoidCallback cb)
 {
+    if (address.isEmpty()) {
+        cb(false, BackendError::make(BackendError::NoAddress,
+                                     QStringLiteral("This MultiSeat's address names no machine")));
+        return;
+    }
+
     if (m_PairUser.isEmpty() || m_PairPassword.isEmpty()) {
         cb(false,
            BackendError::make(
@@ -178,7 +184,7 @@ void MultiSeatBackend::pairSeat(const MultiSeatSeat& seat, const QString& addres
     const quint16 webUiPort = static_cast<quint16>(seat.portBase + 1);
 
     PairingChain::run(
-        m_Pairing.get(), pin,
+        m_Pairing.get(), pin, this,
         [this, address, webUiPort, accountName](const QString& announced) {
             // Stage 1 is parked on the host waiting for a PIN, and the seat
             // Apollo web UI is the only way to deliver it.
@@ -260,7 +266,10 @@ void MultiSeatBackend::withSeatBackend(const QString& seatId, SeatBackendCallbac
             return;
         }
 
-        pairSeat(seat, address,
+        // Pairing carries the seat's admin credentials and no certificate can be
+        // checked yet: it goes to the machine the administrator named, not to
+        // whichever address this host last answered from.
+        pairSeat(seat, m_Api->host(),
                  [this, seat, address, ready, cb](bool paired, const BackendError& perr) {
                      if (!paired) {
                          cb(nullptr, perr);
@@ -678,7 +687,11 @@ void MultiSeatBackend::teardownSeat(const QString& seatId, BackendVoidCallback c
 {
     m_Api->teardownSeat(seatId,
                         [this, seatId, cb = std::move(cb)](bool ok, const MultiSeatApiError& err) {
-                            if (ok) releaseSeat(seatId);
+                            if (ok) {
+                                releaseSeat(seatId);
+                                // A seat of that id later is another Apollo.
+                                QSettings().remove(seatPairingKey(seatId, "serverCert"));
+                            }
                             cb(ok, toBackendError(err));
                         });
 }

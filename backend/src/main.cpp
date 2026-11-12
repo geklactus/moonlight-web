@@ -30,6 +30,7 @@
 #include <QNetworkAccessManager>
 #include <QNetworkReply>
 #include <QNetworkRequest>
+#include <QOperatingSystemVersion>
 #include <QPointer>
 #include <QProcess>
 #include <QRegularExpression>
@@ -62,6 +63,7 @@
 #include <clocale>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <utility>
 #include "server/AppSettings.h"
 #include "common/DetachedProcess.h"
@@ -71,12 +73,15 @@
 #include "common/RunFlags.h"
 #include "server/CertManager.h"
 #include "server/Provisioning.h"
+#include "server/HostKeyVault.h"
 #include "server/HttpServer.h"
 #include "server/ControlChannel.h"
 #include "server/ControlTunnel.h"
+#include "server/LocalChannel.h"
 #include "server/RestRouter.h"
 #include "server/AuthManager.h"
 #include "server/NetClassify.h"
+#include "server/RequestGuard.h"
 #include "server/ShareManager.h"
 #include "server/SessionPool.h"
 #include "server/SingleSessionHosts.h"
@@ -86,6 +91,7 @@
 #include "server/routes/HostAppRoutes.h"
 #include "server/routes/ShareRoutes.h"
 #include "server/routes/SystemRoutes.h"
+#include "server/routes/PairRequestRoutes.h"
 #include "common/Logger.h"
 #include "common/LinuxCapabilities.h"
 #include "common/PairingCrypto.h"
@@ -104,6 +110,7 @@
 #include "backend/VirtualDisplayApply.h"
 #include "backend/VirtualHidApply.h"
 #include "common/InheritedEnvironment.h"
+#include "common/LoopbackKey.h"
 #include "network/UpdateApply.h"
 #include "backend/VirtualDisplayJob.h"
 #include "backend/streambackend/NativeHostBackend.h"
@@ -114,11 +121,13 @@
 #include "streaming/StreamRelay.h"
 #include "streaming/TransportPriorities.h"
 #include "streaming/ConsoleSession.h"
+#include "streaming/RemoteDesktopReturn.h"
 #include "streaming/SharedFeed.h"
 #include "streaming/StreamEnds.h"
 #include "streaming/StreamWorkerHost.h"
 #include "streaming/WorkerService.h"
 #include "streaming/worker/StreamWorkerMain.h"
+#include "server/HomeScreenShell.h"
 #include "server/HostAppImage.h"
 #include "server/HostAppLauncher.h"
 #include "server/LauncherDetect.h"
@@ -465,141 +474,127 @@ static void openInBrowser(const QString& url)
     QDesktopServices::openUrl(QUrl(url));
 }
 
-// Ask an already-running instance (reached over loopback HTTPS at @p base, e.g.
-// "https://localhost:443") to surface the admin page: it redirects an existing
-// browser tab to /admin via the control channel, or opens a fresh tab when no
-// tab is connected. Returns true when the running instance handled the request
-// (HTTP 200); false on any network/timeout error so the caller can fall back to
-// opening the browser itself. The localhost cert is self-signed, so peer
-// verification is disabled for this one loopback call.
-static bool requestFocusAdmin(const QString& base)
-{
-    QNetworkAccessManager nam;
-    QNetworkRequest req{QUrl(base + QStringLiteral("/api/local/focus"))};
-    req.setHeader(QNetworkRequest::ContentTypeHeader, QStringLiteral("application/json"));
-    QSslConfiguration ssl = QSslConfiguration::defaultConfiguration();
-    ssl.setPeerVerifyMode(QSslSocket::VerifyNone);
-    req.setSslConfiguration(ssl);
-
-    QNetworkReply* reply = nam.post(req, QByteArrayLiteral("{}"));
-    QObject::connect(reply, &QNetworkReply::sslErrors, reply,
-                     [reply](const QList<QSslError>&) { reply->ignoreSslErrors(); });
-
-    QEventLoop loop;
-    QTimer timer;
-    timer.setSingleShot(true);
-    QObject::connect(&timer, &QTimer::timeout, &loop, &QEventLoop::quit);
-    QObject::connect(reply, &QNetworkReply::finished, &loop, &QEventLoop::quit);
-    timer.start(3000);
-    loop.exec();
-
-    const bool ok = timer.isActive() && reply->error() == QNetworkReply::NoError &&
-                    reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt() == 200;
-    reply->deleteLater();
-    return ok;
-}
-
-// ── Headless operator CLI ───────────────────────────────────────────────────
+// ── The running server, asked from another process ─────────────────────────
 // A headless install has no admin page within reach: the operator is on SSH,
 // and the browser that will use the server lives on another machine. `--status`
-// and `--enable-internet` drive the *running* instance through the very same
-// loopback endpoints the admin page calls, and print the result as plain text.
+// and `--enable-internet` drive the *running* instance through the very routes
+// the admin page calls, and print the result as plain text. The tray icon of a
+// server that runs as a service, and a second launch, ask it the same way.
 //
 // They are queries against another process, so they run before the
-// single-instance lock is taken and never start a server of their own.
+// single-instance lock is taken and never start a server of their own. They
+// go over the local channel (server/LocalChannel.h): a door of this machine,
+// for this install's own programs, which is what says who is asking. No
+// address does, so none of them goes through a network socket.
 
-struct LoopbackReply
+struct LocalReply
 {
-    bool ok = false;    // transport-level success AND HTTP 2xx
-    int httpStatus = 0; // 0 when the request never completed
+    bool ok = false;    // answered, AND with a 2xx
+    int httpStatus = 0; // 0 when the request never got an answer
     QJsonObject json;   // parsed body (empty when not JSON)
-    QString error;      // human-readable transport error
+    QString error;      // why it never got an answer, for a person to read
 };
 
-// One loopback HTTPS call. The loopback certificate is the self-signed LAN one,
-// so peer verification is off — the peer is a socket on 127.0.0.1, which no
-// certificate could authenticate better than the kernel already does.
-static LoopbackReply loopbackRequest(const QString& base, const QString& path,
-                                     const QByteArray& postBody = QByteArray(),
-                                     int timeoutMs = 15000, const QString& adminKey = QString())
+static QString localChannelEndpoint()
 {
-    QNetworkAccessManager nam;
-    QNetworkRequest req{QUrl(base + path)};
-    req.setHeader(QNetworkRequest::ContentTypeHeader, QStringLiteral("application/json"));
-    if (!adminKey.isEmpty())
-        req.setRawHeader(QByteArrayLiteral("X-MW-Admin-Key"), adminKey.toUtf8());
-    QSslConfiguration ssl = QSslConfiguration::defaultConfiguration();
-    ssl.setPeerVerifyMode(QSslSocket::VerifyNone);
-    req.setSslConfiguration(ssl);
+    return mw::localchannel::endpointFor(
+        mw::localchannel::channelName(mw::edition::productName(), mw::edition::devFlag()),
+        QStandardPaths::writableLocation(QStandardPaths::AppDataLocation));
+}
 
-    QNetworkReply* reply = postBody.isNull() ? nam.get(req) : nam.post(req, postBody);
-    QObject::connect(reply, &QNetworkReply::sslErrors, reply,
-                     [reply](const QList<QSslError>&) { reply->ignoreSslErrors(); });
+// One request to the running server: a GET, or a POST when @p postBody is
+// given. @p target is a route, with its query if it has one.
+static LocalReply localRequest(const QString& target, const QByteArray& postBody = QByteArray(),
+                               int timeoutMs = 15000)
+{
+    mw::localchannel::Request request;
+    request.method = postBody.isNull() ? QStringLiteral("GET") : QStringLiteral("POST");
+    const qsizetype mark = target.indexOf(QLatin1Char('?'));
+    request.path = mark < 0 ? target : target.left(mark);
+    if (mark >= 0) request.query = target.mid(mark + 1);
+    request.body = postBody;
 
-    QEventLoop loop;
-    QTimer timer;
-    timer.setSingleShot(true);
-    QObject::connect(&timer, &QTimer::timeout, &loop, &QEventLoop::quit);
-    QObject::connect(reply, &QNetworkReply::finished, &loop, &QEventLoop::quit);
-    timer.start(timeoutMs);
-    loop.exec();
-
-    LoopbackReply out;
-    if (!timer.isActive()) {
-        out.error = QStringLiteral("timed out after %1 s").arg(timeoutMs / 1000);
-    } else if (reply->error() != QNetworkReply::NoError) {
-        out.error = reply->errorString();
-    }
-    out.httpStatus = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
-    out.json = QJsonDocument::fromJson(reply->readAll()).object();
-    out.ok = out.error.isEmpty() && out.httpStatus >= 200 && out.httpStatus < 300;
-    reply->deleteLater();
+    LocalReply out;
+    const mw::localchannel::Reply reply =
+        mw::localchannel::request(localChannelEndpoint(), request, timeoutMs, &out.error);
+    out.httpStatus = reply.status;
+    out.json = QJsonDocument::fromJson(reply.body).object();
+    out.ok = reply.status >= 200 && reply.status < 300;
     return out;
 }
 
-// HTTPS port the running server answers on, or 0 when none does.
-//
-// The persisted port is the authority, but it is read from *this* user's
-// settings.json — run as a different user than the service (a plain `sudo`-less
-// `moonlightweb --status` against a root-owned systemd unit) that file is a
-// different one, or absent. So fall back to the default 443 before giving up.
-static quint16 findRunningHttpsPort(quint16 persistedPort)
+// Whether a server of this install answers on the channel.
+static bool serverRunning()
+{
+    return localRequest(QStringLiteral("/api/health"), QByteArray(), 3000).ok;
+}
+
+// HTTPS port the running server answers on, or 0 when none does. Asked of the
+// server itself: the port in this account's settings.json is the one it last
+// wrote, not always the one it holds now.
+static quint16 findRunningHttpsPort()
+{
+    // A route that answers under --noadmin too: a booth's tray needs the port.
+    const LocalReply status =
+        localRequest(QStringLiteral("/api/server/status"), QByteArray(), 3000);
+    if (!status.ok) return 0;
+    const int port = status.json.value(QStringLiteral("https_port")).toInt(0);
+    return port > 0 && port < 65536 ? static_cast<quint16>(port) : 0;
+}
+
+// Ask the running instance to surface the admin page: it redirects an existing
+// browser tab to /admin via the control channel, or opens a fresh tab when no
+// tab is connected. False when it could not be asked, so the caller can fall
+// back to opening the browser itself.
+static bool requestFocusAdmin()
+{
+    return localRequest(QStringLiteral("/api/local/focus"), QByteArrayLiteral("{}"), 3000).ok;
+}
+
+// Whether something answers this install's port on this machine, asked the way
+// any browser may ask (GET /api/health, which says nothing private). It grants
+// nothing and is used for one thing: telling a server that is not running from
+// one that runs under another account, whose channel this account cannot open.
+// The certificate there is the self-signed local one, so it is not verified.
+static bool answersOnThisMachine(quint16 persistedPort)
 {
     QList<quint16> candidates{persistedPort};
     if (!candidates.contains(443)) candidates.append(443);
-
     for (quint16 p : candidates) {
-        const QString base = p == 443 ? QStringLiteral("https://127.0.0.1")
-                                      : QStringLiteral("https://127.0.0.1:%1").arg(p);
-        if (loopbackRequest(base, QStringLiteral("/api/health"), QByteArray(), 3000).ok) return p;
+        QNetworkAccessManager nam;
+        QNetworkRequest req{QUrl(p == 443
+                                     ? QStringLiteral("https://127.0.0.1/api/health")
+                                     : QStringLiteral("https://127.0.0.1:%1/api/health").arg(p))};
+        QSslConfiguration ssl = QSslConfiguration::defaultConfiguration();
+        ssl.setPeerVerifyMode(QSslSocket::VerifyNone);
+        req.setSslConfiguration(ssl);
+        QNetworkReply* reply = nam.get(req);
+        QObject::connect(reply, &QNetworkReply::sslErrors, reply,
+                         [reply](const QList<QSslError>&) { reply->ignoreSslErrors(); });
+        QEventLoop loop;
+        QTimer timer;
+        timer.setSingleShot(true);
+        QObject::connect(&timer, &QTimer::timeout, &loop, &QEventLoop::quit);
+        QObject::connect(reply, &QNetworkReply::finished, &loop, &QEventLoop::quit);
+        timer.start(3000);
+        loop.exec();
+        const bool ok = timer.isActive() && reply->error() == QNetworkReply::NoError &&
+                        reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt() == 200;
+        reply->deleteLater();
+        if (ok) return true;
     }
-    return 0;
+    return false;
 }
 
-// POST to an admin route from the terminal.
-//
-// Every mutating admin endpoint additionally requires the per-run admin key
-// (RequestGuard treats a write without it as something another page drove
-// through the user's browser). A terminal is not a browser, but the gate cannot
-// tell — so fetch the key exactly as the frontend does, over the same loopback
-// connection that already proves we are on this machine, and present it.
-static LoopbackReply loopbackAdminPost(const QString& base, const QString& path,
-                                       const QByteArray& body, int timeoutMs = 15000)
+// What a command says when the running server could not be asked.
+static QString notRunningText(quint16 persistedPort)
 {
-    const QString key =
-        loopbackRequest(base, QStringLiteral("/api/admin/token"), QByteArray(), 5000)
-            .json.value(QStringLiteral("token"))
-            .toString();
-    return loopbackRequest(base, path, body, timeoutMs, key);
-}
-
-// Loopback base URL of the running server, or empty when none answers.
-static QString findRunningInstance(quint16 persistedPort)
-{
-    const quint16 p = findRunningHttpsPort(persistedPort);
-    if (p == 0) return QString();
-    return p == 443 ? QStringLiteral("https://127.0.0.1")
-                    : QStringLiteral("https://127.0.0.1:%1").arg(p);
+    if (answersOnThisMachine(persistedPort))
+        return QStringLiteral(
+            "MoonlightWeb is running under another account: run this command as that account\n"
+            "(for the system service: with sudo).\n");
+    return QStringLiteral("MoonlightWeb is not running — start it first "
+                          "(sudo systemctl start moonlightweb).\n");
 }
 
 // The agreement the operator must accept before the machine is opened to the
@@ -635,20 +630,22 @@ static bool stdinIsInteractive()
 static int runStatusCommand(quint16 persistedHttpsPort)
 {
     QTextStream out(stdout);
-    const QString base = findRunningInstance(persistedHttpsPort);
-    if (base.isEmpty()) {
-        out << "MoonlightWeb is not running (nothing answers on the loopback interface).\n"
-            << "\n"
-            << "  systemd:  sudo systemctl status moonlightweb\n"
-            << "  logs:     ~/.local/share/MoonlightWeb/MoonlightWeb/logs/moonlightweb.log\n";
+    if (!serverRunning()) {
+        if (answersOnThisMachine(persistedHttpsPort))
+            out << notRunningText(persistedHttpsPort);
+        else
+            out << "MoonlightWeb is not running (nothing answers on this machine).\n"
+                << "\n"
+                << "  systemd:  sudo systemctl status moonlightweb\n"
+                << "  logs:     ~/.local/share/MoonlightWeb/MoonlightWeb/logs/moonlightweb.log\n";
         out.flush();
         return 1;
     }
 
-    const QJsonObject server = loopbackRequest(base, "/api/server/status").json;
-    const QJsonObject setup = loopbackRequest(base, "/api/setup/status").json;
-    const QJsonObject auth = loopbackRequest(base, "/api/auth/status").json;
-    const QJsonObject inet = loopbackRequest(base, "/api/internet/status").json;
+    const QJsonObject server = localRequest("/api/server/status").json;
+    const QJsonObject setup = localRequest("/api/setup/status").json;
+    const QJsonObject auth = localRequest("/api/auth/status").json;
+    const QJsonObject inet = localRequest("/api/internet/status").json;
 
     const int httpsPort = setup.value("https_port").toInt(443);
     const QString portSuffix = httpsPort == 443 ? QString() : QStringLiteral(":%1").arg(httpsPort);
@@ -699,8 +696,7 @@ static int runStatusCommand(quint16 persistedHttpsPort)
         // tells the operator up front whether enabling it will configure the
         // router by itself or need a port forward typed in by hand. Nothing on
         // the LAN depends on any of this.
-        const QJsonObject upnp =
-            loopbackRequest(base, "/api/internet/upnp-probe", QByteArray(), 10000).json;
+        const QJsonObject upnp = localRequest("/api/internet/upnp-probe", QByteArray(), 10000).json;
         if (upnp.value("available").toBool(false))
             out << "                 a UPnP router answered — the port will be mapped for you\n";
         else
@@ -760,16 +756,13 @@ static int runStatusCommand(quint16 persistedHttpsPort)
 static int runNewPinCommand(quint16 persistedHttpsPort)
 {
     QTextStream out(stdout);
-    const QString base = findRunningInstance(persistedHttpsPort);
-    if (base.isEmpty()) {
-        out << "MoonlightWeb is not running — start it first "
-               "(sudo systemctl start moonlightweb).\n";
+    if (!serverRunning()) {
+        out << notRunningText(persistedHttpsPort);
         out.flush();
         return 1;
     }
 
-    const LoopbackReply reply =
-        loopbackAdminPost(base, "/api/admin/pin/generate", QByteArrayLiteral("{}"));
+    const LocalReply reply = localRequest("/api/admin/pin/generate", QByteArrayLiteral("{}"));
     if (!reply.ok) {
         out << "Failed: "
             << (reply.error.isEmpty() ? QStringLiteral("HTTP %1").arg(reply.httpStatus)
@@ -835,10 +828,8 @@ static QString readSecretFromStdin(const QString& prompt)
 static int runSetAdminPasswordCommand(quint16 persistedHttpsPort)
 {
     QTextStream out(stdout);
-    const QString base = findRunningInstance(persistedHttpsPort);
-    if (base.isEmpty()) {
-        out << "MoonlightWeb is not running — start it first "
-               "(sudo systemctl start moonlightweb).\n";
+    if (!serverRunning()) {
+        out << notRunningText(persistedHttpsPort);
         out.flush();
         return 1;
     }
@@ -864,8 +855,8 @@ static int runSetAdminPasswordCommand(quint16 persistedHttpsPort)
     // to allow the unlock, so make sure the toggle is not left off.
     body["enabled"] = true;
 
-    const LoopbackReply reply = loopbackAdminPost(
-        base, "/api/admin/password", QJsonDocument(body).toJson(QJsonDocument::Compact));
+    const LocalReply reply =
+        localRequest("/api/admin/password", QJsonDocument(body).toJson(QJsonDocument::Compact));
     if (!reply.ok) {
         const QString apiError = reply.json.value("error").toString();
         out << "Failed: "
@@ -893,10 +884,8 @@ static int runSetAdminPasswordCommand(quint16 persistedHttpsPort)
 static int runClearAdminPasswordCommand(quint16 persistedHttpsPort, bool assumeYes)
 {
     QTextStream out(stdout);
-    const QString base = findRunningInstance(persistedHttpsPort);
-    if (base.isEmpty()) {
-        out << "MoonlightWeb is not running — start it first "
-               "(sudo systemctl start moonlightweb).\n";
+    if (!serverRunning()) {
+        out << notRunningText(persistedHttpsPort);
         out.flush();
         return 1;
     }
@@ -915,8 +904,8 @@ static int runClearAdminPasswordCommand(quint16 persistedHttpsPort, bool assumeY
 
     QJsonObject body;
     body["clear"] = true;
-    const LoopbackReply reply = loopbackAdminPost(
-        base, "/api/admin/password", QJsonDocument(body).toJson(QJsonDocument::Compact));
+    const LocalReply reply =
+        localRequest("/api/admin/password", QJsonDocument(body).toJson(QJsonDocument::Compact));
     if (!reply.ok) {
         const QString apiError = reply.json.value("error").toString();
         out << "Failed: "
@@ -937,6 +926,95 @@ static int runClearAdminPasswordCommand(quint16 persistedHttpsPort, bool assumeY
     return 0;
 }
 
+// `moonlightweb --max-allowed-frame-rate 60 --max-allowed-bitrate 40
+//  --max-allowed-stream-resolution 1920x1080`: the administrator's ceilings
+// (AppSettings::streamLimits), written by the running instance into its own
+// settings.json — a service runs as another user, with a file of its own.
+// Each is optional; 0 lifts it. Every stream started afterwards holds to them.
+static int runStreamLimitsCommand(quint16 persistedHttpsPort, const std::optional<QString>& fps,
+                                  const std::optional<QString>& mbps,
+                                  const std::optional<QString>& resolution)
+{
+    QTextStream out(stdout);
+    QJsonObject body;
+    const auto number = [](const QString& text) {
+        bool ok = false;
+        const int n = text.trimmed().toInt(&ok);
+        return ok && n >= 0 && n <= AppSettings::kLimitMax ? n : -1;
+    };
+    if (fps) {
+        const int n = number(*fps);
+        if (n < 0) {
+            out << "--max-allowed-frame-rate takes a whole number of frames per second "
+                   "(0 for no limit). Nothing was changed.\n";
+            out.flush();
+            return 1;
+        }
+        body["max_allowed_frame_rate"] = n;
+    }
+    if (mbps) {
+        const int n = number(*mbps);
+        if (n < 0) {
+            out << "--max-allowed-bitrate takes a whole number of Mbps (0 for no limit). "
+                   "Nothing was changed.\n";
+            out.flush();
+            return 1;
+        }
+        body["max_allowed_bitrate"] = n;
+    }
+    if (resolution) {
+        int w = 0, h = 0;
+        if (!AppSettings::parseStreamResolution(*resolution, &w, &h)) {
+            out << "--max-allowed-stream-resolution takes WIDTHxHEIGHT: 1920x1080, 1920 (a\n"
+                   "1920x1920 box), 0x1440 (the height only), 0 for no limit. Nothing was "
+                   "changed.\n";
+            out.flush();
+            return 1;
+        }
+        body["max_allowed_stream_resolution"] = AppSettings::streamResolutionText(w, h);
+    }
+
+    if (!serverRunning()) {
+        out << notRunningText(persistedHttpsPort);
+        out.flush();
+        return 1;
+    }
+    const LocalReply reply =
+        localRequest("/api/settings/streaming", QJsonDocument(body).toJson(QJsonDocument::Compact));
+    if (!reply.ok) {
+        const QString apiError = reply.json.value("error").toString();
+        out << "Failed: "
+            << (!apiError.isEmpty()
+                    ? apiError
+                    : (reply.error.isEmpty() ? QStringLiteral("HTTP %1").arg(reply.httpStatus)
+                                             : reply.error))
+            << "\n";
+        out.flush();
+        return 1;
+    }
+
+    // What the instance holds now, all three, read back.
+    const QJsonObject now = localRequest("/api/settings/streaming", QByteArray(), 10000).json;
+    const auto shown = [](int v, const char* unit) {
+        return v > 0 ? QStringLiteral("%1 %2").arg(v).arg(QLatin1String(unit))
+                     : QStringLiteral("no limit");
+    };
+    const int w = now.value("max_allowed_stream_width").toInt(0);
+    const int h = now.value("max_allowed_stream_height").toInt(0);
+    out << "\n  Frame rate     " << shown(now.value("max_allowed_frame_rate").toInt(0), "FPS")
+        << "\n  Bitrate        " << shown(now.value("max_allowed_bitrate").toInt(0), "Mbps")
+        << "\n  Resolution     "
+        << (w > 0 || h > 0 ? AppSettings::streamResolutionText(w, h) +
+                                 (w > 0 && h > 0 ? QString()
+                                  : w > 0        ? QStringLiteral(" (the width only)")
+                                                 : QStringLiteral(" (the height only)"))
+                           : QStringLiteral("no limit"))
+        << "\n\n  Every stream started from now on is held to these, whatever the\n"
+        << "  viewer's Settings say. A stream already running keeps its own.\n\n";
+    out.flush();
+    return 0;
+}
+
 // `moonlightweb --enable-internet`: record the operator's consent and enable
 // the Internet link. A legacy instance re-publishes its sub-domain and renews
 // its certificate; a fresh one authorizes the per-session router mapping and
@@ -951,10 +1029,8 @@ static int runEnableInternetCommand(quint16 persistedHttpsPort, bool assumeYes)
         out.flush();
         return 1;
     }
-    const QString base = findRunningInstance(persistedHttpsPort);
-    if (base.isEmpty()) {
-        out << "MoonlightWeb is not running — start it first "
-               "(sudo systemctl start moonlightweb).\n";
+    if (!serverRunning()) {
+        out << notRunningText(persistedHttpsPort);
         out.flush();
         return 1;
     }
@@ -978,7 +1054,7 @@ static int runEnableInternetCommand(quint16 persistedHttpsPort, bool assumeYes)
 
     // Probe the router before enabling, so the closing advice is accurate even
     // if the enable itself half-fails.
-    const bool upnp = loopbackRequest(base, "/api/internet/upnp-probe", QByteArray(), 10000)
+    const bool upnp = localRequest("/api/internet/upnp-probe", QByteArray(), 10000)
                           .json.value("available")
                           .toBool(false);
 
@@ -990,8 +1066,8 @@ static int runEnableInternetCommand(quint16 persistedHttpsPort, bool assumeYes)
 
     // Generous: the handler runs STUN detection and asks the router, both
     // network round-trips with their own timeouts.
-    const LoopbackReply reply = loopbackAdminPost(
-        base, "/api/internet/enable", QJsonDocument(body).toJson(QJsonDocument::Compact), 180000);
+    const LocalReply reply = localRequest(
+        "/api/internet/enable", QJsonDocument(body).toJson(QJsonDocument::Compact), 180000);
     if (!reply.ok) {
         out << "Failed: "
             << (reply.error.isEmpty() ? QStringLiteral("HTTP %1").arg(reply.httpStatus)
@@ -1102,10 +1178,61 @@ static void waitMs(int ms)
     loop.exec();
 }
 
+// `moonlightweb --open-link` / `--print-link`: the link this machine's owner
+// opens its pages with, asked of the running instance — the admin page, or the
+// front door of a booth. It carries a key made for it at that moment, good once
+// and for ten minutes. Opened, it goes to the browser and nowhere else; printed,
+// it goes to the terminal that asked. It is never written to a log, and never
+// handed to another program than the browser.
+static int runOwnerLinkCommand(quint16 persistedHttpsPort, bool print)
+{
+    QTextStream out(stdout);
+    if (!serverRunning()) {
+        out << notRunningText(persistedHttpsPort);
+        out.flush();
+        return 1;
+    }
+    const bool booth = localRequest(QStringLiteral("/api/auth/status"), QByteArray(), 5000)
+                           .json.value("admin_locked")
+                           .toBool(false);
+    const QString target = QStringLiteral("/api/server/remote-link") +
+                           (booth ? QString() : QStringLiteral("?p=/admin"));
+
+    // The internet link takes a moment to come up after a start: while it is
+    // only "not yet", ask again rather than settle for this machine's address.
+    QString url;
+    for (int attempt = 0; attempt < 30 && url.isEmpty(); ++attempt) {
+        if (attempt > 0) waitMs(700);
+        const LocalReply reply = localRequest(target, QByteArray(), 5000);
+        if (!reply.ok) {
+            out << "Failed: "
+                << (reply.error.isEmpty() ? QStringLiteral("HTTP %1").arg(reply.httpStatus)
+                                          : reply.error)
+                << "\n";
+            out.flush();
+            return 1;
+        }
+        url = reply.json.value("url").toString();
+        if (url.isEmpty() && !reply.json.value("pending").toBool(false)) break;
+    }
+    if (url.isEmpty()) {
+        out << "No link could be made.\n";
+        out.flush();
+        return 1;
+    }
+    if (print) {
+        out << url << "\n";
+        out.flush();
+        return 0;
+    }
+    openInBrowser(url);
+    return 0;
+}
+
 // Loopback URL for the tray entries. "localhost", not 127.0.0.1: the loopback
 // certificate carries localhost as a SAN, so the browser only has to accept a
-// self-signed certificate, not a name mismatch on top of it. No host key is
-// needed — loopback carries local privilege by itself.
+// self-signed certificate, not a name mismatch on top of it. It carries no key:
+// it is what is left when the server could not be asked for a link.
 static QUrl trayClientUrl(quint16 httpsPort, const QString& path)
 {
     return QUrl(httpsPort == 443
@@ -1113,7 +1240,7 @@ static QUrl trayClientUrl(quint16 httpsPort, const QString& path)
                     : QStringLiteral("https://localhost:%1%2").arg(httpsPort).arg(path));
 }
 
-static int runTrayClient(QApplication& app, quint16 persistedHttpsPort, bool ownerHasNoDesktopHere)
+static int runTrayClient(QApplication& app, bool ownerHasNoDesktopHere)
 {
     QLockFile trayLock(QStandardPaths::writableLocation(QStandardPaths::AppDataLocation) +
                        "/moonlightweb-tray.lock");
@@ -1124,16 +1251,18 @@ static int runTrayClient(QApplication& app, quint16 persistedHttpsPort, bool own
     }
 
     // At logon the service and this process start within the same second, and
-    // the service's TLS listener is a few seconds behind. Give it time before
-    // concluding that nothing is there. A refused connection returns at once,
-    // so this costs nothing in the common case.
+    // the service's channel opens a few seconds later, once its routes are all
+    // in place. Give it time before concluding that nothing is there. A channel
+    // that is not there yet answers at once, so this costs nothing in the
+    // common case.
     quint16 port = 0;
     for (int attempt = 0; attempt < 10 && port == 0; ++attempt) {
         if (attempt > 0) waitMs(2000);
-        port = findRunningHttpsPort(persistedHttpsPort);
+        port = findRunningHttpsPort();
     }
     if (port == 0) {
-        Logger::info("No tray client: the instance holding the lock never answered on loopback");
+        Logger::info("No tray client: the instance holding the lock never answered on its "
+                     "local channel");
         return 0;
     }
 
@@ -1141,10 +1270,8 @@ static int runTrayClient(QApplication& app, quint16 persistedHttpsPort, bool own
     // systemd --user unit started outside a graphical session): the running
     // instance says itself whether it has a desktop to draw on.
     if (!ownerHasNoDesktopHere) {
-        const QString base = port == 443 ? QStringLiteral("https://127.0.0.1")
-                                         : QStringLiteral("https://127.0.0.1:%1").arg(port);
-        const LoopbackReply setup =
-            loopbackRequest(base, QStringLiteral("/api/setup/status"), QByteArray(), 5000);
+        const LocalReply setup =
+            localRequest(QStringLiteral("/api/setup/status"), QByteArray(), 5000);
         if (!setup.ok || !setup.json.value("headless").toBool(false)) {
             Logger::info("No tray client: the running instance has a desktop and its own tray");
             return 0;
@@ -1157,10 +1284,8 @@ static int runTrayClient(QApplication& app, quint16 persistedHttpsPort, bool own
     tray.setClientMode(true);
     // A service started with --noadmin: its tray offers nothing that changes it.
     {
-        const QString base = port == 443 ? QStringLiteral("https://127.0.0.1")
-                                         : QStringLiteral("https://127.0.0.1:%1").arg(port);
-        const LoopbackReply status =
-            loopbackRequest(base, QStringLiteral("/api/auth/status"), QByteArray(), 5000);
+        const LocalReply status =
+            localRequest(QStringLiteral("/api/auth/status"), QByteArray(), 5000);
         tray.setAdminLocked(status.ok && status.json.value("admin_locked").toBool(false));
     }
     tray.setUrlProvider([&port](const QString& path) { return trayClientUrl(port, path); });
@@ -1168,49 +1293,37 @@ static int runTrayClient(QApplication& app, quint16 persistedHttpsPort, bool own
     // The internet link has to be asked for rather than computed: this process
     // has no rendezvous line and no settings of its own, it only decorates a
     // server it cannot see. Asked at the moment the entry is clicked, so a
-    // blocking loopback call is acceptable — and given a short budget so a
-    // wedged server cannot freeze the menu. Empty on any failure, which is the
-    // same answer as "no internet way in": the entry falls back to loopback.
-    tray.setRemoteLinkProvider([&port](const QString& path) -> QString {
-        const QString base = port == 443 ? QStringLiteral("https://127.0.0.1")
-                                         : QStringLiteral("https://127.0.0.1:%1").arg(port);
+    // blocking call is acceptable — and given a short budget so a wedged server
+    // cannot freeze the menu. Empty on any failure, which is the same answer as
+    // "no internet way in": the entry falls back to this machine's own address.
+    tray.setRemoteLinkProvider([](const QString& path) -> QString {
         // Sent raw: the server accepts one plain path segment and nothing else,
         // so there is never anything here that needs escaping.
         const QString query = path.isEmpty() ? QString() : QStringLiteral("?p=") + path;
-        const LoopbackReply reply = loopbackRequest(
-            base, QStringLiteral("/api/server/remote-link") + query, QByteArray(), 2000);
+        const LocalReply reply =
+            localRequest(QStringLiteral("/api/server/remote-link") + query, QByteArray(), 2000);
         return reply.ok ? reply.json.value(QStringLiteral("url")).toString() : QString();
     });
 
     // Restart / Quit act on the server we decorate, not on this tray. We reach it
-    // the same way the CLI reaches an admin route: a loopback POST carrying the
-    // per-run admin key (loopbackAdminPost fetches it). The server then exits on
-    // its own — its supervisor respawns it for a restart, or lets it stay down
-    // for a quit — so no elevation and no SCM rights are needed here. 127.0.0.1,
-    // not "localhost", so the admin-key exchange rides the loopback the guard
-    // already trusts. `port` is followed live by the poll below.
-    tray.setRestartHandler([&port]() {
-        const QString base = port == 443 ? QStringLiteral("https://127.0.0.1")
-                                         : QStringLiteral("https://127.0.0.1:%1").arg(port);
-        loopbackAdminPost(base, QStringLiteral("/api/system/restart"), QByteArrayLiteral("{}"));
-    });
-    tray.setQuitHandler([&port]() {
-        const QString base = port == 443 ? QStringLiteral("https://127.0.0.1")
-                                         : QStringLiteral("https://127.0.0.1:%1").arg(port);
-        loopbackAdminPost(base, QStringLiteral("/api/system/quit"), QByteArrayLiteral("{}"));
-    });
+    // the same way the command line reaches an admin route: over the local
+    // channel. The server then exits on its own — its supervisor respawns it for
+    // a restart, or lets it stay down for a quit — so no elevation and no SCM
+    // rights are needed here.
+    tray.setRestartHandler(
+        []() { localRequest(QStringLiteral("/api/system/restart"), QByteArrayLiteral("{}")); });
+    tray.setQuitHandler(
+        []() { localRequest(QStringLiteral("/api/system/quit"), QByteArrayLiteral("{}")); });
 
     // Who is watching the screen this tray sits on. The server keeps that
     // answer — this process has no slot table, no sessions and no settings —
-    // so it is asked for over the same loopback as everything else, on a short
+    // so it is asked for over the same channel as everything else, on a short
     // budget: a wedged server must cost the icon nothing but a stale count, and
     // an unanswered poll simply reports nobody rather than inventing viewers.
     tray.setActivityProvider(
-        [&port]() -> StreamActivity {
-            const QString base = port == 443 ? QStringLiteral("https://127.0.0.1")
-                                             : QStringLiteral("https://127.0.0.1:%1").arg(port);
-            const LoopbackReply reply = loopbackRequest(
-                base, QStringLiteral("/api/server/stream-activity"), QByteArray(), 2000);
+        []() -> StreamActivity {
+            const LocalReply reply =
+                localRequest(QStringLiteral("/api/server/stream-activity"), QByteArray(), 2000);
             if (!reply.ok) {
                 StreamActivity unknown;
                 unknown.valid = false;
@@ -1235,7 +1348,7 @@ static int runTrayClient(QApplication& app, quint16 persistedHttpsPort, bool own
     QTimer portPoll;
     portPoll.setInterval(60000);
     QObject::connect(&portPoll, &QTimer::timeout, &app, [&port, &silentPolls]() {
-        const quint16 p = findRunningHttpsPort(port);
+        const quint16 p = findRunningHttpsPort();
         if (p == 0) {
             if (++silentPolls < 5) return;
             Logger::info("Tray client: the server has been gone for 5 minutes — quitting");
@@ -1336,10 +1449,7 @@ static NetClassify::Kind streamClientKind(const HttpRequest& req)
     const NetClassify::Kind kind = NetClassify::classify(req.clientAddress);
     if (kind != NetClassify::Kind::Loopback && kind != NetClassify::Kind::Private) return kind;
     const bool localProxy = kind == NetClassify::Kind::Loopback && !req.hostTrusted;
-    const bool forwarded = req.headers.contains(QStringLiteral("x-forwarded-for")) ||
-                           req.headers.contains(QStringLiteral("forwarded")) ||
-                           req.headers.contains(QStringLiteral("cf-connecting-ip")) ||
-                           req.headers.contains(QStringLiteral("tailscale-funnel-request"));
+    const bool forwarded = RequestGuard::forwardedByProxy(req.headers);
     if (!localProxy && !forwarded) return kind;
     qInfo() << "[Session] Browser behind a reverse proxy (peer" << req.clientAddress << ", Host"
             << req.headers.value(QStringLiteral("host")) << ") — planning ICE for the internet";
@@ -1476,6 +1586,24 @@ static int concurrentSessionCap(const QString& backendType)
     return 4; // gamestream (Sunshine / Apollo), and anything not yet known
 }
 
+/// Which sound a stream carries (Settings → Stream audio from), in its one form.
+/// A host that cannot capture one app (below Windows 11) streams the whole mix
+/// rather than silence: the browser's stored choice may predate the host it now
+/// reaches.
+static QString streamableAudioSource(const QString& requested)
+{
+    const QString source = AppSettings::canonicalAudioSource(requested);
+#if defined(Q_OS_WIN)
+    if (source != QLatin1String("all") &&
+        QOperatingSystemVersion::current() <
+            QOperatingSystemVersion(QOperatingSystemVersion::Windows, 10, 0, 20348)) {
+        Logger::info("[audio] Stream audio from: one app needs Windows 11 — streaming all apps");
+        return QStringLiteral("all");
+    }
+#endif
+    return source;
+}
+
 int main(int argc, char* argv[])
 {
     // Before anything reads the environment: a mode an installer task runs
@@ -1556,40 +1684,10 @@ int main(int argc, char* argv[])
     // Route the console echo to stderr BEFORE anything logs (CrashHandler::install
     // below logs an INFO line), for every mode whose stdout is a payload rather
     // than a log: --stream-worker carries the JSON event protocol, and the
-    // operator commands print a report a human (or a script) reads. The real
-    // branches for all of them run after CLI parsing.
-    // --help/--version included: QCommandLineParser writes them to stdout and
-    // exits, and two INFO lines ahead of the usage text is exactly the kind of
-    // noise that breaks `moonlightweb --help | less`.
-    for (int i = 1; i < argc; ++i) {
-        static const char* const kQuietStdout[] = {"--stream-worker",
-                                                   "--worker-service",
-                                                   "--worker-service-install",
-                                                   "--worker-service-remove",
-                                                   "--native-probe",
-                                                   "--vdisplay-apply",
-                                                   "--vdisplay-guard",
-                                                   "--vhid-apply",
-                                                   "--update-apply",
-                                                   "--open-on-desktop",
-                                                   "--status",
-                                                   "--new-pin",
-                                                   "--enable-internet",
-                                                   "--set-admin-password",
-                                                   "--clear-admin-password",
-                                                   "--help",
-                                                   "--help-all",
-                                                   "-h",
-                                                   "-?",
-                                                   "--version",
-                                                   "-v"};
-        for (const char* flag : kQuietStdout) {
-            if (qstrcmp(argv[i], flag) == 0) {
-                Logger::instance()->setConsoleToStderr(true);
-                break;
-            }
-        }
-    }
+    // operator commands print what a human (or a script) reads — a report, a
+    // PIN, a link — which must come out alone. The real branches for all of
+    // them run after CLI parsing; the list is mw::edition::stdoutIsPayload.
+    if (mw::edition::stdoutIsPayload(argc, argv)) Logger::instance()->setConsoleToStderr(true);
     // Where this process logs is decided HERE, from raw argv, and not after
     // parser.process() — CrashHandler::install() just below writes its first
     // line, so anything decided later would have leaked that line into the
@@ -1782,6 +1880,14 @@ int main(int argc, char* argv[])
         "worker-data-dir", "Internal: the stream worker's log and crash directory", "dir");
     workerDataDirOption.setFlags(QCommandLineOption::HiddenFromHelp);
     parser.addOption(workerDataDirOption);
+    // Internal: the worker streams the console's sign-in screen and nothing
+    // else (mw::native::NativeHost::enterSignInScreenOnly). Written by the
+    // launcher service alone, on the command line of the worker it starts on
+    // a console nobody is signed in on (WorkerService::requestSignInWorker).
+    QCommandLineOption signInScreenOption(
+        "signin-screen", "Internal: the stream worker streams the sign-in screen only");
+    signInScreenOption.setFlags(QCommandLineOption::HiddenFromHelp);
+    parser.addOption(signInScreenOption);
 
     // Internal: the LocalSystem launcher service — the process Windows starts,
     // and the two verbs the installer runs elevated to register and remove it
@@ -1822,6 +1928,36 @@ int main(int argc, char* argv[])
     QCommandLineOption enableInternetOption(
         "enable-internet", "Enable the Internet link (asks for consent), then exit");
     parser.addOption(enableInternetOption);
+
+    // The way into this machine's own pages for a terminal, and for whatever
+    // opens them for its owner (the installer's last page): the same link the
+    // tray icon opens, asked of the running instance at that moment.
+    QCommandLineOption openLinkOption(
+        "open-link", "Open the running server's page in the browser, signed in as this "
+                     "machine's owner, then exit");
+    parser.addOption(openLinkOption);
+    QCommandLineOption printLinkOption(
+        "print-link", "Print the link --open-link would open (it works once, for ten "
+                      "minutes), then exit");
+    parser.addOption(printLinkOption);
+
+    // The administrator's ceilings, written into the running instance's
+    // settings.json (AppSettings::streamLimits). Any of the three, together.
+    QCommandLineOption maxFrameRateOption(
+        "max-allowed-frame-rate",
+        "Hold every stream to this frame rate (0 for no limit), then exit", "fps");
+    parser.addOption(maxFrameRateOption);
+    QCommandLineOption maxBitrateOption("max-allowed-bitrate",
+                                        "Hold every stream to this bitrate in Mbps (0 for no "
+                                        "limit), then exit",
+                                        "mbps");
+    parser.addOption(maxBitrateOption);
+    QCommandLineOption maxResolutionOption(
+        "max-allowed-stream-resolution",
+        "Hold every stream inside this size: 1920x1080, 1920 (a square box), 0x1440 (the "
+        "height only), 0 for no limit; then exit",
+        "WxH");
+    parser.addOption(maxResolutionOption);
 
     QCommandLineOption yesOption("yes", "Accept the --enable-internet agreement, or confirm "
                                         "--clear-admin-password, non-interactively");
@@ -2007,6 +2143,11 @@ int main(int argc, char* argv[])
     // interleave. stdout carries the worker's JSON event protocol — Logger
     // writes to file/stderr only.
     if (parser.isSet(streamWorkerOption)) {
+        // Before anything else runs, and for good: nothing later leaves it.
+        if (parser.isSet(signInScreenOption) && !mw::native::NativeHost::enterSignInScreenOnly()) {
+            Logger::error("[StreamWorker] the sign-in screen mode does not exist on this platform");
+            return 1;
+        }
         if (parser.isSet(workerPipeOption)) {
             QString pipeError;
             if (!ConsoleSession::attachWorkerPipes(parser.value(workerPipeOption), &pipeError)) {
@@ -2070,6 +2211,20 @@ int main(int argc, char* argv[])
     if (parser.isSet(enableInternetOption))
         return runEnableInternetCommand(appSettings.httpsPort(mw::edition::defaultHttpsPort()),
                                         parser.isSet(yesOption));
+    if (parser.isSet(openLinkOption) || parser.isSet(printLinkOption))
+        return runOwnerLinkCommand(appSettings.httpsPort(mw::edition::defaultHttpsPort()),
+                                   parser.isSet(printLinkOption));
+    if (parser.isSet(maxFrameRateOption) || parser.isSet(maxBitrateOption) ||
+        parser.isSet(maxResolutionOption)) {
+        // Not given: nothing to change; given empty: a bad value.
+        const auto given = [&parser](const QCommandLineOption& o) -> std::optional<QString> {
+            if (!parser.isSet(o)) return std::nullopt;
+            return parser.value(o);
+        };
+        return runStreamLimitsCommand(appSettings.httpsPort(mw::edition::defaultHttpsPort()),
+                                      given(maxFrameRateOption), given(maxBitrateOption),
+                                      given(maxResolutionOption));
+    }
 
     appSettings.seedDocumentedDefaults(); // write documented file-only keys if absent
     appSettings.migrateHostApps();        // the betas' gamescope_apps → host_apps
@@ -2108,7 +2263,7 @@ int main(int argc, char* argv[])
             // Prefer redirecting an already-open tab (no duplicate). Only when the
             // running instance can't be reached do we open the admin page here.
             Logger::info("Asking the running instance to surface the admin page: " + base);
-            if (!requestFocusAdmin(base)) {
+            if (!requestFocusAdmin()) {
                 Logger::info("Running instance unreachable — opening the admin page directly");
                 openInBrowser(base + QStringLiteral("/admin"));
             }
@@ -2120,8 +2275,7 @@ int main(int argc, char* argv[])
 #else
         const bool ownerHidden = false;
 #endif
-        return runTrayClient(app, appSettings.httpsPort(mw::edition::defaultHttpsPort()),
-                             ownerHidden);
+        return runTrayClient(app, ownerHidden);
     }
 
     HttpServer server(httpPort);
@@ -2170,6 +2324,7 @@ int main(int argc, char* argv[])
 
     // ── AuthManager (PIN-based + certificate authentication) ────────────────
     AuthManager authManager(&appSettings);
+    authManager.setHostSessionRepairBefore(appSettings.hostSessionRepairBefore());
 
     // Generate certificate token on first startup (persisted forever)
     if (authManager.certificateToken().isEmpty()) {
@@ -2193,9 +2348,13 @@ int main(int argc, char* argv[])
     server.setBoothShare(boothShare);
     if (boothShare)
         Logger::info("[Auth] Booth mode: sharing during a stream stays on (share_in_booth_mode)");
-    server.setHomeScreenIdentity([&appSettings, &authManager](const HttpRequest& req) {
+    // The machine's name for a signed-in session only: the entry link alone
+    // does not say whose machine is behind it (HomeScreenShell.h).
+    server.setHomeScreenIdentity([&appSettings, &authManager, &server](const HttpRequest& req) {
         return HttpServer::HomeScreenIdentity{
-            appSettings.rendezvousId(), appSettings.displayName(),
+            appSettings.rendezvousId(),
+            mw::homescreen::shownMachineName(appSettings.displayName(),
+                                             server.isAuthenticated(req)),
             req.viaTunnel ? authManager.homeScreenKey(HttpServer::sessionTokenFromRequest(req))
                           : QString()};
     });
@@ -2229,6 +2388,10 @@ int main(int argc, char* argv[])
     // session. Used to reject a stale /quit from a client that was taken over
     // (its quit would otherwise tear down the NEW owner via the global pointer).
     QString g_ActiveClientUniqueId;
+    // The authenticated device behind that relay (its AuthManager session
+    // token), empty for localhost: a revoked session ends this relay only when
+    // the relay is that session's.
+    QString g_ActiveSessionToken;
     // UUID of the host the active relay streams from. Needed by teardown paths
     // that have no HTTP request to read the host from (revoked-device kill).
     QString g_ActiveHostUuid;
@@ -2349,6 +2512,21 @@ int main(int argc, char* argv[])
         }
         return false;
     });
+    // Slots 2..4 are the invited players'; every other one is a signed-in device.
+    const auto streamsVirtualDisplay = [&g_Pool](bool guests) {
+        for (int i = 0; i < g_Pool.size(); ++i) {
+            const SessionPool::Slot& sl = g_Pool.at(i);
+            if ((i >= kOwnerSlots && i < kTotalSlots) == guests && !sl.worker.isNull() &&
+                sl.hostUuid == NativeHostBackend::hostUuid() &&
+                NativeHostBackend::usesVirtualDisplay(sl.appId))
+                return true;
+        }
+        return false;
+    };
+    VirtualDisplayJob::instance().setOwnerOn(
+        [streamsVirtualDisplay]() { return streamsVirtualDisplay(false); });
+    VirtualDisplayJob::instance().setGuestOn(
+        [streamsVirtualDisplay]() { return streamsVirtualDisplay(true); });
     VirtualDisplayJob::instance().setBeforeRelease([]() {
         if (g_HostAppCloseOnRelease.isEmpty()) return false;
         for (const QString& command : std::as_const(g_HostAppCloseOnRelease)) {
@@ -2412,18 +2590,27 @@ int main(int argc, char* argv[])
     // restarted. Asking the backend to end the session by name is the only
     // reliable route — and it is the supervisor's job rather than the worker's,
     // because the worker dying without a teardown is exactly the case that leaks.
-    auto reapCoopSession = [&computerManager](const QString& hostUuid, const QString& sessionId) {
+    //
+    // `ownerStop`: the owner pressed Stop, so what the session leaves running
+    // for nobody goes too (on Wolf, its lobby). A stream that ended any other
+    // way keeps it for the next launch.
+    auto reapCoopSession = [&computerManager](const QString& hostUuid, const QString& sessionId,
+                                              bool ownerStop = false) {
         if (hostUuid.isEmpty() || sessionId.isEmpty()) return;
         std::shared_ptr<IStreamBackend> backend(computerManager.backendForHost(hostUuid).release());
         if (!backend || !backend->capabilities().lobbies) return;
         // The lambda keeps `backend` alive until the answer comes back.
-        backend->endCoopSession(sessionId, [backend, sessionId](bool ok, const BackendError& err) {
+        auto done = [backend, sessionId](bool ok, const BackendError& err) {
             if (ok)
                 qInfo() << "[main] Co-op session" << sessionId << "closed on the host";
             else
                 qWarning() << "[main] Could not close co-op session" << sessionId << ":"
                            << err.message;
-        });
+        };
+        if (ownerStop)
+            backend->stopCoopSession(sessionId, done);
+        else
+            backend->endCoopSession(sessionId, done);
     };
 
     // Detach a worker slot from session-level bookkeeping and tear the child
@@ -2492,9 +2679,11 @@ int main(int argc, char* argv[])
     //    is watching them would be false.
     //  - to people, not sessions. The owner's standby leg (slot 1) is the same
     //    viewer continuing their own stream through a quality change, so it
-    //    shares their browser's uniqueid and collapses into one row here —
-    //    otherwise a single person switching quality would read as two, and
-    //    would announce themselves twice.
+    //    shares their session and collapses into one row here — otherwise a
+    //    single person switching quality would read as two, and would announce
+    //    themselves twice. Who is who is the server's to say
+    //    (StreamActivity::viewerId), never the browser's uniqueid: a second
+    //    viewer reusing one already watching would never have been listed.
     //
     // The legacy in-process path (stream_worker_enabled off) is deliberately
     // not consulted: its globals are not cleared on every exit, and a stuck
@@ -2502,33 +2691,34 @@ int main(int argc, char* argv[])
     auto streamActivity = [&g_Pool, &authManager, &shareManager, &appSettings]() {
         StreamActivity activity;
         activity.notify = appSettings.streamNotifications();
-        QSet<QString> seen;
+        QList<StreamSlotFacts> live;
         for (int i = 0; i < g_Pool.size(); ++i) {
             const SessionPool::Slot& sl = g_Pool.at(i);
             if (sl.worker.isNull()) continue;
             if (sl.hostUuid != NativeHostBackend::hostUuid()) continue;
-            const QString id =
-                sl.clientUniqueId.isEmpty() ? QStringLiteral("slot-%1").arg(i) : sl.clientUniqueId;
-            if (seen.contains(id)) continue;
-            seen.insert(id);
             // An authenticated device is named by whatever the admin sessions
             // list calls it; an invited guest by the row they were let in on.
             const SessionInfo session = authManager.sessionForToken(sl.sessionToken);
             QString name = session.machineName;
             if (name.isEmpty() && ShareManager::isPlayerSlot(i)) name = shareManager.name(i);
-            activity.viewers.append({id, name, session.isHost});
+            live.append({i, sl.sessionToken, name, session.isHost});
         }
+        activity.viewers = StreamActivity::viewersOf(live, kOwnerSlots);
         return activity;
     };
 
-    // Tear every player worker down and revoke their shares. Called when the
-    // owner really stops — their session is the one the players resumed into.
-    auto endPlayerSessions = [&g_Pool, &detachWorkerSlot, &shareManager,
-                              &sharedFeed](ShareManager::EndReason reason) {
+    // Tear the player workers of @p hostUuid down and revoke their shares.
+    // Called when the app the players resumed into ends on that host. Guests
+    // invited to another host are not on that app, and stay.
+    auto endPlayerSessions = [&g_Pool, &detachWorkerSlot, &shareManager, &sharedFeed](
+                                 const QString& hostUuid, ShareManager::EndReason reason) {
+        if (hostUuid.isEmpty()) return;
         for (int i = kOwnerSlots; i < kTotalSlots; ++i)
-            if (g_Pool.at(i).worker) detachWorkerSlot(i, false, true);
-        shareManager.deactivateAll(reason);
-        sharedFeed.reset();
+            if (g_Pool.at(i).worker &&
+                (g_Pool.at(i).hostUuid == hostUuid || shareManager.hostForSlot(i) == hostUuid))
+                detachWorkerSlot(i, false, true);
+        shareManager.deactivateForHost(hostUuid, reason);
+        if (sharedFeed.hostUuid() == hostUuid) sharedFeed.reset();
     };
 
     // The feed died three times running: its guests leave, and rejoin on
@@ -2588,86 +2778,104 @@ int main(int argc, char* argv[])
     });
 
     // ── Revoked-device kill-switch ─────────────────────────────────────────────
-    // Revoking a device whose session is actively streaming must stop that
-    // stream immediately — the revoked browser must not keep receiving video
-    // just because its relay was established before the revocation. Teardown
-    // mirrors the proven /quit route (notify client, stop shim + relay,
-    // deleteLater), then cancels the Sunshine session keyed by the revoked
-    // browser's uniqueid. sessionEnded stays connected: its auto-quit lambda is
-    // re-entrant safe (stop() guards, deleteLater is idempotent) and a double
-    // Sunshine /cancel is harmless.
-    QObject::connect(
-        &authManager, &AuthManager::streamingSessionRevoked, qApp,
-        [&computerManager, &g_ActiveRelay, &g_ActiveMediaTrackRelay, &g_ActiveStreamRelay,
-         &g_ActiveSession, &g_ActiveClientUniqueId, &g_ActiveHostUuid, &g_Pool]() {
-            qInfo() << "[main] Streaming session revoked — tearing down active stream";
-            bool relayStopped = false;
+    // A session that goes (revoked, logged out, replaced) takes its streams
+    // with it at once — the revoked browser must not keep receiving video just
+    // because its relay was established before the revocation — and nobody
+    // else's: another device's stream, and the players invited to the host,
+    // carry on as after a Leave. Revoking every session at once ends every
+    // stream. Teardown mirrors the proven /quit route (notify client, stop shim
+    // + relay, deleteLater), then cancels the Sunshine session keyed by the
+    // revoked browser's uniqueid. sessionEnded stays connected: its auto-quit
+    // lambda is re-entrant safe (stop() guards, deleteLater is idempotent) and
+    // a double Sunshine /cancel is harmless.
+    const auto endStreamsOf = [&computerManager, &g_ActiveRelay, &g_ActiveMediaTrackRelay,
+                               &g_ActiveStreamRelay, &g_ActiveSession, &g_ActiveClientUniqueId,
+                               &g_ActiveSessionToken, &g_ActiveHostUuid,
+                               &g_Pool](const QString& id) {
+        const bool everyone = id.isEmpty();
+        const auto ofThatSession = [&id](const QString& token) {
+            return AuthManager::isTokenOf(token, id);
+        };
 
-            // Worker-mode sessions: notify + teardown each slot's child. The
-            // slot's normal ended handler sends the Sunshine /cancel and clears
-            // the streaming flag.
-            for (int i = 0; i < g_Pool.size(); ++i) {
-                auto* w = g_Pool.workerAs<StreamWorkerHost>(i);
-                if (!w) continue;
-                qInfo() << "[main] Revoke teardown: stopping stream worker (uid="
-                        << g_Pool.at(i).clientUniqueId << ")";
-                w->notifyRevoked();
-                relayStopped = true;
-            }
+        // Worker-mode sessions: notify + teardown the child of each slot
+        // that session streams in. The slot's normal ended handler sends
+        // the Sunshine /cancel — held back while a sibling, a player
+        // included, still streams the app — and clears the streaming flag.
+        QVector<int> theirs;
+        if (everyone) {
+            for (int i = 0; i < g_Pool.size(); ++i)
+                if (g_Pool.live(i)) theirs.append(i);
+        } else {
+            theirs = g_Pool.slotsOfSession(ofThatSession);
+        }
+        for (int i : std::as_const(theirs)) {
+            auto* w = g_Pool.workerAs<StreamWorkerHost>(i);
+            if (!w) continue;
+            qInfo() << "[main] Revoke teardown: stopping stream worker (slot" << i
+                    << ", uid=" << g_Pool.at(i).clientUniqueId << ")";
+            w->notifyRevoked();
+        }
 
-            if (g_ActiveRelay) {
-                DataChannelRelay* relay = g_ActiveRelay;
-                g_ActiveRelay = nullptr;
-                relay->notifyClientRevoked();
-                if (relay->mediaEngine()) relay->mediaEngine()->stopConnection();
-                relay->stop();
-                relay->deleteLater();
-                relayStopped = true;
-            }
+        // The in-process relay: only when it is that session's.
+        if (!everyone && !ofThatSession(g_ActiveSessionToken)) return;
+        qInfo() << "[main] Streaming session revoked — tearing down its relay";
+        bool relayStopped = false;
 
-            if (g_ActiveMediaTrackRelay) {
-                MediaTrackRelay* relay = g_ActiveMediaTrackRelay;
-                g_ActiveMediaTrackRelay = nullptr;
-                relay->notifyClientRevoked();
-                if (relay->mediaEngine()) relay->mediaEngine()->stopConnection();
-                relay->stop();
-                relay->deleteLater();
-                relayStopped = true;
-            }
+        if (g_ActiveRelay) {
+            DataChannelRelay* relay = g_ActiveRelay;
+            g_ActiveRelay = nullptr;
+            relay->notifyClientRevoked();
+            if (relay->mediaEngine()) relay->mediaEngine()->stopConnection();
+            relay->stop();
+            relay->deleteLater();
+            relayStopped = true;
+        }
 
-            if (g_ActiveStreamRelay) {
-                StreamRelay* relay = g_ActiveStreamRelay;
-                g_ActiveStreamRelay = nullptr;
-                relay->notifyClientRevoked();
-                relay->stop();
-                relay->deleteLater();
-                relayStopped = true;
-            }
+        if (g_ActiveMediaTrackRelay) {
+            MediaTrackRelay* relay = g_ActiveMediaTrackRelay;
+            g_ActiveMediaTrackRelay = nullptr;
+            relay->notifyClientRevoked();
+            if (relay->mediaEngine()) relay->mediaEngine()->stopConnection();
+            relay->stop();
+            relay->deleteLater();
+            relayStopped = true;
+        }
 
-            if (g_ActiveSession) {
-                g_ActiveSession->deleteLater();
-                g_ActiveSession = nullptr;
-            }
+        if (g_ActiveStreamRelay) {
+            StreamRelay* relay = g_ActiveStreamRelay;
+            g_ActiveStreamRelay = nullptr;
+            relay->notifyClientRevoked();
+            relay->stop();
+            relay->deleteLater();
+            relayStopped = true;
+        }
 
-            if (!relayStopped) {
-                qInfo() << "[main] Revoke teardown: no live relay (already stopped)";
-                return;
-            }
+        if (g_ActiveSession) {
+            g_ActiveSession->deleteLater();
+            g_ActiveSession = nullptr;
+        }
 
-            // Cancel the revoked browser's Sunshine session (keyed like /launch).
-            // Nobody legitimately resumes it, so leaving it alive is pointless.
-            NvComputer* host = computerManager.getHost(g_ActiveHostUuid);
-            if (host && host->takesHostCancel()) {
-                auto* identity = IdentityManager::get();
-                auto* quitReply = computerManager.http()->quitAppAsync(
-                    host->activeAddress, host->activeHttpsPort, identity->getCertificate(),
-                    identity->getPrivateKey(), g_ActiveClientUniqueId);
-                QObject::connect(quitReply, &QNetworkReply::finished, quitReply,
-                                 &QNetworkReply::deleteLater);
-            }
-            g_ActiveClientUniqueId.clear();
-            g_ActiveHostUuid.clear();
-        });
+        if (!relayStopped) {
+            qInfo() << "[main] Revoke teardown: no live relay (already stopped)";
+            return;
+        }
+
+        // Cancel the revoked browser's Sunshine session (keyed like /launch).
+        // Nobody legitimately resumes it, so leaving it alive is pointless.
+        NvComputer* host = computerManager.getHost(g_ActiveHostUuid);
+        if (host && host->takesHostCancel()) {
+            auto* identity = IdentityManager::get();
+            auto* quitReply = computerManager.http()->quitAppAsync(
+                host->activeAddress, host->activeHttpsPort, identity->getCertificate(),
+                identity->getPrivateKey(), host->serverCertPem, g_ActiveClientUniqueId);
+            QObject::connect(quitReply, &QNetworkReply::finished, quitReply,
+                             &QNetworkReply::deleteLater);
+        }
+        g_ActiveClientUniqueId.clear();
+        g_ActiveSessionToken.clear();
+        g_ActiveHostUuid.clear();
+    };
+    QObject::connect(&authManager, &AuthManager::streamingSessionRevoked, qApp, endStreamsOf);
 
     InternetAccessManager internetAccess(&appSettings);
     // Every hole in the router, from one place: the tunnel's and each stream
@@ -2753,15 +2961,17 @@ int main(int argc, char* argv[])
     }
 
     // Register API routes
-    server.router()->get("/api/health", [&appSettings](const HttpRequest&) {
+    server.router()->get("/api/health", [&appSettings, &server](const HttpRequest& req) {
         QJsonObject obj;
         obj["status"] = "ok";
         obj["version"] = QCoreApplication::applicationVersion();
         // What this install calls itself, for the header and for the switcher
-        // that lists the other machines a browser has paired with. Public, like
-        // the rest of this route and like /api/server/hostname next door, which
-        // has always answered the same question to anyone who asked.
-        obj["name"] = appSettings.displayName();
+        // that lists the other machines a browser has paired with: to a caller
+        // on this LAN, the host machine, or a session, like
+        // /api/server/hostname next door (AuthManager::mayKnowMachineName). A
+        // page from elsewhere reads it again once signed in (app.js).
+        if (AuthManager::mayKnowMachineName(req, server.isAuthenticated(req)))
+            obj["name"] = appSettings.displayName();
         // The diagnostic modes, for every page including a guest's, which can
         // reach nothing else before it joins: a page in debug mode sends its
         // console to the client log, one in verbose mode prints its pipeline
@@ -2777,11 +2987,43 @@ int main(int argc, char* argv[])
     // the background without blocking this handler. `self_update` describes what
     // this host can do about it, so the web app can offer a one-click update (or
     // explain that the host must be updated by hand) without a second round-trip.
-    server.router()->get("/api/update/check", [&updateChecker, &selfUpdater](const HttpRequest&) {
-        QJsonObject obj = updateChecker.statusJson();
-        obj["self_update"] = selfUpdater.capabilityJson();
-        return HttpResponse::json(obj);
-    });
+    //
+    // `?fresh=1` asks for a look at the releases now, at the moments a user reads
+    // the answer (opening Settings, the app or Admin, a stream closing), so a
+    // release shows up then rather than up to kCacheHours later. Bounded three
+    // ways: at most one look per UpdateChecker::kFreshFloorSeconds for every
+    // client together, none while a stream runs here (the cache answers), and
+    // the answer waits for the look at most kFreshWaitMs, then goes out with
+    // whatever the cache holds.
+    server.router()->getAsync(
+        "/api/update/check", [&updateChecker, &selfUpdater, &g_Pool, &g_ActiveSession](
+                                 const HttpRequest& req, const ResponseCallback& respond) {
+            auto answer = [&updateChecker, &selfUpdater, respond]() {
+                QJsonObject obj = updateChecker.statusJson();
+                obj["self_update"] = selfUpdater.capabilityJson();
+                respond(HttpResponse::json(obj));
+            };
+            const bool fresh = req.queryParams.value(QStringLiteral("fresh")) == QLatin1String("1");
+            const bool streaming = !g_ActiveSession.isNull() || g_Pool.liveCount() > 0;
+            if (!fresh || streaming || !updateChecker.requestFresh()) {
+                answer();
+                return;
+            }
+            constexpr int kFreshWaitMs = 5000;
+            // Answer once: on the check's end or on the wait running out,
+            // whichever comes first. The context object carries both
+            // connections and goes with the first.
+            auto* ctx = new QObject(&updateChecker);
+            auto answered = std::make_shared<bool>(false);
+            auto finish = [ctx, answered, answer]() {
+                if (*answered) return;
+                *answered = true;
+                answer();
+                ctx->deleteLater();
+            };
+            QObject::connect(&updateChecker, &UpdateChecker::checkFinished, ctx, finish);
+            QTimer::singleShot(kFreshWaitMs, ctx, finish);
+        });
 
     // POST /api/update/start — download and apply the update on the host, then
     // relaunch. Session-authenticated but deliberately NOT localhost-gated: the
@@ -2897,7 +3139,9 @@ int main(int argc, char* argv[])
         return HttpResponse::json(obj);
     });
 
-    // GET /api/server/hostname — returns the server's hostname and OS info
+    // GET /api/server/hostname — returns the server's hostname and OS info, to
+    // whoever may know what this machine is called: HttpServer lets a caller on
+    // this LAN or the host machine in without a session, anyone else with one.
     server.router()->get("/api/server/hostname", [](const HttpRequest&) {
         QJsonObject obj;
         obj["hostname"] = AppSettings::machineName();
@@ -2943,27 +3187,25 @@ int main(int argc, char* argv[])
         const bool asker = e.hostUuid == req.pathParams.value("id") &&
                            !ShareManager::isPlayerSlot(e.slot) &&
                            e.sessionToken == HttpServer::sessionTokenFromRequest(req);
-        return HttpResponse::json(
-            QJsonObject{{"state", StreamEnds::name(asker ? e.state : StreamEnds::State::Unknown)}});
+        // The sign-in screen's: whether its user signed in through it is read
+        // now (StreamEnds::nameFor).
+        return HttpResponse::json(QJsonObject{
+            {"state", asker ? StreamEnds::nameFor(e, e.signInScreen &&
+                                                         RemoteDesktopReturn::backOnScreenNow())
+                            : StreamEnds::name(StreamEnds::State::Unknown)}});
     });
 
     // Phase 5: Start streaming — launch app + RTSP handshake
-    server.router()->postAsync("/api/hosts/:id/start", [&computerManager, signalingPort,
-                                                        &g_ActiveRelay, &g_ActiveStreamRelay,
-                                                        &g_ActiveMediaTrackRelay, &g_ActiveSession,
-                                                        &g_ActiveRelayRoot, &g_ActiveClientUniqueId,
-                                                        &g_ActiveHostUuid, &g_HostAspect, &g_Pool,
-                                                        &g_DualSupport, &g_SingleSessionHosts,
-                                                        &g_LastStandbyStartMs, &g_LiveSunshineUids,
-                                                        &g_PendingHostCancels, &g_StreamEnds,
-                                                        &dropPendingHostCancel, &detachWorkerSlot,
-                                                        &quitsPerDevice, &quitDeviceApp,
-                                                        &releaseSeatIfIdle, &slotSignalingPort,
-                                                        &slotWsPath, &anyOtherSlotLive,
-                                                        &reapCoopSession, &server, &appSettings,
-                                                        &authManager, &sessionMetrics, &routerPorts,
-                                                        stunServer](const HttpRequest& req,
-                                                                    ResponseCallback respond) {
+    const auto startHost = [&computerManager, signalingPort, &g_ActiveRelay, &g_ActiveStreamRelay,
+                            &g_ActiveMediaTrackRelay, &g_ActiveSession, &g_ActiveRelayRoot,
+                            &g_ActiveClientUniqueId, &g_ActiveSessionToken, &g_ActiveHostUuid,
+                            &g_HostAspect, &g_Pool, &g_DualSupport, &g_SingleSessionHosts,
+                            &g_LastStandbyStartMs, &g_LiveSunshineUids, &g_PendingHostCancels,
+                            &g_StreamEnds, &dropPendingHostCancel, &detachWorkerSlot,
+                            &quitsPerDevice, &quitDeviceApp, &releaseSeatIfIdle, &slotSignalingPort,
+                            &slotWsPath, &anyOtherSlotLive, &reapCoopSession, &server, &appSettings,
+                            &authManager, &sessionMetrics, &routerPorts,
+                            stunServer](const HttpRequest& req, ResponseCallback respond) {
         QString uuid = req.pathParams.value("id");
         if (uuid.isEmpty()) {
             respond(HttpResponse::error(400, "Missing host ID"));
@@ -2978,6 +3220,36 @@ int main(int argc, char* argv[])
 
         QJsonDocument doc = QJsonDocument::fromJson(req.body);
         QJsonObject body = doc.object();
+
+        // The console's sign-in screen (RemoteDesktopReturnPolicy), asked here
+        // again since this is where its stream starts: offered by this
+        // version, never from a kiosk, and only while Remote Desktop has left
+        // this session. One stream of it: never a standby leg beside it (the
+        // launcher runs one sign-in screen worker at a time).
+        const bool signInStream = host->backendType == NativeHostBackend::typeName() &&
+                                  body["appId"].toInt(0) == NativeHostBackend::signInScreenAppId();
+        if (signInStream) {
+            // Only a worker the launcher starts in sign-in screen mode streams
+            // it: never a session in this process.
+            QString refusal = RemoteDesktopReturn::instance().signInRefusal(req.adminLocked);
+            if (refusal.isEmpty() && !appSettings.streamWorkerEnabled())
+                refusal = QStringLiteral("streams run in this process (stream_worker_enabled)");
+            if (!refusal.isEmpty()) {
+                qInfo().noquote() << "[signin] a stream of this PC's sign-in screen refused:"
+                                  << refusal;
+                respond(HttpResponse::error(
+                    req.adminLocked ? 403 : 409,
+                    QStringLiteral("This PC's sign-in screen cannot be streamed: ") + refusal));
+                return;
+            }
+            if (body["standby"].toBool(false)) {
+                respond(HttpResponse::json(
+                    QJsonObject{{"status", QStringLiteral("dual_unavailable")},
+                                {"reason", QStringLiteral("the sign-in screen streams once")}},
+                    200));
+                return;
+            }
+        }
 
         // ── Worker mode + slot selection ───────────────────────────────────────
         // stream_worker_enabled (default): sessions run in --stream-worker child
@@ -3255,6 +3527,7 @@ int main(int argc, char* argv[])
         if (!standby) {
             g_ActiveSession = nullptr;
             g_ActiveClientUniqueId.clear();
+            g_ActiveSessionToken.clear();
             g_ActiveHostUuid.clear();
         }
 
@@ -3347,7 +3620,7 @@ int main(int argc, char* argv[])
         // browser's "Same as your device" and "Custom" resolutions; absent
         // (an older frontend, a fixed rung) → today's reading. Every other
         // host gets the explicit width and height above regardless.
-        const bool reqFitBox = body["stream_fit_box"].toBool(false);
+        bool reqFitBox = body["stream_fit_box"].toBool(false);
         const bool reqAllowUpscale = reqFitBox && body["stream_allow_upscale"].toBool(false);
         // "Match my screen": the native host puts its display in that very
         // mode for the session, when its driver lists one.
@@ -3359,8 +3632,35 @@ int main(int argc, char* argv[])
             return v >= AppSettings::kCustomSizeMin && v <= AppSettings::kCustomSizeMax ? v & ~1
                                                                                         : 0;
         };
-        const int reqFallbackW = reqMatchDisplay ? boxSide("stream_fallback_width") : 0;
-        const int reqFallbackH = reqMatchDisplay ? boxSide("stream_fallback_height") : 0;
+        int reqFallbackW = reqMatchDisplay ? boxSide("stream_fallback_width") : 0;
+        int reqFallbackH = reqMatchDisplay ? boxSide("stream_fallback_height") : 0;
+
+        // The administrator's ceilings (settings.json max_allowed_*, issue
+        // #53), on every host, the native one and its virtual display
+        // included. The browser holds itself to them already; this is what
+        // makes them hold for an older page, or one that ignores them.
+        const AppSettings::StreamLimits limits = appSettings.streamLimits();
+        // What the size cost in pixels, for an automatic bitrate (below).
+        const qint64 pixelsAsked = qint64(reqWidth) * reqHeight;
+        qint64 pixelsLimited = pixelsAsked;
+        {
+            const AppSettings::LimitedSize limited = AppSettings::limitStreamSize(
+                limits, reqWidth, reqHeight, reqFitBox, reqMatchDisplay,
+                backendType == QStringLiteral("native"), reqFallbackW, reqFallbackH);
+            if (limited.changed) {
+                qInfo().noquote() << "[Session] Resolution limit"
+                                  << AppSettings::streamResolutionText(limits.width, limits.height)
+                                  << ":" << reqWidth << "x" << reqHeight
+                                  << (reqFitBox ? "(box)" : "") << "→" << limited.width << "x"
+                                  << limited.height << (limited.fitBox ? "(box)" : "");
+                reqWidth = limited.width;
+                reqHeight = limited.height;
+                reqFitBox = limited.fitBox;
+                reqFallbackW = limited.fallbackWidth;
+                reqFallbackH = limited.fallbackHeight;
+                pixelsLimited = qint64(reqWidth) * reqHeight;
+            }
+        }
         qInfo() << "[Session] Aspect" << reqAspect << "→" << reqWidth << "x" << reqHeight
                 << (reqMatchDisplay ? "(box, the display's mode)"
                     : reqFitBox     ? (reqAllowUpscale ? "(box, may upscale)" : "(box)")
@@ -3394,7 +3694,48 @@ int main(int argc, char* argv[])
         // and a 144 Hz panel would answer an Auto 120 with 144. Absent — an
         // older frontend, a rate the viewer named — means no ceiling, and the
         // alignment keeps the freedom it was designed with.
-        const int reqFpsCeiling = qMax(0, body["stream_fps_max"].toInt(0));
+        int reqFpsCeiling = qMax(0, body["stream_fps_max"].toInt(0));
+
+        // The administrator's frame rate: the stream's, and the ceiling the
+        // native host's alignment may not cross either.
+        const int fpsAsked = reqFps;
+        if (limits.fps > 0) {
+            if (reqFps > limits.fps) {
+                qInfo() << "[Session] Frame rate limit" << limits.fps << ":" << reqFps << "→"
+                        << limits.fps << "fps";
+                reqFps = limits.fps;
+            }
+            reqFpsCeiling = reqFpsCeiling > 0 ? qMin(reqFpsCeiling, limits.fps) : limits.fps;
+        }
+
+        // A page that did not hold itself to the ceilings sized its automatic
+        // bitrate for the rate and the pixels asked — linear in both before
+        // v0.4.2 — so what a ceiling took of them comes off it too, or the
+        // frames would get the bits of a stream twice as fast. Today's page
+        // applies the ceilings before its estimate (util/StreamLimits.js,
+        // then util/AutoBitrate.js), and nothing is taken here. A bitrate the
+        // viewer set is theirs, under the administrator's own ceiling like
+        // everything else.
+        const bool reqBitrateAuto = body.contains("stream_bitrate_auto")
+                                        ? body["stream_bitrate_auto"].toBool(true)
+                                        : appSettings.streamBitrateAuto();
+        if (reqBitrateAuto && !body["power_save"].toBool(false)) {
+            double ratio = 1.0;
+            if (reqFps < fpsAsked) ratio *= double(reqFps) / fpsAsked;
+            if (pixelsAsked > 0 && pixelsLimited > 0 && pixelsLimited < pixelsAsked)
+                ratio *= double(pixelsLimited) / pixelsAsked;
+            if (ratio < 1.0) {
+                const int scaled = qMax(1000, static_cast<int>(reqBitrate * ratio));
+                qInfo() << "[Session] Automatic bitrate follows the limits:" << reqBitrate << "→"
+                        << scaled << "kbps";
+                reqBitrate = scaled;
+            }
+        }
+        if (limits.bitrateMbps > 0 && reqBitrate > limits.bitrateMbps * 1000) {
+            qInfo() << "[Session] Bitrate limit" << limits.bitrateMbps << "Mbps:" << reqBitrate
+                    << "→" << limits.bitrateMbps * 1000 << "kbps";
+            reqBitrate = limits.bitrateMbps * 1000;
+        }
 
         bool reqYuv444 = body.contains("chroma_444_enabled") ? body["chroma_444_enabled"].toBool()
                                                              : appSettings.chroma444Enabled();
@@ -3412,6 +3753,12 @@ int main(int argc, char* argv[])
         // Mute host PC speakers while streaming (localAudioPlayMode). Default true.
         bool reqMuteHost = body.contains("mute_host_audio") ? body["mute_host_audio"].toBool()
                                                             : appSettings.muteHostAudio();
+
+        // Which sound the stream carries: the browser's choice, else the host's
+        // default.
+        const QString reqAudioSource =
+            streamableAudioSource(body.contains("audio_source") ? body["audio_source"].toString()
+                                                                : appSettings.audioSource());
 
         // Video enhancement (WebGPU): the browser renders via canvas, so when it
         // is on the transport negotiation must avoid webrtc-media (<video>).
@@ -3630,12 +3977,13 @@ int main(int argc, char* argv[])
             QObject::connect(
                 s, &StreamSession::streamRelayCreated,
                 [&g_ActiveStreamRelay, &g_ActiveRelayRoot, &g_ActiveClientUniqueId,
-                 &g_ActiveHostUuid, &computerManager, &authManager, sessionToken, host,
-                 quitUid](StreamRelay* r) {
+                 &g_ActiveSessionToken, &g_ActiveHostUuid, &computerManager, &authManager,
+                 sessionToken, host, quitUid](StreamRelay* r) {
                     qInfo() << "[main] streamRelayCreated, relay=" << r;
                     g_ActiveStreamRelay = r;
                     g_ActiveRelayRoot = r;
                     g_ActiveClientUniqueId = quitUid;
+                    g_ActiveSessionToken = sessionToken;
                     g_ActiveHostUuid = host->uuid;
                     authManager.setSessionStreaming(sessionToken, true);
 
@@ -3652,7 +4000,8 @@ int main(int argc, char* argv[])
                                 auto* identity = IdentityManager::get();
                                 auto* quitReply = computerManager.http()->quitAppAsync(
                                     host->activeAddress, host->activeHttpsPort,
-                                    identity->getCertificate(), identity->getPrivateKey(), quitUid);
+                                    identity->getCertificate(), identity->getPrivateKey(),
+                                    host->serverCertPem, quitUid);
                                 QObject::connect(quitReply, &QNetworkReply::finished, quitReply,
                                                  &QNetworkReply::deleteLater);
                             }
@@ -3674,12 +4023,14 @@ int main(int argc, char* argv[])
             // WebRTC DataChannel mode: DataChannelRelay tracking
             QObject::connect(
                 s, &StreamSession::relayCreated,
-                [&g_ActiveRelay, &g_ActiveRelayRoot, &g_ActiveClientUniqueId, &g_ActiveHostUuid,
-                 &computerManager, &authManager, sessionToken, host, quitUid](DataChannelRelay* r) {
+                [&g_ActiveRelay, &g_ActiveRelayRoot, &g_ActiveClientUniqueId, &g_ActiveSessionToken,
+                 &g_ActiveHostUuid, &computerManager, &authManager, sessionToken, host,
+                 quitUid](DataChannelRelay* r) {
                     qInfo() << "[main] relayCreated, relay=" << r;
                     g_ActiveRelay = r;
                     g_ActiveRelayRoot = r;
                     g_ActiveClientUniqueId = quitUid;
+                    g_ActiveSessionToken = sessionToken;
                     g_ActiveHostUuid = host->uuid;
                     authManager.setSessionStreaming(sessionToken, true);
 
@@ -3694,7 +4045,8 @@ int main(int argc, char* argv[])
                                 auto* identity = IdentityManager::get();
                                 auto* quitReply = computerManager.http()->quitAppAsync(
                                     host->activeAddress, host->activeHttpsPort,
-                                    identity->getCertificate(), identity->getPrivateKey(), quitUid);
+                                    identity->getCertificate(), identity->getPrivateKey(),
+                                    host->serverCertPem, quitUid);
                                 QObject::connect(quitReply, &QNetworkReply::finished, quitReply,
                                                  &QNetworkReply::deleteLater);
                             }
@@ -3719,12 +4071,13 @@ int main(int argc, char* argv[])
             QObject::connect(
                 s, &StreamSession::mediaTrackRelayCreated,
                 [&g_ActiveMediaTrackRelay, &g_ActiveRelayRoot, &g_ActiveClientUniqueId,
-                 &g_ActiveHostUuid, &computerManager, &authManager, sessionToken, host,
-                 quitUid](MediaTrackRelay* r) {
+                 &g_ActiveSessionToken, &g_ActiveHostUuid, &computerManager, &authManager,
+                 sessionToken, host, quitUid](MediaTrackRelay* r) {
                     qInfo() << "[main] mediaTrackRelayCreated, relay=" << r;
                     g_ActiveMediaTrackRelay = r;
                     g_ActiveRelayRoot = r;
                     g_ActiveClientUniqueId = quitUid;
+                    g_ActiveSessionToken = sessionToken;
                     g_ActiveHostUuid = host->uuid;
                     authManager.setSessionStreaming(sessionToken, true);
 
@@ -3739,7 +4092,8 @@ int main(int argc, char* argv[])
                                 auto* identity = IdentityManager::get();
                                 auto* quitReply = computerManager.http()->quitAppAsync(
                                     host->activeAddress, host->activeHttpsPort,
-                                    identity->getCertificate(), identity->getPrivateKey(), quitUid);
+                                    identity->getCertificate(), identity->getPrivateKey(),
+                                    host->serverCertPem, quitUid);
                                 QObject::connect(quitReply, &QNetworkReply::finished, quitReply,
                                                  &QNetworkReply::deleteLater);
                             }
@@ -3788,6 +4142,7 @@ int main(int argc, char* argv[])
             s->setDebugIceDropUdp(AppSettings().debugIceDropUdp());
             s->setLowAudio(reqLowAudio);
             s->setMuteHostAudio(reqMuteHost);
+            s->setAudioSource(reqAudioSource);
             s->setMicRequested(reqMic);
             s->setMicDevice(appSettings.micDevice());
             // What the browser's RTP decoder takes on the media track.
@@ -3820,9 +4175,14 @@ int main(int argc, char* argv[])
             // A rate chosen FOR the viewer states the ceiling it was chosen
             // against; one the viewer named states none.
             s->setMaxFps(reqFpsCeiling);
+            // And the administrator's, which the native session holds to
+            // mid-stream too (cadence steps, the bitrate following the frame).
+            s->setStreamLimits(limits.fps, limits.bitrateMbps * 1000);
             // The viewer's aspect is "Auto": a native stream follows the
             // display's shape when it changes. Absent → the size is kept.
             s->setFollowDisplayShape(body["follow_display_shape"].toBool(false));
+            // The viewer's codec is "Auto", whatever codec the browser named.
+            s->setCodecAuto(body["codec_auto"].toBool(false));
             s->setFrameFit(reqFitBox, reqAllowUpscale, reqMatchDisplay, reqFallbackW, reqFallbackH);
             s->setClientKind(clientKind);
             s->setClientSameNetwork(clientSameNetwork);
@@ -3967,6 +4327,8 @@ int main(int argc, char* argv[])
             cfg["iceTcp"] = enableIceTcp;
             cfg["lowAudio"] = reqLowAudio;
             cfg["muteHostAudio"] = reqMuteHost;
+            cfg["audioSource"] = reqAudioSource;
+            cfg["audioReportApp"] = true;
             // The viewer's microphone; the device it plays into travels with
             // the other settings a SYSTEM worker cannot read (StreamWorkerHost).
             cfg["mic"] = reqMic;
@@ -3982,10 +4344,15 @@ int main(int argc, char* argv[])
             // And MWSR's zones, the same way (setMwsrZones).
             cfg["mwsrZones"] = body["mwsr_map"].toBool(false);
             cfg["fpsCeiling"] = reqFpsCeiling;
+            // The administrator's ceilings (setStreamLimits): a SYSTEM worker
+            // reads another profile's settings.json, so they travel here.
+            cfg["fpsLimit"] = limits.fps;
+            cfg["bitrateLimitKbps"] = limits.bitrateMbps * 1000;
             cfg["clientRefreshMilliHz"] = body["client_refresh_mhz"].toInt(0);
             cfg["clientVsync"] = body["client_vsync"].toBool(false);
             cfg["clientTearingReal"] = body["client_tearing_real"].toBool(false);
             cfg["followDisplayShape"] = body["follow_display_shape"].toBool(false);
+            cfg["codecAuto"] = body["codec_auto"].toBool(false);
             cfg["fitRequestedBox"] = reqFitBox;
             cfg["allowUpscale"] = reqAllowUpscale;
             cfg["matchClientDisplay"] = reqMatchDisplay;
@@ -4032,6 +4399,14 @@ int main(int argc, char* argv[])
             if (host->backendType == NativeHostBackend::typeName() &&
                 NativeHostBackend::isHostAppCard(appId))
                 cfg["hostAppKnown"] = !NativeHostBackend::hostAppFor(appId).isEmpty();
+            // The console's sign-in screen: through the launcher's sign-in
+            // screen request alone (StreamWorkerHost::Launch::SignInScreen),
+            // and its worker finds its display by itself.
+            if (signInStream) {
+                cfg["signInScreen"] = true;
+                cfg["displayKey"] =
+                    QString::fromLatin1(RemoteDesktopReturnPolicy::kSignInDisplayKey);
+            }
             // The admin's picture chain for a native Windows session.
             cfg["nativeVideoPipeline"] = appSettings.nativeVideoPipeline();
             // The bench's knobs, read here: a SYSTEM worker's own AppData is
@@ -4057,6 +4432,7 @@ int main(int argc, char* argv[])
             // Every slot owns a port pair so all children can listen at once
             // (HttpServer proxies /ws1../ws4 to them).
             cfg["signalingPort"] = static_cast<int>(slotSignalingPort(reqSlot));
+            cfg["loopbackKey"] = QString::fromLatin1(mw::loopback::key());
             cfg["streamRelayPort"] = static_cast<int>(slotSignalingPort(reqSlot) + 1);
             cfg["mediaPort"] = static_cast<int>(kMediaBasePort + reqSlot);
             cfg["wsPath"] = slotWsPath(reqSlot);
@@ -4155,13 +4531,46 @@ int main(int argc, char* argv[])
             // What the page knows this stream by, to ask how it ended.
             const QString streamId = StreamEnds::newId();
             worker->setStreamId(streamId);
+            // The sign-in screen's audit line (RemoteDesktopReturnPolicy): who
+            // opened it, and how it ended — signed in, stopped by another
+            // account signing in on the PC, or closed. Never what was typed.
+            if (signInStream) {
+                // The device name and the id are the browser's own words: no
+                // control, format or line character of theirs reaches the log,
+                // where it could pass for a line of its own.
+                const auto logSafe = [](QString text, int maxChars) {
+                    text.removeIf([](QChar c) {
+                        const QChar::Category cat = c.category();
+                        return cat == QChar::Other_Control || cat == QChar::Other_Format ||
+                               cat == QChar::Separator_Line || cat == QChar::Separator_Paragraph;
+                    });
+                    return text.left(maxChars);
+                };
+                const QString device = logSafe(authManager.sessionMachineName(sessionToken), 64);
+                const QString who =
+                    QStringLiteral("\"%1\" (%2, device %3)")
+                        .arg(device.isEmpty() ? QStringLiteral("a paired browser") : device,
+                             logSafe(req.clientAddress, 64), logSafe(uid, 8));
+                qInfo().noquote() << "[signin]" << who << "opened this PC's sign-in screen";
+                const qint64 openedAt = QDateTime::currentMSecsSinceEpoch();
+                QObject::connect(worker, &StreamWorkerHost::exited, qApp, [who, openedAt]() {
+                    // The session reaches the screen a moment after the
+                    // sign-in screen's session ends, the worker with it.
+                    QTimer::singleShot(3000, qApp, [who, openedAt]() {
+                        qInfo().noquote()
+                            << "[signin] the sign-in screen opened by" << who << "ended after"
+                            << (QDateTime::currentMSecsSinceEpoch() - openedAt - 3000) / 1000
+                            << "s:" << RemoteDesktopReturn::signInOutcomeNow();
+                    });
+                });
+            }
             QObject::connect(
                 worker, &StreamWorkerHost::responseReady, qApp,
                 [respond, worker, &g_Pool, &g_DualSupport, &g_SingleSessionHosts,
                  &g_LiveSunshineUids, &g_StreamEnds, &authManager, &sessionMetrics, sessionFacts,
                  sessionStartedAt, reqSlot, standby, hostUuidCopy, uid, sessionToken, streamId,
-                 hostAppCommand, hostAppOnVirtual, hostAppCloseCommand,
-                 hostAppStillOpen](int code, QJsonObject bodyObj) {
+                 hostAppCommand, hostAppOnVirtual, hostAppCloseCommand, hostAppStillOpen,
+                 signInStream](int code, QJsonObject bodyObj) {
                     const bool ok =
                         code == 200 && bodyObj["status"].toString() == QLatin1String("streaming");
                     // Count a session once it actually carries a picture, and
@@ -4184,7 +4593,7 @@ int main(int argc, char* argv[])
                                                     !g_SingleSessionHosts.contains(hostUuidCopy);
                         bodyObj["stream_id"] = streamId;
                         g_StreamEnds.begin(streamId, hostUuidCopy, reqSlot, uid, sessionToken,
-                                           QDateTime::currentMSecsSinceEpoch());
+                                           QDateTime::currentMSecsSinceEpoch(), signInStream);
                         authManager.setSessionStreaming(sessionToken, true);
                         g_LiveSunshineUids.insert(uid);
                         // A successful standby launch IS the capability probe.
@@ -4376,7 +4785,8 @@ int main(int argc, char* argv[])
                                 auto* identity = IdentityManager::get();
                                 auto* quitReply = computerManager.http()->quitAppAsync(
                                     h->activeAddress, h->activeHttpsPort,
-                                    identity->getCertificate(), identity->getPrivateKey(), uid);
+                                    identity->getCertificate(), identity->getPrivateKey(),
+                                    h->serverCertPem, uid);
                                 // Report the outcome. This /cancel used to be
                                 // pure fire-and-forget, so a refused or failed
                                 // one left Sunshine holding the app with nothing
@@ -4511,12 +4921,27 @@ int main(int argc, char* argv[])
             // worker is spawned once the engine can see it. Several viewers
             // opening it at once share the one operation.
             //
-            // "Match my screen" is the one choice that names a size for it:
-            // a display nobody sees can be made at the client's own, phone
-            // shape and all, instead of the 1080p default. Every other choice
-            // passes 0 and takes the mode that is there.
-            const int vdWidth = reqMatchDisplay ? reqWidth : 0;
-            const int vdHeight = reqMatchDisplay ? reqHeight : 0;
+            // "Match my screen" names a size for it: a display nobody sees
+            // can be made at the client's own, phone shape and all, instead of
+            // the 1080p default. So does any stream larger than that default
+            // (a 1440p or 2160p choice, the browser's or a TV's): it gets a
+            // desktop of its size rather than 1080p scaled up, or 1080p left
+            // as it is under a box (VirtualDisplay::sizeForStream). A smaller
+            // stream passes 0 and takes the mode that is there.
+            const VirtualDisplay::ModeSize vdSize =
+                VirtualDisplay::sizeForStream(reqWidth, reqHeight, reqMatchDisplay);
+            const int vdWidth = vdSize.width;
+            const int vdHeight = vdSize.height;
+            // The other displays off while it runs: allowed by the admin, and
+            // chosen in this browser's streaming settings ("others_off"). A
+            // browser that never chose sends nothing and gets the PC's
+            // inherited default (issue #39).
+            const bool vdOthersOff = [&body]() {
+                AppSettings settings;
+                return VirtualDisplay::ownerWantsOthersOff(
+                    settings.virtualDisplayExclusive(), body.contains("others_off"),
+                    body["others_off"].toBool(false), settings.virtualDisplayExclusiveInherited());
+            }();
             // Its refresh rate, on Windows, is 240 Hz whatever the stream's
             // (decision A of plan framerate-hote, 30/09/2026), or a whole
             // multiple of the client's screen under vddmatch (below). A
@@ -4618,9 +5043,9 @@ int main(int argc, char* argv[])
             if (host->backendType == NativeHostBackend::typeName() &&
                 NativeHostBackend::usesVirtualDisplay(appId)) {
                 readyThenStart = [claimThenStart, worker, respond, standby, reqSlot, generation,
-                                  vdWidth, vdHeight, vdRefresh, vdHdr]() {
+                                  vdWidth, vdHeight, vdRefresh, vdHdr, vdOthersOff]() {
                     VirtualDisplayJob::instance().activate(
-                        vdWidth, vdHeight, vdRefresh, vdHdr,
+                        vdWidth, vdHeight, vdRefresh, vdHdr, vdOthersOff,
                         [claimThenStart, worker, respond, standby, reqSlot,
                          generation](bool ok, const QString& error) {
                             if (g_SlotLaunchGeneration.value(reqSlot) != generation) {
@@ -4744,16 +5169,104 @@ int main(int argc, char* argv[])
                 claimThenStart();
             }
         }
+    };
+    // "This PC's screen", the card of a session Remote Desktop left without a
+    // screen (Windows): opening it brings the session back to the PC's screen,
+    // locked, and the stream then starts on its primary display — the lock
+    // screen, unlocked from the stream. Nothing else ever brings it back
+    // (RemoteDesktopReturn). A launch that finds the session back already (a
+    // quality switch, a second tab) streams that display straight away.
+    // "This PC's sign-in screen", the card offered in its place, streams the
+    // console's sign-in screen instead; once the user has signed in through
+    // it, the same card streams the PC's screen the same way.
+    server.router()->postAsync("/api/hosts/:id/start", [&computerManager,
+                                                        startHost](const HttpRequest& req,
+                                                                   ResponseCallback respond) {
+        NvComputer* host = computerManager.getHost(req.pathParams.value("id"));
+        const QJsonObject body = QJsonDocument::fromJson(req.body).object();
+        const bool native = host && host->backendType == NativeHostBackend::typeName();
+        const int appId = body["appId"].toInt(0);
+        const bool signInCard = native && appId == NativeHostBackend::signInScreenAppId();
+        if (!native || (appId != NativeHostBackend::remoteDesktopReturnAppId() && !signInCard)) {
+            startHost(req, std::move(respond));
+            return;
+        }
+        // "This PC's sign-in screen" (RemoteDesktopReturnPolicy): never in a
+        // version that does not offer it, never from a kiosk. startHost asks
+        // the rest again where the stream starts.
+        if (signInCard && (!RemoteDesktopReturnPolicy::kSignInOffered || req.adminLocked)) {
+            respond(HttpResponse::error(
+                req.adminLocked ? 403 : 409,
+                QStringLiteral("This PC's sign-in screen cannot be streamed: ") +
+                    (req.adminLocked ? QStringLiteral("not from a kiosk")
+                                     : QStringLiteral("this version does not offer it"))));
+            return;
+        }
+        // The displays come with the session, a moment after it reaches the
+        // console: asked again every 100 ms, for up to 3 s.
+        const auto streamPrimary = [startHost, req, body, respond]() {
+            auto attempt = std::make_shared<std::function<void(int)>>();
+            const std::weak_ptr<std::function<void(int)>> weak = attempt;
+            *attempt = [startHost, req, body, respond, weak](int triesLeft) {
+                QString why;
+                const int appId = NativeHostBackend::primaryDisplayAppId(&why);
+                if (appId > 0) {
+                    QJsonObject onScreen = body;
+                    onScreen["appId"] = appId;
+                    HttpRequest again = req;
+                    again.body = QJsonDocument(onScreen).toJson(QJsonDocument::Compact);
+                    qInfo().noquote()
+                        << "[rdp] streaming this PC's screen (display card" << appId << ")";
+                    startHost(again, respond);
+                    return;
+                }
+                const auto self = weak.lock();
+                if (triesLeft <= 0 || !self) {
+                    respond(HttpResponse::error(
+                        503, QStringLiteral("This PC's session is back on its screen, locked, but "
+                                            "no display showed up: ") +
+                                 why));
+                    return;
+                }
+                QTimer::singleShot(100, qApp, [self, triesLeft]() { (*self)(triesLeft - 1); });
+            };
+            (*attempt)(30);
+        };
+        if (signInCard) {
+            // The session as it is now, not as the last tick saw it: a launch
+            // right after the user signed in through the sign-in screen (the
+            // page starts the card again, StreamEnds::nameFor) streams the
+            // PC's screen, which the session is back on.
+            RemoteDesktopReturn::instance().refreshNow();
+            if (RemoteDesktopReturn::instance().leftByRemoteDesktop())
+                startHost(req, respond);
+            else
+                streamPrimary();
+            return;
+        }
+        if (!RemoteDesktopReturn::instance().leftByRemoteDesktop()) {
+            streamPrimary();
+            return;
+        }
+        RemoteDesktopReturn::instance().bringBack(
+            [streamPrimary, respond](bool ok, const QString& error) {
+                if (!ok) {
+                    respond(HttpResponse::error(409, error));
+                    return;
+                }
+                streamPrimary();
+            });
     });
 
     // Phase 5: Quit running app
     server.router()->postAsync(
         "/api/hosts/:id/quit",
         [&computerManager, &g_ActiveRelay, &g_ActiveStreamRelay, &g_ActiveMediaTrackRelay,
-         &g_ActiveSession, &g_ActiveClientUniqueId, &g_ActiveHostUuid, &g_Pool, &g_LiveSunshineUids,
-         &g_DualSupport, &g_SingleSessionHosts, &dropPendingHostCancel, &detachWorkerSlot,
-         &appOutlivesStream, &anyOtherSlotLive, &endPlayerSessions, &quitsPerDevice, &quitDeviceApp,
-         &releaseSeatIfIdle](const HttpRequest& req, const ResponseCallback& respond) {
+         &g_ActiveSession, &g_ActiveClientUniqueId, &g_ActiveSessionToken, &g_ActiveHostUuid,
+         &g_Pool, &g_LiveSunshineUids, &g_DualSupport, &g_SingleSessionHosts,
+         &dropPendingHostCancel, &detachWorkerSlot, &appOutlivesStream, &anyOtherSlotLive,
+         &endPlayerSessions, &quitsPerDevice, &quitDeviceApp, &releaseSeatIfIdle,
+         &reapCoopSession](const HttpRequest& req, const ResponseCallback& respond) {
             QString uuid = req.pathParams.value("id");
             qInfo() << "[quit] ENTER — uuid=" << uuid << "relay=" << g_ActiveRelay.data()
                     << "relay valid=" << (!g_ActiveRelay.isNull());
@@ -4824,15 +5337,41 @@ int main(int argc, char* argv[])
             }
 
             // Anything that is not a retire ends with a Sunshine /cancel, which
-            // kills the app for everyone — so the invited players go first.
-            // Their workers must be gone before the owner's last slot ends, or
-            // anyOtherSlotLive() would suppress that /cancel and leave the game
-            // running with nobody attached. (A retire — keep_host_session — is
-            // one leg of the owner's dual stream stepping aside; the app, and
+            // kills the app for everyone — so the players invited to this host
+            // go first. Their workers must be gone before the owner's last slot
+            // ends, or anyOtherSlotLive() would suppress that /cancel and leave
+            // the game running with nobody attached. (A retire — keep_host_session
+            // — is one leg of the owner's dual stream stepping aside; the app, and
             // every player on it, carries on.)
-            if (!keepHostSession) endPlayerSessions(ShareManager::EndReason::OwnerStop);
+            //
+            // Only the stop of the device whose stream this host carries. One
+            // that was taken over may still send a late /quit, and the host's
+            // stream — with the guests on it — is another device's by then: it
+            // is asked before any slot is touched, while the pool still says
+            // who holds what. And only where a stop ends the app: on a host that
+            // takes no /cancel (the native host) the guests' picture outlives the
+            // owner's stream, and only quitting the app ends it for them.
+            const bool hostHeldByAnother =
+                g_Pool.hostHeldByAnother(host->uuid, quitSessionToken, quitUniqueId, kOwnerSlots);
+            if (hostHeldByAnother)
+                qInfo() << "[quit] Host" << host->name
+                        << "streams for another device — its guests stay";
+            const bool guestsEnd =
+                !keepHostSession && !hostHeldByAnother && (host->takesHostCancel() || quitApp);
+            if (guestsEnd) endPlayerSessions(host->uuid, ShareManager::EndReason::OwnerStop);
 
             bool workerStopped = false;
+            // The co-op sessions (Wolf) of the slots this Stop ends, read before
+            // the detach clears them. Not on a retire: the surviving leg is on
+            // the same session.
+            QVector<QPair<QString, QString>> stoppedCoop;
+            auto takeCoopSession = [&stoppedCoop, keepHostSession](SessionPool::Slot& sl) {
+                const QString id = sl.coopSessionId;
+                sl.coopSessionId.clear();
+                const QPair<QString, QString> entry{sl.hostUuid, id};
+                if (!keepHostSession && !id.isEmpty() && !stoppedCoop.contains(entry))
+                    stoppedCoop.append(entry);
+            };
             for (int i = 0; i < kOwnerSlots; ++i) {
                 SessionPool::Slot& sl = g_Pool.at(i);
                 if (!sl.worker) continue;
@@ -4868,27 +5407,49 @@ int main(int argc, char* argv[])
                 }
                 // Suppressed ended-cleanup: this handler owns the Sunshine
                 // /cancel decision (keyed by quitUniqueId below; none at all
-                // when retiring).
+                // when retiring) — and the co-op session the ended handler
+                // would have closed, gathered here.
+                takeCoopSession(sl);
                 detachWorkerSlot(i, false);
                 workerStopped = true;
             }
             // A stream of this device on this host in a slot past the owner's
             // two — an app slot (the virtual display beside Display 1, a second
-            // MultiSeat device) — is this device's too. session_slot is taken as
-            // sent here: the owner bound above would turn slot 5 into 1.
+            // MultiSeat device, a second device on a Wolf) — is this device's
+            // too. session_slot is taken as sent here: the owner bound above
+            // would turn slot 5 into 1. The page sends the slot's derived id,
+            // not always the one its launch carried, so the slot it names from
+            // the session that started it is enough (12/11/2026: a second Wolf
+            // device's Stop found nothing and left its lobby running).
             const int rawSlot =
                 qbody.contains("session_slot") ? qbody["session_slot"].toInt(-1) : -1;
-            for (int i = kOwnerSlots; i < g_Pool.size() && !quitUniqueId.isEmpty(); ++i) {
-                const SessionPool::Slot& sl = g_Pool.at(i);
-                if (!sl.worker || sl.hostUuid != host->uuid || sl.clientUniqueId != quitUniqueId)
+            for (int i = kOwnerSlots; i < g_Pool.size(); ++i) {
+                if (!g_Pool.quitReachesAppSlot(i, host->uuid, quitUniqueId, quitSessionToken,
+                                               rawSlot))
                     continue;
-                if (rawSlot >= 0 && rawSlot != i) continue;
-                if (!quitSessionToken.isEmpty() && !sl.sessionToken.isEmpty() &&
-                    quitSessionToken != sl.sessionToken)
-                    continue;
+                SessionPool::Slot& sl = g_Pool.at(i);
                 qInfo() << "[quit] Stopping stream worker slot" << i << "(app slot of this device)";
+                takeCoopSession(sl);
                 detachWorkerSlot(i, false);
                 workerStopped = true;
+            }
+            // The Stop's own end of the co-op sessions those slots held (Wolf),
+            // with the lobby each leaves running for nobody. The GameStream
+            // /cancel below cannot do it: the session was launched under the
+            // seat's certificate, not ours, and Wolf kept it and its lobby
+            // after every Stop (UM790Pro, 07-08/11/2026). Not a session a slot
+            // still streams — two legs of one seat share it.
+            for (const auto& [coopHost, coopId] : stoppedCoop) {
+                bool stillStreamed = false;
+                for (int i = 0; i < g_Pool.size(); ++i) {
+                    const SessionPool::Slot& s = g_Pool.at(i);
+                    if (s.worker && s.hostUuid == coopHost && s.coopSessionId == coopId)
+                        stillStreamed = true;
+                }
+                if (stillStreamed)
+                    qInfo() << "[quit] Co-op session" << coopId << "still streamed — kept";
+                else
+                    reapCoopSession(coopHost, coopId, /*ownerStop*/ true);
             }
 
             // Ownership guard: a client that was taken over by another device may
@@ -4951,6 +5512,7 @@ int main(int argc, char* argv[])
                 g_ActiveSession->deleteLater();
                 g_ActiveSession = nullptr;
                 g_ActiveClientUniqueId.clear();
+                g_ActiveSessionToken.clear();
                 g_ActiveHostUuid.clear();
             }
 
@@ -5006,7 +5568,7 @@ int main(int argc, char* argv[])
             auto* identity = IdentityManager::get();
             QNetworkReply* reply = computerManager.http()->quitAppAsync(
                 host->activeAddress, host->activeHttpsPort, identity->getCertificate(),
-                identity->getPrivateKey(), quitUniqueId);
+                identity->getPrivateKey(), host->serverCertPem, quitUniqueId);
             qInfo() << "[quit] quitAppAsync reply=" << reply;
 
             // Wait for quit to complete, then respond
@@ -5068,8 +5630,10 @@ int main(int argc, char* argv[])
     // that knows its slot and uniqueid. When the owner cannot get back to their
     // stream — tab killed, machine rebooted, players holding the session open —
     // nothing in the UI can end the app any more, and Sunshine keeps it running.
-    // This one is deliberately unscoped: it drops every slot and cancels every
-    // Sunshine session we know to be live, whoever started it.
+    // This one is deliberately unscoped as to who: it drops every slot on this
+    // host and cancels every Sunshine session we know to be live there,
+    // whoever started it. Never another host's stream: a native stream left
+    // running while a Sunshine session on the same PC is closed must survive.
     server.router()->postAsync(
         "/api/hosts/:id/stop-session",
         [&computerManager, &g_Pool, &g_LiveSunshineUids, &detachWorkerSlot, &endPlayerSessions,
@@ -5120,8 +5684,9 @@ int main(int argc, char* argv[])
             }
 
             qInfo() << "[stop-session] Forcing the host session down";
-            endPlayerSessions(ShareManager::EndReason::OwnerStop);
-            for (int i = 0; i < kOwnerSlots; ++i)
+            // This host's guests: the cancels below end their app too.
+            endPlayerSessions(host->uuid, ShareManager::EndReason::OwnerStop);
+            for (int i : g_Pool.slotsOnHost(host->uuid, kOwnerSlots))
                 detachWorkerSlot(i, false);
 
             // Sunshine's /cancel is keyed by the uniqueid that launched the
@@ -5165,7 +5730,7 @@ int main(int argc, char* argv[])
                 const QString uid = cancelQueue.at(idx++);
                 auto* reply = computerManager.http()->quitAppAsync(
                     host->activeAddress, host->activeHttpsPort, identity->getCertificate(),
-                    identity->getPrivateKey(), uid);
+                    identity->getPrivateKey(), host->serverCertPem, uid);
                 QObject::connect(reply, &QNetworkReply::finished, reply, [reply, sendNext]() {
                     reply->deleteLater();
                     (*sendNext)();
@@ -5209,18 +5774,24 @@ int main(int argc, char* argv[])
     // already streaming, on a slot of their own. Everything that is not the
     // resolution is decided here — the browser on the other end is a stranger's.
 
-    // The owner's live context (host + app), taken from whichever owner slot is
-    // up. Empty uuid means nothing is running and no player can join.
-    auto ownerContext = [&g_Pool, &g_LiveSunshineUids]() {
-        for (int i = 0; i < kOwnerSlots; ++i)
-            if (g_Pool.at(i).worker && !g_Pool.at(i).hostUuid.isEmpty())
-                return std::pair<QString, int>{g_Pool.at(i).hostUuid, g_Pool.at(i).appId};
+    // The owner's live context (host + app), taken from an owner slot that is
+    // up. Empty uuid means nothing is running and no player can join. The device
+    // asking (its session) and the host its board is about decide which slot:
+    // that device's own stream of that host first, so an owner streaming two
+    // machines from two devices invites each guest to the machine they asked
+    // from (SessionPool::ownerSlotFor).
+    auto ownerContext = [&g_Pool, &g_LiveSunshineUids](const QString& session,
+                                                       const QString& wantedHost) {
+        const int i = g_Pool.ownerSlotFor(session, wantedHost, kOwnerSlots);
+        if (i >= 0) return std::pair<QString, int>{g_Pool.at(i).hostUuid, g_Pool.at(i).appId};
         // No owner leg left — they pressed Leave, or their stream dropped. While
         // the session is still held on Sunshine, the app is still up: fall back
-        // to what it was. Otherwise nothing runs, and the board's own choice of
-        // host and app decides (S9.2, 11/10: the last stream's display won over
-        // the one the owner had just picked, for every invitation after it).
-        if (!g_LastOwnerHostUuid.isEmpty() && !g_LiveSunshineUids.isEmpty())
+        // to what it was, on that host. Otherwise nothing runs, and the board's
+        // own choice of host and app decides (S9.2, 11/10: the last stream's
+        // display won over the one the owner had just picked, for every
+        // invitation after it).
+        if (!g_LastOwnerHostUuid.isEmpty() && !g_LiveSunshineUids.isEmpty() &&
+            (wantedHost.isEmpty() || wantedHost == g_LastOwnerHostUuid))
             return std::pair<QString, int>{g_LastOwnerHostUuid, g_LastOwnerAppId};
         return std::pair<QString, int>{};
     };
@@ -5272,6 +5843,16 @@ int main(int argc, char* argv[])
         return picture;
     };
     shareDeps.currentOwnerContext = ownerContext;
+    // Off the tunnel the cookie is all a request carries; the board's rows that
+    // hand out a guest's way in ask the session's pairing key for a proof there
+    // (OwnerProof). Through the tunnel the line proved that key already.
+    shareDeps.ownerProofKey = [&authManager](const HttpRequest& req) {
+        if (req.viaTunnel) return QByteArray();
+        return authManager.sessionPairingKey(HttpServer::sessionTokenFromRequest(req));
+    };
+    shareDeps.hostKeyId = [&appSettings]() {
+        return PairingCrypto::keyId(appSettings.hostSigningPublicKey());
+    };
     shareDeps.ownerWatching = [&g_Pool](const QString& hostUuid) {
         for (int i = 0; i < kOwnerSlots; ++i)
             if (g_Pool.at(i).worker && g_Pool.at(i).hostUuid == hostUuid) return true;
@@ -5420,7 +6001,7 @@ int main(int argc, char* argv[])
                              auto* identity = IdentityManager::get();
                              auto* quitReply = computerManager.http()->quitAppAsync(
                                  h->activeAddress, h->activeHttpsPort, identity->getCertificate(),
-                                 identity->getPrivateKey(), uid);
+                                 identity->getPrivateKey(), h->serverCertPem, uid);
                              QObject::connect(quitReply, &QNetworkReply::finished, quitReply,
                                               &QNetworkReply::deleteLater);
                          });
@@ -5490,6 +6071,14 @@ int main(int argc, char* argv[])
         NvComputer* host = computerManager.getHost(hostUuid);
         if (!host) {
             // The host this invitation was bound to is gone from the list.
+            respond(HttpResponse::json(QJsonObject{{"error", "session_ended"}}, 409));
+            return;
+        }
+        // The console's sign-in screen is the owner's alone, never a guest's,
+        // cold or beside the owner (RemoteDesktopReturnPolicy).
+        if (!RemoteDesktopReturnPolicy::guestMayStream(
+                host->backendType == NativeHostBackend::typeName(), appId)) {
+            qInfo() << "[signin] a guest refused: the sign-in screen is never shared";
             respond(HttpResponse::json(QJsonObject{{"error", "session_ended"}}, 409));
             return;
         }
@@ -5678,6 +6267,8 @@ int main(int argc, char* argv[])
         cfg["iceTcp"] = mode.endsWith(QStringLiteral("-tcp"));
         cfg["lowAudio"] = false;
         cfg["muteHostAudio"] = false;
+        // A guest hears what the host's default stream would.
+        cfg["audioSource"] = streamableAudioSource(appSettings.audioSource());
         // The guest's browser decodes through a gap, as the owner's /start
         // says it (ride_out_loss): a native host then refreshes their stream
         // in a wave, and a lost frame costs no keyframe. The shared feed sets
@@ -5715,6 +6306,7 @@ int main(int argc, char* argv[])
         cfg["serverHost"] = serverHost;
         cfg["serverHttpsPort"] = static_cast<int>(server.activeHttpsPort());
         cfg["signalingPort"] = static_cast<int>(slotSignalingPort(slot));
+        cfg["loopbackKey"] = QString::fromLatin1(mw::loopback::key());
         cfg["streamRelayPort"] = static_cast<int>(slotSignalingPort(slot) + 1);
         cfg["mediaPort"] = static_cast<int>(kMediaBasePort + slot);
         cfg["wsPath"] = slotWsPath(slot);
@@ -6100,11 +6692,14 @@ int main(int argc, char* argv[])
 
     // Announce this server on the LAN (_moonlightweb._tcp), so the TV app finds
     // it without typing an address. Through the OS's own mDNS responder: binding
-    // UDP 5353 ourselves for good is what ComputerManager avoids.
+    // UDP 5353 ourselves for good is what ComputerManager avoids. Its TXT record
+    // carries the name this install goes by, read here once: a rename in the
+    // admin page reaches the announcement at the next start of the server.
     MdnsAdvertiser mdnsAdvertiser;
     mdnsAdvertiser.start(
         MdnsAdvertiser::instanceName(QSysInfo::machineHostName(), mw::edition::isDev()),
-        server.activeHttpsPort());
+        server.activeHttpsPort(), PairingCrypto::keyId(appSettings.hostSigningPublicKey()),
+        appSettings.displayName());
 
     // URL for the host machine's own entry points (Desktop shortcut, installer
     // post-install page, Dock, tray, startup open).
@@ -6272,6 +6867,13 @@ int main(int argc, char* argv[])
         if (online) probeEntry();
     });
 
+    // The keys this machine's own links open a page with: each made for one
+    // link, good once and for ten minutes, kept in memory and nowhere else
+    // (server/HostKeyVault.h). An earlier version kept one key in settings.json;
+    // what is left of it there opens nothing any more and is removed.
+    HostKeyVault hostKeys;
+    appSettings.forgetLocalKey();
+
     // The way into this machine's own pages under a certificate the browser
     // already trusts.
     //
@@ -6299,13 +6901,32 @@ int main(int argc, char* argv[])
         probeEntry();
         if (!entryAnswers) return {};
         const QString entry = rendezvous.entryUrl();
-        const QString key = appSettings.localKey();
-        if (entry.isEmpty() || key.isEmpty()) return {};
+        if (entry.isEmpty()) return {};
+        // Made here, for this link, once every other reason to hand out none
+        // has been ruled out: a key waits ten minutes for the click it was
+        // made for, and is in no file.
+        const QString key = hostKeys.mint();
         return entry + QStringLiteral("#k=") + QString::fromLatin1(QUrl::toPercentEncoding(key)) +
                (path.isEmpty() ? QString() : QStringLiteral("&p=") + path);
     };
     auto remoteAdminLink = [remoteLink]() -> QString {
         return remoteLink(QStringLiteral("/admin"));
+    };
+
+    // The same page under this machine's own address, with a key of its own:
+    // what an entry point opens when the internet link would not work. The key
+    // is what tells the page it was opened by this machine's owner, here.
+    auto localLink = [&hostKeys, entryUrl](const QString& path) -> QString {
+        return entryUrl(path) + QStringLiteral("#k=") +
+               QString::fromLatin1(QUrl::toPercentEncoding(hostKeys.mint()));
+    };
+    // The link an entry point opens: the internet one when there is one that
+    // works, this machine's own otherwise. Each carries a key made for it, so
+    // it is asked for at the click and never kept: not in a file, not in a
+    // shortcut, not in a log.
+    auto ownerLink = [remoteLink, localLink](const QString& path) -> QString {
+        const QString remote = remoteLink(path);
+        return remote.isEmpty() ? localLink(path) : remote;
     };
 
     // An empty link that is only "not yet": the internet way in is wanted, but
@@ -6321,30 +6942,42 @@ int main(int argc, char* argv[])
         return rendezvousShouldRun() && !entryVerdictReached && sinceLineWanted.elapsed() < 20000;
     };
 
-    // GET /api/server/remote-link — the same link, for the tray client. That
-    // tray runs in its own process decorating a server it cannot see, so it asks
-    // over loopback. Local callers only: this hands out a live credential, and
-    // everything else already has the machine itself.
+    // GET /api/server/remote-link — the link an entry point opens, for the ones
+    // that live in another process: the tray client, which decorates a server it
+    // cannot see, the command line (--open-link), the installer's last page. The
+    // internet link when there is one that works, this machine's own address
+    // otherwise, each with a key made for it.
+    //
+    // The host machine only: this hands out a live credential, the one that says
+    // "the host machine's own browser". Not a computer of the network that
+    // unlocked the admin page with the password: it administers, and is not the
+    // host.
     //
     // `?p=` names the page, absent means the front door. It is checked against
     // the shape the bootstrap will accept rather than passed through, so this
     // route can never be the thing that puts an arbitrary string into a link
     // this machine hands its owner.
     //
-    // `pending` is true while an empty url is only "not yet" (remoteLinkPending).
-    server.router()->get(
-        "/api/server/remote-link", [remoteLink, remoteLinkPending](const HttpRequest& req) {
-            if (!req.isLocal && !(req.adminLocked && req.isHostMachine))
-                return HttpResponse::error(403, "Only available from localhost");
-            const QString path = req.queryParams.value(QStringLiteral("p"));
-            static const QRegularExpression shape(QStringLiteral("^/[A-Za-z0-9_-]{1,32}$"));
-            if (!path.isEmpty() && !shape.match(path).hasMatch())
-                return HttpResponse::error(400, "Bad page");
-            const QString url = remoteLink(path);
-            return HttpResponse::json(
-                QJsonObject{{QStringLiteral("url"), url},
-                            {QStringLiteral("pending"), url.isEmpty() && remoteLinkPending()}});
-        });
+    // `pending` is true while the internet link is only "not yet"
+    // (remoteLinkPending): the url is then empty, for a caller that can wait to
+    // ask again rather than settle for this machine's own address.
+    server.router()->get("/api/server/remote-link", [remoteLink, remoteLinkPending,
+                                                     localLink](const HttpRequest& req) {
+        if (!req.isHostMachine)
+            return HttpResponse::error(403, "Only available to the host "
+                                            "machine");
+        const QString path = req.queryParams.value(QStringLiteral("p"));
+        static const QRegularExpression shape(QStringLiteral("^/[A-Za-z0-9_-]{1,32}$"));
+        if (!path.isEmpty() && !shape.match(path).hasMatch())
+            return HttpResponse::error(400, "Bad page");
+        const QString remote = remoteLink(path);
+        const bool pending = remote.isEmpty() && remoteLinkPending();
+        const QString url = !remote.isEmpty() ? remote : pending ? QString() : localLink(path);
+        HttpResponse resp = HttpResponse::json(
+            QJsonObject{{QStringLiteral("url"), url}, {QStringLiteral("pending"), pending}});
+        resp.headers["Cache-Control"] = "no-store";
+        return resp;
+    });
 
     // GET /api/server/stream-activity — who is streaming this screen, for the
     // tray client. Same snapshot the in-process tray reads straight from the
@@ -6399,30 +7032,33 @@ int main(int argc, char* argv[])
     controlChannel.start();
     server.setControlPort(controlChannel.port());
 
-    server.router()->post("/api/local/focus",
-                          [&controlChannel, adminUrl](const HttpRequest& req) -> HttpResponse {
-                              // Loopback only: this is the private IPC surface a second local
-                              // launch uses, never something a remote peer should trigger.
-                              if (!req.isLocal && !(req.adminLocked && req.isHostMachine))
-                                  return HttpResponse::error(403, "local only");
-                              QJsonObject obj;
-                              if (controlChannel.hasClients()) {
-                                  controlChannel.broadcastFocusAdmin();
-                                  obj["delivered"] = true;
-                              } else {
-                                  openInBrowser(adminUrl());
-                                  obj["delivered"] = false;
-                              }
-                              return HttpResponse::json(obj, 200);
-                          });
+    server.router()->post(
+        "/api/local/focus",
+        [&controlChannel, ownerLink, adminLocked](const HttpRequest& req) -> HttpResponse {
+            // Loopback only: this is the private IPC surface a second local
+            // launch uses, never something a remote peer should trigger.
+            if (!req.isLocal && !(req.adminLocked && req.isHostMachine))
+                return HttpResponse::error(403, "local only");
+            QJsonObject obj;
+            if (controlChannel.hasClients()) {
+                controlChannel.broadcastFocusAdmin();
+                obj["delivered"] = true;
+            } else {
+                // With a key: the page that opens is this
+                // machine's owner's.
+                openInBrowser(ownerLink(adminLocked ? QString() : QStringLiteral("/admin")));
+                obj["delivered"] = false;
+            }
+            return HttpResponse::json(obj, 200);
+        });
 
     // — Internet Access via PowerDNS —
 
-    // The host key is single-use: after each redemption the rotated key must be
-    // written back into the Desktop shortcut (tray/startup URLs read it live).
+    // The key of a link this machine handed its owner is spent where it was
+    // made (hostKeys, above).
     registerSystemRoutes(
         server, appSettings, authManager, internetAccess, computerManager,
-        [adminUrl]() { writeAdminShortcut(adminUrl()); },
+        [&hostKeys](const QString& key) { return hostKeys.spend(key); },
         [&rendezvous, rendezvousShouldRun, &entryVerdictReached, &sinceLineWanted](bool enabled) {
             if (enabled && rendezvousShouldRun()) {
                 // A line that is not up yet restarts the "not yet" window, so
@@ -6451,7 +7087,62 @@ int main(int argc, char* argv[])
             if (const QString err = rendezvous.lastError(); !err.isEmpty())
                 rdv[QStringLiteral("error")] = err;
             return rdv;
+        },
+        [&routerPorts](const HttpRequest& req) {
+            // The browser's way here, as a stream would plan it: on this
+            // machine or its network (streamClientKind), or a public address
+            // that is this network's own (streamClientSameNetwork, without its
+            // log line: the page asks at every launch). A mesh VPN is not.
+            const NetClassify::Kind kind = streamClientKind(req);
+            if (kind == NetClassify::Kind::Loopback || kind == NetClassify::Kind::Private)
+                return true;
+            return kind == NetClassify::Kind::Public &&
+                   NetClassify::sharesHostNetwork(req.clientAddress, {routerPorts.publicIp()},
+                                                  QNetworkInterface::allAddresses());
         });
+
+    // A device asking in by the QR code it shows, approved by the administrator
+    // (server/PhonePairing.h). Here, after the rendezvous client: the QR code
+    // opens this machine's public link while its line is up, which is where the
+    // administrator's phone holds its session.
+    registerPairRequestRoutes(
+        *server.router(), authManager,
+        {[&appSettings]() { return appSettings.hostSigningPublicKey(); },
+         &HttpServer::sessionTokenFromRequest,
+         [&server](const QString& address) { server.reportAuthFailure(address); },
+         [&authManager, &geoIpService](const QString& token, const QString& address) {
+             geoIpService.lookupIp(
+                 address, [&authManager, token](const QString& city, const QString& country) {
+                     authManager.setSessionGeo(token, city, country);
+                 });
+         },
+         [&rendezvous]() { return rendezvous.isOnline() ? rendezvous.entryUrl() : QString(); },
+         []() { return QDateTime::currentSecsSinceEpoch(); },
+         [&appSettings]() { return appSettings.pairRequestInternet(); },
+         [&appSettings]() { return appSettings.sessionLocationEnabled(); },
+         [&geoIpService](const QString& address) {
+             // Known, or asked for once: the answer lands in the cache, where
+             // the administrator's next look finds it.
+             const QString city = geoIpService.cachedLocation(address).first;
+             if (city.isEmpty())
+                 geoIpService.lookupIp(address, [](const QString&, const QString&) {});
+             return city;
+         },
+         []() {
+             // Read on every answer: a cable plugged in or a Wi-Fi joined since
+             // the start counts at once.
+             QList<QPair<QHostAddress, int>> subnets;
+             for (const QNetworkInterface& i : QNetworkInterface::allInterfaces()) {
+                 const auto flags = i.flags();
+                 if (!flags.testFlag(QNetworkInterface::IsUp) ||
+                     flags.testFlag(QNetworkInterface::IsLoopBack))
+                     continue;
+                 for (const QNetworkAddressEntry& e : i.addressEntries())
+                     if (e.prefixLength() > 0) subnets.append({e.ip(), e.prefixLength()});
+             }
+             return subnets;
+         },
+         &HttpServer::isLocalRequest});
 
     // ── The application, carried to a browser that cannot reach us ───────────
     //
@@ -6480,7 +7171,10 @@ int main(int argc, char* argv[])
     // The desktop session gets its tray from runTrayClient() instead.
     TrayManager trayManager(&server);
     trayManager.setUrlProvider([entryUrl](const QString& path) { return QUrl(entryUrl(path)); });
-    trayManager.setRemoteLinkProvider(remoteLink);
+    // A click opens the owner's link: the internet one, or this machine's own
+    // address with its key. The plain address above is what is written down
+    // (the log line at start-up), and what is left if no link could be made.
+    trayManager.setRemoteLinkProvider(ownerLink);
     trayManager.setActivityProvider(streamActivity);
     trayManager.setAdminLocked(adminLocked);
     if (hasGuiSession()) trayManager.init();
@@ -6550,7 +7244,7 @@ int main(int argc, char* argv[])
             if (link.isEmpty() && --(*attemptsLeft) > 0) return;
             opener->stop();
             opener->deleteLater();
-            const QString url = link.isEmpty() ? entryUrl(path) : link;
+            const QString url = link.isEmpty() ? localLink(path) : link;
             // Without its fragment: that is where the host key rides.
             QUrl logged(url);
             logged.setFragment(QString());
@@ -6612,6 +7306,30 @@ int main(int argc, char* argv[])
         }
         // Nothing is printed when Internet Access is off: the operator turned it
         // off, or never turned it on. --status is where that gets explained.
+    }
+
+    // The channel the other programs of this install reach this server by: the
+    // tray icon of a server that runs as a service, the command line, a second
+    // launch (server/LocalChannel.h). Opened last, once every route it may ask
+    // for exists. A server that cannot open it says so and runs without one: it
+    // never shares a name something else already holds.
+    mw::localchannel::Server localChannel;
+    {
+        const QString endpoint = mw::localchannel::endpointFor(
+            mw::localchannel::channelName(mw::edition::productName(), mw::edition::devFlag()),
+            QStandardPaths::writableLocation(QStandardPaths::AppDataLocation));
+        QString why;
+        const bool open = localChannel.listen(
+            endpoint,
+            [&server](const mw::localchannel::Request& request,
+                      mw::localchannel::Server::Respond respond) {
+                server.serveLocal(request, std::move(respond));
+            },
+            &why);
+        if (open)
+            Logger::info(QStringLiteral("[LocalChannel] open"));
+        else
+            Logger::error(QStringLiteral("[LocalChannel] not open: %1").arg(why));
     }
 
     const int exitCode = app.exec();

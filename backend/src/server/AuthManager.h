@@ -20,6 +20,8 @@
 #include <QObject>
 #include <QHash>
 #include <QMap>
+#include <QSet>
+#include <functional>
 #include <optional>
 #include <QDateTime>
 #include <QByteArray>
@@ -28,6 +30,7 @@
 #include <QJsonObject>
 
 class QTimer;
+struct HttpRequest;
 
 /**
  * Session metadata stored server-side keyed by token.
@@ -75,11 +78,19 @@ struct SessionInfo
     // secret, and it never leaves the machine anyway.
     QByteArray pairingKey;
 
+    // The session that let this one in, by its opaque id: a device approved
+    // by the QR code it showed, from that session (server/PhonePairing.h).
+    // Revoking that session revokes this one too (destroySession); when it
+    // logs out or runs out of time, this one stays, the administrator's. Empty
+    // for every other way in, and when the host machine itself approved.
+    QString approvedBy;
+
     QJsonObject toJson() const
     {
         QJsonObject obj;
         obj["token"] = token;
         if (!pairingKey.isEmpty()) obj["pairing_key"] = QString::fromLatin1(pairingKey.toBase64());
+        if (!approvedBy.isEmpty()) obj["approved_by"] = approvedBy;
         obj["ip"] = ip;
         obj["machine_name"] = machineName;
         obj["city"] = city;
@@ -110,7 +121,7 @@ public:
     // ── PIN management ─────────────────────────────────────────────────────
     QString generatePin();
     QString currentPin() const { return m_currentPin; }
-    bool hasValidPin() const; // true if a real PIN has been generated
+    bool hasValidPin() const; // true if a PIN is shown and not yet used
     void clearPin();          // reset PIN to "--------" (invalid)
     void regeneratePin();     // generates new PIN + invalidates all sessions
 
@@ -130,6 +141,21 @@ public:
     };
 
     ValidateResult validatePin(const QString& ip, const QString& pin);
+
+    // ── The PIN proved without being sent (MW-PIN-v1, common/PinBinding.h) ──
+    // A run is the attempt, counted when it begins, on the typed PIN's own bucket
+    // and tiers: whatever its first round could reveal about the PIN is then no
+    // cheaper to collect than wrong PINs typed one by one.
+
+    /// POST /api/auth/pin/start: RateLimited while @p ip is locked out; else the
+    /// run is admitted and counted as a failure until its proof (finishPinProof).
+    ValidateResult beginPinProof(const QString& ip);
+
+    /// POST /api/auth/pin/finish: Valid when @p confirmed and @p pinAtStart, the
+    /// PIN the run was made with, is still the current one, which clears the
+    /// caller's failures as a typed PIN does. Not counted again otherwise, and no
+    /// lockout stops a run beginPinProof() already admitted.
+    ValidateResult finishPinProof(const QString& ip, const QString& pinAtStart, bool confirmed);
 
     // ── Remote admin password ──────────────────────────────────────────────
     // Second door into admin access, for a LAN machine that is not the host.
@@ -191,8 +217,9 @@ public:
     bool isEphemeralSession(const QString& token) const;
     /** Destroy the session a raw cookie token belongs to — the visitor logging
      *  themselves out. Unlike destroySession() this takes the raw token, so a
-     *  browser can only ever end its own session. Returns false when the token
-     *  matches none. */
+     *  browser can only ever end its own session. The sessions it let in stay,
+     *  the administrator's from now on: leaving is not a revocation. Returns
+     *  false when the token matches none. */
     bool logoutSession(const QString& token);
     /** True when the raw cookie token belongs to a valid *host* session (created
      *  by redeeming the host key — the browser runs on the host machine). */
@@ -205,6 +232,10 @@ public:
      *  access with the remote admin password. Orthogonal to isHostSession:
      *  same privileges, different proof. */
     bool isAdminSession(const QString& token) const;
+    /// The device name a valid session was paired under ("Bruno's iPhone"),
+    /// empty when there is none or the session is not valid. For an audit
+    /// line; never a credential.
+    QString sessionMachineName(const QString& token) const;
     /** Grant admin access to an existing session (after the password checked
      *  out). Takes the raw cookie token. Returns false for unknown sessions. */
     bool promoteSessionToAdmin(const QString& token);
@@ -235,8 +266,34 @@ public:
     /** The SPKI public key bound to the session a raw cookie @p token belongs
      *  to, or empty when there is none (or no such session). */
     QByteArray sessionPairingKey(const QString& token) const;
+
+    // ── Host sessions made before a session took its key at creation ───────
+    // A host session made through a rendezvous line by an earlier version
+    // holds no browser key. It takes the key of the line it next comes by,
+    // once: after that it is a session like any other, on that key only.
+
+    /** Sessions created before @p secs are the ones adoptLineKey looks at
+     *  (AppSettings::hostSessionRepairBefore). 0, the default, is none. */
+    void setHostSessionRepairBefore(qint64 secs) { m_hostSessionRepairBefore = secs; }
+
+    enum class LineKeyAdoption
+    {
+        NotConcerned, ///< not such a session, or no key on the line: nothing done
+        Deferred,     ///< such a session, from an address that cannot be this machine
+        Bound,        ///< the session now holds the line's key
+    };
+
+    /** Bind @p lineKey, the browser key a rendezvous line presented and
+     *  proved, to the session of the raw cookie @p token, when that session is
+     *  a valid host session made through a line, holds no key, and is older
+     *  than setHostSessionRepairBefore. @p plausibleAddress says whether the
+     *  request comes from an address that can be this machine (the check of
+     *  /api/auth/host-key); it is only asked for such a session. */
+    LineKeyAdoption adoptLineKey(const QString& token, const QByteArray& lineKey,
+                                 const std::function<bool()>& plausibleAddress);
     /** Revoke a session by its opaque id (the value exposed in sessions()/toJson,
-     *  i.e. the token hash), NOT the raw cookie token. */
+     *  i.e. the token hash), NOT the raw cookie token. Every session it let in
+     *  (SessionInfo::approvedBy) goes with it, and theirs in turn. */
     void destroySession(const QString& token);
     /** Rename a session by its opaque id (the token hash exposed in toJson),
      *  NOT the raw cookie token. No-op for unknown ids. Returns true on success. */
@@ -244,6 +301,10 @@ public:
     void destroyAllSessions();
     /** Drop sessions inactive beyond SESSION_TTL_SECS. Called periodically. */
     void purgeExpiredSessions();
+    /// A session whose approver is gone by expiry, not by revocation, keeps
+    /// going without one, the administrator's to revoke (logoutSession does the
+    /// same for the sessions it let in): returns how many.
+    int keepDevicesOfEndedApprovers();
 
     /** Store geolocation data for a session after async lookup completes. */
     void setSessionGeo(const QString& token, const QString& city, const QString& country);
@@ -278,6 +339,20 @@ public:
      *  to, or an empty string when the token matches none. Lets the admin UI
      *  point at the row that is the caller's own device. */
     QString sessionIdForToken(const QString& token) const;
+
+    /** Whether raw cookie @p token is the one behind session id @p sessionId,
+     *  the session still there or not (a revoked one, for its streams).
+     *  Never for an empty side. */
+    static bool isTokenOf(const QString& token, const QString& sessionId);
+
+    /** Record that the session behind raw cookie @p token was let in by the
+     *  session whose opaque id is @p approverId (SessionInfo::approvedBy).
+     *  Returns false when the token matches none. */
+    bool setSessionApprover(const QString& token, const QString& approverId);
+
+    /** True when @p id (an opaque id, as sessions() gives it) names a session
+     *  that has not expired. */
+    bool hasLiveSession(const QString& id) const;
 
     // ── Home-screen handoff ─────────────────────────────────────────────────
     // A shortcut added to an iPhone's home screen runs in a storage of its own,
@@ -348,6 +423,11 @@ public:
     int remainingAttempts(const QString& ip) const;
     int lockoutSeconds(const QString& ip) const;
     bool isRateLimited(const QString& ip) const;
+    /** Count a failed device pairing against @p ip, on the PIN's own counter: a
+     *  claim the device's key did not sign, a request the administrator refused,
+     *  one request more than an address may hold (PhonePairing.h). The two ways
+     *  in share one count, so neither is a way around the other's lockout. */
+    ValidateResult countPairingFailure(const QString& ip);
 
     // ── Address helpers ────────────────────────────────────────────────────
     /** Strip IPv4-mapped IPv6 prefix (e.g. "::ffff:192.168.1.5" -> "192.168.1.5") */
@@ -406,6 +486,23 @@ public:
      *
      *  @p headers are the request's, with lower-case names. */
     static QString attemptAddress(const QString& peer, const QMap<QString, QString>& headers);
+    /** Whether @p req comes from this machine's LAN: the one rule for what is
+     *  given to this LAN alone (routes/PairRequestRoutes.cpp, which narrows it
+     *  to this host's own links: a device asks to pair by its QR code;
+     *  routes/AuthStatusRoute.cpp: this machine's name).
+     *
+     *  On a line, by the address ICE settled on: a peer elsewhere cannot make a
+     *  connectivity check to a private address succeed. On a socket, by the
+     *  caller's address (the visitor a proxy on this machine names, see
+     *  attemptAddress) under a Host naming this machine, and from loopback only
+     *  under a name that cannot come from outside (RequestGuard::isLocalHostName):
+     *  a proxy here forwards the internet from loopback, under a public name. */
+    static bool fromThisLan(const HttpRequest& req);
+    /** Whether @p req may be told what this machine is called (GET /api/health's
+     *  `name`, GET /api/server/hostname): a caller on this LAN (fromThisLan),
+     *  the host machine itself (HttpRequest::isHostMachine), or one with a
+     *  session (@p signedIn). Anyone else learns it once signed in. */
+    static bool mayKnowMachineName(const HttpRequest& req, bool signedIn);
 
     // ── Session persistence ───────────────────────────────────────────────────
     /** Save active sessions to disk (app data directory). */
@@ -417,14 +514,24 @@ public:
     int activeSessionCount() const { return m_sessions.size(); }
     int failedAttemptCount(const QString& ip) const;
 
+    /// The clock of the attempt counters and lockouts, in seconds since the
+    /// epoch. For tests; empty puts back the wall clock.
+    void setRateClockForTesting(std::function<qint64()> nowSecs)
+    {
+        m_rateClock = std::move(nowSecs);
+    }
+
 signals:
     void pinChanged(const QString& newPin);
     void sessionCreated(const QString& ip, const QString& machineName);
     void sessionDestroyed(const QString& token);
-    /** Emitted when a destroyed session was actively streaming. The stream
-     *  lifecycle owner (main.cpp) must tear the live relay down so a revoked
-     *  device stops receiving the stream immediately. */
-    void streamingSessionRevoked();
+    /** Emitted when a session goes (revoked, logged out, replaced): the
+     *  stream lifecycle owner (main.cpp) ends that session's streams at once,
+     *  and no one else's. @p sessionId is its id (isTokenOf matches a cookie
+     *  to it); empty when every session went at once (destroyAllSessions),
+     *  and then every stream ends. Emitted whether or not the session is
+     *  flagged as streaming: the flag follows one stream only. */
+    void streamingSessionRevoked(const QString& sessionId);
     /** Emitted when session list changes (created or destroyed) */
     void sessionsChanged();
 
@@ -432,9 +539,14 @@ private:
     struct RateLimitEntry
     {
         int failures = 0;
-        QDateTime lastFailure;
+        // One failure is forgiven per RATE_DECAY_SECS without a new one,
+        // counted from here: the last failure, then each step forgiven.
+        qint64 decayFromEpoch = 0;
         long long lockoutUntilEpoch = 0;
     };
+    static constexpr qint64 RATE_DECAY_SECS = 600;
+    std::function<qint64()> m_rateClock; // tests only; the wall clock otherwise
+    qint64 rateNow() const;
 
     AppSettings* m_settings = nullptr;
     QString m_currentPin;
@@ -442,6 +554,11 @@ private:
     QByteArray m_hmacKey;
     QHash<QString, RateLimitEntry> m_rateLimits; // rate-limit key -> entry
     QHash<QString, SessionInfo> m_sessions;      // token hash (id) -> SessionInfo
+    qint64 m_hostSessionRepairBefore = 0;        // see setHostSessionRepairBefore
+    QSet<QString> m_lineKeyDeferredSaid;         // session ids already logged as Deferred
+
+    /// bindSessionKey, with @p note appended to the line it logs.
+    bool bindKey(const QString& token, const QByteArray& spkiDer, const QString& note);
 
     struct HomeScreenKey
     {

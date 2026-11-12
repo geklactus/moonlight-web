@@ -20,6 +20,8 @@ const VIEW_MESSAGES = new Set([
     'stats',
     'pong',
     'rumble',
+    // Native Windows host: the player number its OS gave a pad.
+    'padnumber',
     'clipboard',
     'clipboardcaps',
     // The pointer, when the client draws it: its shape, and its position.
@@ -41,6 +43,8 @@ const VIEW_MESSAGES = new Set([
     'hidffb',
     // A guest's mouse given or taken by the owner (StreamView._setMouseAllowed).
     'inputcaps',
+    // Touch-keyboard characters the host could only take as text (issue #44).
+    'textviaime',
 ]);
 
 /** Whether a host message of this type goes to the stream view. */

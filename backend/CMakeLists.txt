@@ -167,16 +167,22 @@ add_subdirectory(third_party/moonlight-common-c)
 
 # Our patches on submodules, kept as files in third_party/patches rather than a
 # fork: each is applied to the submodule's working tree at configure time, once
-# (a patch that already reverses cleanly is left alone).
+# (a patch that already reverses cleanly is left alone). A later patch may rewrite
+# lines an earlier one wrote, and the earlier one then no longer reverses on a tree
+# holding both: REQUIRED_BY names that later patch, and if it reverses, both are in.
 find_package(Git REQUIRED)
 function(mw_apply_patch dir patch)
-    set(p "${CMAKE_CURRENT_SOURCE_DIR}/third_party/patches/${patch}")
-    execute_process(COMMAND "${GIT_EXECUTABLE}" -C "${dir}" apply --reverse --check "${p}"
-                    RESULT_VARIABLE applied OUTPUT_QUIET ERROR_QUIET)
-    if(applied EQUAL 0)
-        return()
-    endif()
-    execute_process(COMMAND "${GIT_EXECUTABLE}" -C "${dir}" apply "${p}"
+    cmake_parse_arguments(PARSE_ARGV 2 ARG "" "REQUIRED_BY" "")
+    set(patches "${CMAKE_CURRENT_SOURCE_DIR}/third_party/patches")
+    foreach(in_tree IN ITEMS ${ARG_REQUIRED_BY} ${patch})
+        execute_process(COMMAND "${GIT_EXECUTABLE}" -C "${dir}" apply --reverse --check
+                                "${patches}/${in_tree}"
+                        RESULT_VARIABLE applied OUTPUT_QUIET ERROR_QUIET)
+        if(applied EQUAL 0)
+            return()
+        endif()
+    endforeach()
+    execute_process(COMMAND "${GIT_EXECUTABLE}" -C "${dir}" apply "${patches}/${patch}"
                     RESULT_VARIABLE failed ERROR_VARIABLE why)
     if(NOT failed EQUAL 0)
         message(FATAL_ERROR "${patch} does not apply to ${dir}: ${why}"
@@ -186,16 +192,22 @@ function(mw_apply_patch dir patch)
 endfunction()
 
 # libdatachannel: the DSCP of outgoing packets settable (rtc::SetDscpSettings),
-# where upstream writes EF / AF42 / AF11 in. The server puts it all in AF41
-# (plan « le son et la priorité des paquets », D5).
+# where upstream writes EF / AF42 / AF11 in. The server puts the sound in EF and
+# the rest in AF41 (plan « le son et la priorité des paquets », D5 and D9).
 mw_apply_patch("${CMAKE_CURRENT_SOURCE_DIR}/third_party/libdatachannel"
-               libdatachannel-dscp-settings.patch)
+               libdatachannel-dscp-settings.patch
+               REQUIRED_BY libdatachannel-track-video-dscp.patch)
 # DtlsSrtpTransport copies every RTP packet with make_message(size, orig), which
 # dropped the DSCP the track had set: the sound left in the video's class, never
 # its own (bench of 21/10). A patch of its own, so a tree with the one above
 # already applied takes it too.
 mw_apply_patch("${CMAKE_CURRENT_SOURCE_DIR}/third_party/libdatachannel"
                libdatachannel-srtp-dscp.patch)
+# A track's class follows the type of its section, so the frames on the audio
+# road (an audio section) would leave in the sound's class. Track::setVideoDscp
+# keeps them in the video's. A patch of its own, for the same reason.
+mw_apply_patch("${CMAKE_CURRENT_SOURCE_DIR}/third_party/libdatachannel"
+               libdatachannel-track-video-dscp.patch)
 # libjuice gives up marking on Windows without trying; on Windows 11 an
 # unelevated setsockopt(IP_TOS) does mark, under the service too. Chosen over a
 # QoS policy laid by the installer, which Windows leaves out of force after a
@@ -230,6 +242,9 @@ endif()
 mw_apply_patch("${MW_LIBJUICE_DIR}" libjuice-ice-tcp-passive.patch)
 mw_apply_patch("${CMAKE_CURRENT_SOURCE_DIR}/third_party/libdatachannel"
                libdatachannel-ice-tcp-passive.patch)
+# A datagram longer than libjuice's read buffer: Windows reports it as an error,
+# other systems cut it short. With this one libjuice drops it there too.
+mw_apply_patch("${MW_LIBJUICE_DIR}" libjuice-udp-long-datagram.patch)
 
 # libdatachannel (WebRTC DataChannel + media). Match the previous .bat flags.
 set(NO_WEBSOCKET ON  CACHE BOOL "" FORCE)
@@ -278,13 +293,17 @@ target_link_libraries(qmdnsengine PUBLIC Qt6::Network)
 add_executable(mw-server
     src/main.cpp
     src/common/PairingCrypto.cpp
+    src/common/PinBinding.cpp
     src/streaming/SdpFingerprint.cpp
     src/server/AuthManager.cpp
     src/server/AppSettings.cpp
+    src/server/AudioApps.cpp
     src/server/Provisioning.cpp
     src/server/ConnectionGuard.cpp
+    src/server/HostKeyVault.cpp
     src/server/HttpServer.cpp
     src/server/ControlChannel.cpp
+    src/server/LocalChannel.cpp
     src/server/ControlTunnel.cpp
     src/server/HttpParser.cpp
     src/server/RequestGuard.cpp
@@ -293,8 +312,12 @@ add_executable(mw-server
     src/server/HomeScreenShell.cpp
     src/server/RestRouter.cpp
     src/server/ShareManager.cpp
+    src/server/OwnerProof.cpp
     src/server/SessionPool.cpp
     src/server/routes/AuthRoutes.cpp
+    src/server/routes/AuthStatusRoute.cpp
+    src/server/routes/HostKeyRoute.cpp
+    src/server/routes/PinProofRoutes.cpp
     src/server/routes/HostRoutes.cpp
     src/server/routes/HostAppRoutes.cpp
     src/server/HostAppImage.cpp
@@ -303,6 +326,8 @@ add_executable(mw-server
     src/server/routes/ShareRoutes.cpp
     src/server/routes/SystemRoutes.cpp
     src/server/routes/LogRoutes.cpp
+    src/server/routes/PairRequestRoutes.cpp
+    src/server/PhonePairing.cpp
     src/server/LogArchive.cpp
     src/server/LogScrubber.cpp
     src/common/Logger.cpp
@@ -310,6 +335,7 @@ add_executable(mw-server
     src/common/ZipWriter.cpp
     src/common/CrashHandler.cpp
     src/common/DesktopSession.cpp
+    src/common/LoopbackKey.cpp
     src/common/Edition.cpp
     src/common/LinuxCapabilities.cpp
     src/common/RendezvousId.cpp
@@ -330,12 +356,14 @@ add_executable(mw-server
     src/network/UpdateApplyRules.cpp
     src/network/MdnsAdvertiser.cpp
     src/TrayManager.cpp
+    src/ViewerNotices.cpp
     src/Autostart.cpp
     src/DisplaySleep.cpp
     src/LatencyFlag.cpp
     src/LatencyBeep.cpp
     src/backend/NvHTTP.cpp
     src/backend/NvComputer.cpp
+    src/backend/HostCertCheck.cpp
     src/backend/ComputerManager.cpp
     src/backend/IdentityManager.cpp
     src/backend/NvPairingManager.cpp
@@ -402,6 +430,8 @@ add_executable(mw-server
     src/streaming/StreamWorkerHost.cpp
     src/streaming/ConsoleSession.cpp
     src/streaming/WorkerService.cpp
+    src/streaming/RemoteDesktopReturn.cpp
+    src/streaming/RemoteDesktopReturnPolicy.cpp
     src/streaming/worker/StreamWorkerMain.cpp
     src/streaming/worker/CoopSessionResolver.cpp
 )
@@ -467,6 +497,10 @@ elseif(UNIX)
         if(X11_Xrandr_FOUND)
             target_compile_definitions(mw-server PRIVATE MW_HAVE_XRANDR)
             target_link_libraries(mw-server PRIVATE ${X11_Xrandr_LIB})
+            # A card's new X11 windows onto the virtual display, the primary
+            # monitor RandR names. Without it they stay where they open.
+            target_sources(mw-server PRIVATE src/server/HostAppLauncherX11.cpp)
+            target_compile_definitions(mw-server PRIVATE MW_HOST_APP_X11)
         else()
             message(STATUS "LatencyFlag: no libXrandr — the flag will not follow a monitor change")
         endif()
@@ -630,7 +664,10 @@ if(WIN32)
     # wintrust: the update installer's Authenticode check (UpdateApply.cpp).
     target_link_libraries(mw-server PRIVATE ws2_32 winmm Bcrypt Crypt32 iphlpapi Dbghelp avrt
                                             wtsapi32 userenv taskschd ole32 oleaut32
-                                            setupapi newdev cfgmgr32 advapi32 shell32 wintrust)
+                                            setupapi newdev cfgmgr32 advapi32 shell32 wintrust
+                                            # version: the apps' names in Stream audio from
+                                            # (AudioApps.cpp, GetFileVersionInfo).
+                                            version)
     # OpenSSL is linked dynamically (import libs) — ship the DLLs next to the exe.
     file(GLOB _mw_ssl_dlls "${_mw_ssl}/lib/${_mw_ssl_arch}/*-3-${_mw_ssl_arch}.dll")
     foreach(_dll ${_mw_ssl_dlls})
@@ -643,6 +680,16 @@ elseif(APPLE)
         "-framework Security" "-framework CoreFoundation" "-framework Foundation")
 else() # Linux / other Unix
     target_link_libraries(mw-server PRIVATE dl)
+    # The LAN announcement goes through Avahi on the system bus
+    # (MdnsAdvertiser.cpp). Qt's DBus module comes with qtbase on Linux; without
+    # it the server still builds, and announces nothing.
+    find_package(Qt6 QUIET COMPONENTS DBus)
+    if(TARGET Qt6::DBus)
+        target_link_libraries(mw-server PRIVATE Qt6::DBus)
+        target_compile_definitions(mw-server PRIVATE MW_HAVE_QTDBUS)
+    else()
+        message(STATUS "mDNS: no Qt DBus module — the server will not announce itself on the LAN")
+    endif()
 endif()
 
 # ── Linux: the capability launcher ─────────────────────────────────────────
@@ -743,6 +790,15 @@ if(MW_BUILD_TESTS)
         tests/test_pairing_binding.cpp
         src/common/PairingCrypto.cpp
         src/streaming/SdpFingerprint.cpp
+        # The sharing board's proof that it is the browser its session was
+        # paired with, before it hands out a guest's way in.
+        tests/test_owner_proof.cpp
+        src/server/OwnerProof.cpp
+        # MW-PIN-v1 and MW-TLS-v1: the PIN proved without being sent and bound to
+        # its channel (SPAKE2, RFC 9382's vectors), a TLS key vouched for by the
+        # host key. The same reason as MW-BIND: they decide who may pair.
+        tests/test_pin_binding.cpp
+        src/common/PinBinding.cpp
         src/common/Logger.cpp
     )
     set_target_properties(mw-security-tests PROPERTIES AUTOMOC ON)
@@ -763,13 +819,17 @@ endif()
 # files (HttpServer falls back to <exedir>/frontend at runtime), and the OpenSSL
 # DLLs on Windows. Qt runtime is added per-platform by the deploy tool
 # (windeployqt / macdeployqt / linuxdeploy) in the release workflow.
-install(TARGETS mw-server RUNTIME DESTINATION . BUNDLE DESTINATION .)
+# Every rule here is in the "app" component, and the release workflow installs
+# that component alone: the vendored submodules (libdatachannel, miniupnpc,
+# ENet) bring install rules of their own, whose headers, static libraries and
+# CMake package files would otherwise land in the Windows installer.
+install(TARGETS mw-server RUNTIME DESTINATION . COMPONENT app BUNDLE DESTINATION . COMPONENT app)
 # Ship only the served assets: dev tooling (node_modules, tests, lint/TS configs,
 # internal .claude notes) must never reach user machines — and trips codesign on
 # macOS. Top-level dirs are excluded by REGEX so e.g. js/ subtrees stay intact.
 # isDevOnly() in StaticFileHandler.cpp holds the same list for a run from the
 # source tree: change both together.
-install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/../frontend" DESTINATION .
+install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/../frontend" DESTINATION . COMPONENT app
     REGEX "/frontend/(\\.claude|node_modules|test|scripts|build|coverage)$" EXCLUDE
     PATTERN ".prettierignore" EXCLUDE
     PATTERN ".prettierrc.json" EXCLUDE
@@ -782,7 +842,7 @@ install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/../frontend" DESTINATION .
     PATTERN "vitest.config.js" EXCLUDE
 )
 if(WIN32 AND _mw_ssl_prebuilt)
-    install(FILES ${_mw_ssl_dlls} DESTINATION .)
+    install(FILES ${_mw_ssl_dlls} DESTINATION . COMPONENT app)
 endif()
 if(WIN32)
     # "MoonlightWeb Virtual Display": the bundled IddCx driver package (MIT,
@@ -801,7 +861,7 @@ if(WIN32)
                                     "installer/drivers/vdd/${_mw_vdd_file} is missing")
             endif()
         endforeach()
-        install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/installer/drivers/vdd" DESTINATION drivers)
+        install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/installer/drivers/vdd" DESTINATION drivers COMPONENT app)
     endif()
     # "MoonlightWeb Virtual HID": the HID passthrough's driver, and the host's
     # own mouse on a host with none, built and signed apart
@@ -812,7 +872,7 @@ if(WIN32)
     # itself unavailable, as on a machine without the driver.
     if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "ARM64|aarch64"
        AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/installer/drivers/vhid/MoonlightWebVHid.inf")
-        install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/installer/drivers/vhid" DESTINATION drivers)
+        install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/installer/drivers/vhid" DESTINATION drivers COMPONENT app)
     endif()
 endif()
 

@@ -14,6 +14,7 @@
 #include "socket.h"
 #include "stun.h"
 #include "thread.h"
+#include "udp.h"
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -134,6 +135,7 @@ typedef struct side {
 	struct side *peer;   // passive candidates go there, if set
 	const char *bind;    // 127.0.0.1 if NULL
 	const char *rewrite; // the address the peer gets them with, like the tunnel's public one
+	uint16_t port;       // the UDP socket's, and so the listener's; 0 leaves it to the system
 	char passive_addr[64];
 	atomic(int) passive_port;
 	atomic(int) received;
@@ -179,11 +181,45 @@ static void make(side_t *side, juice_ice_tcp_mode_t mode) {
 	memset(&config, 0, sizeof(config));
 	config.concurrency_mode = JUICE_CONCURRENCY_MODE_POLL;
 	config.bind_address = side->bind ? side->bind : "127.0.0.1";
+	config.local_port_range_begin = side->port;
+	config.local_port_range_end = side->port;
 	config.cb_candidate = on_candidate;
 	config.cb_recv = on_recv;
 	config.user_ptr = side;
 	side->agent = juice_create(&config);
 	juice_set_ice_tcp_mode(side->agent, mode);
+}
+
+// A port free here in TCP and in UDP, for a host agent: its listener takes the number of its UDP
+// socket, and an ephemeral one may not be free in TCP. Windows reserves blocks of 100 ports or
+// more for TCP alone or UDP alone (Hyper-V, WSL: `netsh int ipv4 show excludedportrange`, 10013),
+// and hands UDP ports out in sequence, so the agent after a refused one lands in the same block:
+// 1 run in 15 failed on one machine, retrying 5 times did not always get out. Each system choice
+// here skips what its own protocol reserves; the other one is tried, and the next taken if it
+// fails. With `held`, the TCP socket stays open, listening, for the caller.
+static uint16_t free_port(socket_t *held) {
+	for (int attempt = 0; attempt < 2000; ++attempt) {
+		struct sockaddr_in sin;
+		memset(&sin, 0, sizeof(sin));
+		sin.sin_family = AF_INET;
+		sin.sin_addr.s_addr = htonl(0x7F000001);
+		socklen_t sin_len = sizeof(sin);
+		socket_t tcp = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+		bool ok = bind(tcp, (struct sockaddr *)&sin, sizeof(sin)) == 0 && listen(tcp, 1) == 0 &&
+		          getsockname(tcp, (struct sockaddr *)&sin, &sin_len) == 0;
+		socket_t udp = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+		ok = ok && bind(udp, (struct sockaddr *)&sin, sizeof(sin)) == 0;
+		closesocket(udp);
+		if (ok) {
+			if (held)
+				*held = tcp;
+			else
+				closesocket(tcp);
+			return ntohs(sin.sin_port);
+		}
+		closesocket(tcp);
+	}
+	return 0;
 }
 
 static bool wait_state(juice_agent_t *agent, juice_state_t state, int ms) {
@@ -210,21 +246,40 @@ static void read_attr(const char *sdp, const char *key, char *out, size_t size) 
 
 // ── Tests ───────────────────────────────────────────────────────────────────
 
+// The host (a) and a peer that dials it like a browser (b), gathering. If another program took the
+// host's port since free_port() (no listener, no passive candidate, as designed): another pair.
+static void connecting_pair(side_t *a, side_t *b, const char *bind, const char *rewrite) {
+	for (int attempt = 0; attempt < 5 && !a->passive_port; ++attempt) {
+		if (a->agent) {
+			juice_destroy(a->agent);
+			juice_destroy(b->agent);
+		}
+		memset(a, 0, sizeof(*a));
+		memset(b, 0, sizeof(*b));
+		a->bind = bind;
+		a->rewrite = rewrite;
+		a->port = free_port(NULL);
+		make(a, JUICE_ICE_TCP_MODE_ACTIVE_PASSIVE);
+		make(b, JUICE_ICE_TCP_MODE_ACTIVE);
+		a->peer = b; // only a's passive candidates travel; nothing of b's does
+
+		char sdp[JUICE_MAX_SDP_STRING_LEN];
+		juice_get_local_description(a->agent, sdp, sizeof(sdp));
+		juice_set_remote_description(b->agent, sdp);
+		juice_get_local_description(b->agent, sdp, sizeof(sdp));
+		juice_set_remote_description(a->agent, sdp);
+
+		juice_gather_candidates(a->agent);
+		juice_gather_candidates(b->agent);
+		for (int t = 0; t < 1000 && !a->passive_port; t += 50)
+			sleep_ms(50);
+	}
+}
+
 static void test_connect_over_tcp_only(void) {
 	printf("Two agents connect over passive TCP alone\n");
 	side_t a = {0}, b = {0};
-	make(&a, JUICE_ICE_TCP_MODE_ACTIVE_PASSIVE); // the host
-	make(&b, JUICE_ICE_TCP_MODE_ACTIVE);         // dials, like a browser
-	a.peer = &b; // only a's passive candidates travel; nothing of b's does
-
-	char sdp[JUICE_MAX_SDP_STRING_LEN];
-	juice_get_local_description(a.agent, sdp, sizeof(sdp));
-	juice_set_remote_description(b.agent, sdp);
-	juice_get_local_description(b.agent, sdp, sizeof(sdp));
-	juice_set_remote_description(a.agent, sdp);
-
-	juice_gather_candidates(a.agent);
-	juice_gather_candidates(b.agent);
+	connecting_pair(&a, &b, NULL, NULL);
 
 	CHECK(wait_state(a.agent, JUICE_STATE_COMPLETED, 10000));
 	CHECK(wait_state(b.agent, JUICE_STATE_COMPLETED, 2000));
@@ -266,20 +321,7 @@ static void test_selected_local_is_the_address_reached(void) {
 	// gets rewritten (here to 127.0.0.1, the tunnel's public address in production). Before,
 	// the log named the address offered, not the one that accepted.
 	side_t a = {0}, b = {0};
-	a.bind = "0.0.0.0";
-	a.rewrite = "127.0.0.1";
-	make(&a, JUICE_ICE_TCP_MODE_ACTIVE_PASSIVE);
-	make(&b, JUICE_ICE_TCP_MODE_ACTIVE);
-	a.peer = &b;
-
-	char sdp[JUICE_MAX_SDP_STRING_LEN];
-	juice_get_local_description(a.agent, sdp, sizeof(sdp));
-	juice_set_remote_description(b.agent, sdp);
-	juice_get_local_description(b.agent, sdp, sizeof(sdp));
-	juice_set_remote_description(a.agent, sdp);
-
-	juice_gather_candidates(a.agent);
-	juice_gather_candidates(b.agent);
+	connecting_pair(&a, &b, "0.0.0.0", "127.0.0.1");
 
 	CHECK(wait_state(a.agent, JUICE_STATE_COMPLETED, 10000));
 	printf("  offered %s, reached 127.0.0.1%s\n", a.passive_addr,
@@ -299,9 +341,8 @@ static void test_selected_local_is_the_address_reached(void) {
 #endif
 }
 
-// A host agent whose remote is a raw peer ("peer" and `peer_pwd`), listening. The UDP socket
-// takes an ephemeral port, whose TCP side another socket of this machine may hold: then there is
-// no listener and no passive candidate, as designed. Another agent.
+// A host agent whose remote is a raw peer ("peer" and `peer_pwd`), listening. If another program
+// took its port since free_port(): another agent.
 static void listening_host(side_t *h, const char *peer_pwd) {
 	char sdp[JUICE_MAX_SDP_STRING_LEN];
 	snprintf(sdp, sizeof(sdp), "a=ice-ufrag:peer\r\na=ice-pwd:%s\r\n", peer_pwd);
@@ -309,6 +350,7 @@ static void listening_host(side_t *h, const char *peer_pwd) {
 		if (h->agent)
 			juice_destroy(h->agent);
 		memset(h, 0, sizeof(*h));
+		h->port = free_port(NULL);
 		make(h, JUICE_ICE_TCP_MODE_ACTIVE_PASSIVE);
 		juice_set_remote_description(h->agent, sdp);
 		juice_gather_candidates(h->agent);
@@ -662,6 +704,31 @@ static void test_announced_active_takes_no_place(void) {
 	juice_destroy(h.agent);
 }
 
+static void test_taken_tcp_port_means_no_candidate(void) {
+	printf("A TCP port another socket holds: no listener, no candidate; free again, both\n");
+	socket_t holder = INVALID_SOCKET;
+	const uint16_t port = free_port(&holder);
+	CHECK(port > 0);
+
+	const char *remote = "a=ice-ufrag:peer\r\na=ice-pwd:pw01234567890123456789\r\n";
+	for (int free_again = 0; free_again < 2; ++free_again) {
+		if (free_again)
+			closesocket(holder);
+		side_t s = {0};
+		s.port = port;
+		make(&s, JUICE_ICE_TCP_MODE_ACTIVE_PASSIVE);
+		juice_set_remote_description(s.agent, remote);
+		CHECK(juice_gather_candidates(s.agent) == 0);
+		for (int t = 0; t < 500 && !s.passive_port; t += 50)
+			sleep_ms(50);
+		if (free_again)
+			CHECK(s.passive_port == port);
+		else
+			CHECK(s.passive_port == 0);
+		juice_destroy(s.agent);
+	}
+}
+
 static void test_active_only_does_not_listen(void) {
 	printf("ACTIVE alone listens on nothing and offers no passive candidate\n");
 	side_t s = {0};
@@ -671,6 +738,38 @@ static void test_active_only_does_not_listen(void) {
 	sleep_ms(500);
 	CHECK(s.passive_port == 0);
 	juice_destroy(s.agent);
+}
+
+// Not of the passive TCP, but of the same runner: libjuice-udp-long-datagram.patch
+static void test_long_datagram_is_dropped(void) {
+	printf("A datagram longer than the buffer is dropped, the next one is read\n");
+	socket_t rx = socket(AF_INET, SOCK_DGRAM, 0);
+	socket_t tx = socket(AF_INET, SOCK_DGRAM, 0);
+	struct sockaddr_in sin;
+	memset(&sin, 0, sizeof(sin));
+	sin.sin_family = AF_INET;
+	sin.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+	socklen_t sin_len = sizeof(sin);
+	CHECK(bind(rx, (struct sockaddr *)&sin, sizeof(sin)) == 0);
+	CHECK(getsockname(rx, (struct sockaddr *)&sin, &sin_len) == 0);
+	set_timeout(rx, 2000);
+
+	static char big[5000], next[1200];
+	memset(big, 'b', sizeof(big));
+	memset(next, 's', sizeof(next));
+	CHECK(sendto(tx, big, sizeof(big), 0, (struct sockaddr *)&sin, sizeof(sin)) ==
+	      (int)sizeof(big));
+	CHECK(sendto(tx, next, sizeof(next), 0, (struct sockaddr *)&sin, sizeof(sin)) ==
+	      (int)sizeof(next));
+
+	char buffer[4096];
+	addr_record_t src;
+	int len = udp_recvfrom(rx, buffer, sizeof(buffer), &src);
+	if (len == (int)sizeof(buffer) && buffer[0] == 'b') // cut short, where the system does that
+		len = udp_recvfrom(rx, buffer, sizeof(buffer), &src);
+	CHECK(len == (int)sizeof(next) && buffer[0] == 's');
+	closesocket(rx);
+	closesocket(tx);
 }
 
 int main(void) {
@@ -685,7 +784,9 @@ int main(void) {
 	test_gate();
 	test_half_frames_do_not_keep_the_peer_out();
 	test_announced_active_takes_no_place();
+	test_taken_tcp_port_means_no_candidate();
 	test_active_only_does_not_listen();
+	test_long_datagram_is_dropped();
 	printf(failures ? "\n%d FAILURE(S)\n" : "\nall passed\n", failures);
 	return failures ? 1 : 0;
 }

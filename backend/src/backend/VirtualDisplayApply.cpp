@@ -43,7 +43,7 @@
 #include <vector>
 #endif
 
-// The helper behind `--vdisplay-apply`: four verbs on "MoonlightWeb Virtual
+// The helper behind `--vdisplay-apply`: five verbs on "MoonlightWeb Virtual
 // Display" (VirtualDisplay.h), read from a request file, answered in a result
 // file and on stdout.
 //
@@ -677,6 +677,8 @@ int stageDriver(Context& ctx)
         ctx.result.stage = stage;
         return kExitOk; // the caller decides whether a mode stage follows
     }
+
+    case Action::OthersBack: break; // the desktop's business, never the node's
     }
     return failAt(ctx, stage, QStringLiteral("unknown action"));
 }
@@ -1380,6 +1382,45 @@ int stageMode(Context& ctx)
         }
         return kExitOk; // the driver stage (disable) follows
     }
+    // The owner left an exclusive stream and guests still watch ours: the other
+    // displays back, ours keeping its mode and the primary role, the node left
+    // alone. The guests' capture restarts on its own, as for any display change.
+    if (ctx.request.action == Action::OthersBack) {
+        if (othersOff(ctx)) {
+            const auto target = findOurTarget();
+            if (!target) return failAt(ctx, stage, QStringLiteral("the display is not on"));
+            QString error;
+            bool back = false;
+            if (const auto saved = loadTopology(ctx); saved && topologyStillAttached(*saved)) {
+                back = imposeTopology(*saved, target->devicePath, &error);
+                if (!back)
+                    Logger::warning(
+                        QStringLiteral("[vdisplay-apply] the layout from before not imposed: %1")
+                            .arg(error));
+            }
+            if (!back) {
+                const LONG rc =
+                    SetDisplayConfig(0, nullptr, 0, nullptr, SDC_APPLY | SDC_TOPOLOGY_EXTEND);
+                back = rc == ERROR_SUCCESS;
+                if (!back)
+                    return failAt(ctx, stage,
+                                  QStringLiteral("the other displays not back on: %1")
+                                      .arg(lastErrorText(DWORD(rc))));
+            }
+            setOthersOff(ctx, false);
+            Logger::info(QStringLiteral("[vdisplay-apply] the owner left: the other displays "
+                                        "back on, the guests' stream goes on"));
+            if (const auto again = findOurTarget();
+                again && !makePrimary(again->devicePath,
+                                      VirtualDisplay::savesLayout(
+                                          VirtualDisplay::LayoutStep::Primary, false),
+                                      &error))
+                Logger::warning(QStringLiteral("[vdisplay-apply] not made primary: %1").arg(error));
+        }
+        ctx.result.ok = true;
+        ctx.result.stage = QStringLiteral("done");
+        return finish(ctx);
+    }
     if (ctx.request.action != Action::Activate) {
         ctx.result.ok = true;
         ctx.result.stage = QStringLiteral("done");
@@ -1532,20 +1573,28 @@ int stageMode(Context& ctx)
     }
 
     // SDR: the same call scripts/Set-DisplayHdr.ps1 makes. The target ids may
-    // have moved with the mode change, so look the display up again.
+    // have moved with the mode change, so look the display up again. HDR
+    // only for a bench that asked (Request::benchHdr, MW_BENCH_VD_HDR).
     if (auto again = findOurTarget()) target = again;
+    const bool hdr = ctx.request.benchHdr;
     DISPLAYCONFIG_SET_ADVANCED_COLOR_STATE ac{};
     ac.header.type = DISPLAYCONFIG_DEVICE_INFO_SET_ADVANCED_COLOR_STATE;
     ac.header.size = sizeof(ac);
     ac.header.adapterId = target->adapterId;
     ac.header.id = target->targetId;
-    ac.enableAdvancedColor = 0;
+    ac.enableAdvancedColor = hdr ? 1 : 0;
     const LONG hr = DisplayConfigSetDeviceInfo(&ac.header);
     if (hr != ERROR_SUCCESS && hr != ERROR_NOT_SUPPORTED)
-        Logger::warning(
-            QStringLiteral("[vdisplay-apply] SDR refused: %1").arg(lastErrorText(DWORD(hr))));
+        Logger::warning(QStringLiteral("[vdisplay-apply] %1 refused: %2")
+                            .arg(hdr ? QStringLiteral("HDR (bench)") : QStringLiteral("SDR"),
+                                 lastErrorText(DWORD(hr))));
+    else if (hdr)
+        Logger::info(QStringLiteral("[vdisplay-apply] HDR left on for a bench (MW_BENCH_VD_HDR)"));
 
-    if (!makePrimary(target->devicePath, savesLayout(LayoutStep::Primary, off), &error))
+    if (ctx.request.benchSecondary)
+        Logger::info(QStringLiteral("[vdisplay-apply] the primary display keeps its role, "
+                                    "for a bench (MW_BENCH_VD_SECONDARY)"));
+    else if (!makePrimary(target->devicePath, savesLayout(LayoutStep::Primary, off), &error))
         Logger::warning(QStringLiteral("[vdisplay-apply] not made primary: %1").arg(error));
 
     // Last, and never saved: every change above has been, with the other
@@ -1616,6 +1665,8 @@ int run(const QString& stageArg, const QString& dirArg)
     } else if (ctx.request.action == Action::Deactivate) {
         if (wantMode) stages.push_back(&stageMode);
         if (wantDriver) stages.push_back(&stageDriver);
+    } else if (ctx.request.action == Action::OthersBack) {
+        if (wantMode) stages.push_back(&stageMode);
     } else {
         if (wantDriver) stages.push_back(&stageDriver);
         if (wantMode) stages.push_back(&stageMode);

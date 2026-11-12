@@ -38,6 +38,12 @@
  * (gamepadOffset), so a guest pad at browser index 1 would land on the next
  * guest's virtual controller.
  *
+ * An on-screen controller (attachVirtual) is one more pad: it answers to the
+ * same anti-spam, repeats, pause and teardown, and the host cannot tell it from
+ * another Xbox pad. It has no browser index, so it takes the lowest controller
+ * number free, and a real pad whose number it holds takes the next one. It is
+ * read on the frame loop and sent at the touch itself (pokeVirtual).
+ *
  * Protocol (browser → backend):
  *   {type:"gamepadconnect", index, mask, ctype, rumble}
  *   {type:"gamepad", index, mask, buttons, lt, rt, lx, ly, rx, ry}
@@ -55,6 +61,7 @@ import {
     firefoxLinuxJoyCon,
     JOYCON_LEFT_BUTTONS,
     JOYCON_LEFT_AXES,
+    padKey,
 } from './gamepadMapping.js';
 import { getMapping, CHANGED_EVENT } from '../util/gamepadMappingsStore.js';
 
@@ -205,6 +212,7 @@ export class GamepadManager {
      *           onIgnored?: (gp: Gamepad) => void,
      *           onMapped?: (gp: Gamepad, res: object) => void,
      *           onNote?: (kind: string, gp: object) => void,
+     *           onVirtualYield?: () => void,
      *           single?: boolean, preferredKey?: string|null,
      *           probe?: {notePadRead: (gapMs: number) => void, notePadSend: () => void}|null,
      *           platform?: string, db?: object|null, user?: (key: string) => object|null }} [options]
@@ -227,11 +235,15 @@ export class GamepadManager {
      *   as a pad (isTvRemotePad), which is then never forwarded as a pad.
      *   `onMenuChord()` is told when a forwarded pad presses Select + Start +
      *   LB + RB together (StreamView opens the remote's menu with it on a TV).
+     *   `onVirtualYield()` is told when a real pad took the place of an
+     *   on-screen controller attached with `yields`.
      */
     constructor(sendFn, options = {}) {
         this._send = sendFn;
         this._onRemoteKey = typeof options.onRemoteKey === 'function' ? options.onRemoteKey : null;
         this._onMenuChord = typeof options.onMenuChord === 'function' ? options.onMenuChord : null;
+        this._onVirtualYield =
+            typeof options.onVirtualYield === 'function' ? options.onVirtualYield : null;
         // Browser index → { buttonIndex → {since, lastAt} } for a remote's held arrows.
         this._remotes = new Map();
         // Pads whose menu chord is down, so it fires once per press.
@@ -266,6 +278,14 @@ export class GamepadManager {
         this._resolved = new Map();
         this._paused = false;
         this._running = false;
+        // start() was asked for: a page without the Gamepad API only runs once
+        // it has an on-screen controller to forward.
+        this._wanted = false;
+        // The on-screen controller (a Gamepad-shaped object, always current).
+        this._virtual = null;
+        this._virtualYields = false;
+        // Single mode: the pad preferred before the on-screen controller was.
+        this._keyBeforeVirtual = null;
         this._rafId = null;
         // The POLL_MS reader, while armed (_armPoll).
         this._pollTimer = null;
@@ -288,7 +308,8 @@ export class GamepadManager {
     }
 
     start() {
-        if (this._running || !navigator.getGamepads) return;
+        this._wanted = true;
+        if (this._running || (!navigator.getGamepads && !this._virtual)) return;
         this._running = true;
         window.addEventListener('gamepadconnected', this._onConnect);
         window.addEventListener('gamepaddisconnected', this._onDisconnect);
@@ -300,6 +321,7 @@ export class GamepadManager {
     }
 
     stop() {
+        this._wanted = false;
         if (!this._running) return;
         this._running = false;
         window.removeEventListener('gamepadconnected', this._onConnect);
@@ -386,6 +408,99 @@ export class GamepadManager {
     }
 
     /**
+     * Plug an on-screen controller in: a Gamepad-shaped object, standard
+     * mapping, always current, with an `index` no browser pad can have. It is
+     * forwarded from now on, or as soon as the manager starts. In single mode it
+     * becomes the preferred pad, and detachVirtual gives the place back.
+     *
+     * `yields`: a real pad showing up takes its place — it is unplugged first,
+     * so the real pad gets its own number (controller 0, not player 2) — and
+     * onVirtualYield is told. For a controller nobody explicitly asked for.
+     *
+     * @param {any} pad
+     * @param {{yields?: boolean}} [options]
+     */
+    attachVirtual(pad, { yields = false } = {}) {
+        if (this._virtual) this.detachVirtual();
+        this._virtual = pad;
+        this._virtualYields = yields;
+        if (this._single) {
+            this._keyBeforeVirtual = this._preferredKey;
+            this.setPreferredPad(padKey(pad));
+        }
+        if (this._wanted) this.start();
+        this.pokeVirtual();
+    }
+
+    /** Unplug the on-screen controller: taken off the host, its motors stopped. */
+    detachVirtual() {
+        const pad = this._virtual;
+        if (!pad) return;
+        this._release(pad.index);
+        this._chordDown.delete(pad.index);
+        this._virtual = null;
+        if (this._single) {
+            this._preferredKey = this._keyBeforeVirtual;
+            this._keyBeforeVirtual = null;
+        }
+    }
+
+    /** Whether an on-screen controller is plugged in. */
+    hasVirtual() {
+        return !!this._virtual;
+    }
+
+    /**
+     * Read the on-screen controller now: its state changed at a touch, and
+     * waiting for the next frame would add latency for nothing.
+     */
+    pokeVirtual() {
+        if (this._running && this._virtual) this._readPad(this._virtual);
+    }
+
+    /** Whether a real pad is being forwarded, as opposed to an on-screen one. */
+    hasPhysicalPad() {
+        for (const index of this._pads.keys()) {
+            if (!this._virtual || index !== this._virtual.index) return true;
+        }
+        return false;
+    }
+
+    /**
+     * Take every forwarded pad off the host and let the next read plug it in
+     * again, so the host numbers it anew: the lowest player free, once whatever
+     * held player 1 there is gone (stream/HostPadNumber.js). The on-screen
+     * controller is read at once; a browser's pad at its next frame.
+     */
+    replugAll() {
+        for (const index of Array.from(this._pads.keys())) this._release(index);
+        this.pokeVirtual();
+    }
+
+    /** The pad behind `index`: the on-screen controller, or the browser's. */
+    _padAt(index) {
+        if (this._virtual && this._virtual.index === index) return this._virtual;
+        const pads = navigator.getGamepads ? navigator.getGamepads() : [];
+        return pads[index];
+    }
+
+    /**
+     * The controller number a new pad takes on the host. A real pad's is its
+     * browser index, unless an on-screen controller holds it; the on-screen one
+     * takes the lowest free. Nobody is ever renumbered while forwarded: a game
+     * would see its player change hands.
+     */
+    _hostIndexFor(gp) {
+        if (this._single) return 0;
+        const taken = new Set();
+        for (const entry of this._pads.values()) taken.add(entry.hostIndex);
+        if (gp !== this._virtual && !taken.has(gp.index)) return gp.index;
+        let free = 0;
+        while (taken.has(free)) free++;
+        return free;
+    }
+
+    /**
      * What to tell the host this pad is — which decides the virtual controller
      * it presents to the game (Xbox 360, or DualShock 4 for a PlayStation pad).
      *
@@ -396,6 +511,8 @@ export class GamepadManager {
     _controllerType(gp) {
         if (this._profile === 'x360') return CTYPE.XBOX;
         if (this._profile === 'ds4') return CTYPE.PS;
+        // Laid out as one, and no USB ids or vendor name to tell by.
+        if (gp === this._virtual) return CTYPE.XBOX;
         return detectType(gp.id);
     }
 
@@ -403,12 +520,14 @@ export class GamepadManager {
      * Arm the POLL_MS reader while a pad is forwarded, the page is visible and
      * the stream is not paused — disarm it as soon as one of the three fails.
      * Called wherever one of them changes. With nothing to forward, the frame
-     * loop alone keeps watching for pads.
+     * loop alone keeps watching for pads. An on-screen controller alone does not
+     * arm it: it says when it changes (pokeVirtual), and on a phone 250 reads a
+     * second would be battery spent on nothing.
      */
     _armPoll() {
         const wanted =
             this._running &&
-            this._pads.size > 0 &&
+            this.hasPhysicalPad() &&
             !this._paused &&
             document.visibilityState !== 'hidden';
         // Diagnostics: a stretch without reads is not a gap between two.
@@ -489,6 +608,10 @@ export class GamepadManager {
             entry.bindings = res.bindings;
             return entry;
         }
+        if (gp !== this._virtual && this._virtual && this._virtualYields) {
+            this.detachVirtual();
+            if (this._onVirtualYield) this._onVirtualYield();
+        }
         if (this._single) {
             // One pad only. The preferred one takes the place from any other;
             // otherwise first come, first served.
@@ -501,7 +624,7 @@ export class GamepadManager {
             }
         }
         const hasRumble = !!gp.vibrationActuator;
-        const hostIndex = this._single ? 0 : gp.index;
+        const hostIndex = this._hostIndexFor(gp);
         entry = {
             last: null,
             sentAt: 0,
@@ -736,52 +859,58 @@ export class GamepadManager {
                 if (!this._paused) this._readRemote(gp);
                 continue;
             }
-            // Also seen here, not only on the connect event: a pad plugged in
-            // before start() never fires one, and a mapping may have changed.
-            const entry = this._consider(gp);
-            if (!entry || this._paused) continue;
-            this._checkChord(gp);
-
-            const src = entry.bindings ? readVirtualPad(gp, entry.bindings) : gp;
-            let buttons = 0;
-            for (const i in BUTTON_MAP) {
-                if (src.buttons[i] && src.buttons[i].pressed) buttons |= BUTTON_MAP[i];
-            }
-            const lt = src.buttons[6] ? Math.round(src.buttons[6].value * 255) : 0;
-            const rt = src.buttons[7] ? Math.round(src.buttons[7].value * 255) : 0;
-            // Y axes inverted: Limelight expects up = positive.
-            const lx = axisToShort(src.axes[0] || 0);
-            const ly = axisToShort(-(src.axes[1] || 0));
-            const rx = axisToShort(src.axes[2] || 0);
-            const ry = axisToShort(-(src.axes[3] || 0));
-
-            const cur = { buttons, lt, rt, lx, ly, rx, ry };
-            const now = performance.now();
-            const p = entry.last;
-            if (
-                p &&
-                p.buttons === buttons &&
-                p.lt === lt &&
-                p.rt === rt &&
-                p.lx === lx &&
-                p.ly === ly &&
-                p.rx === rx &&
-                p.ry === ry
-            ) {
-                // Unchanged — don't flood the input channel. Except that a pad
-                // held away from rest is repeated now and then: the host's
-                // watchdog centres it when the link goes quiet for too long,
-                // and nothing else would put it back until the stick MOVES.
-                // The state is idempotent on every host, so a repeat costs
-                // two small messages a second and never misleads.
-                if (!isActive(cur) || now - entry.sentAt < REEMIT_MS) continue;
-            }
-            entry.last = cur;
-            entry.sentAt = now;
-            this._send({ type: 'gamepad', index: entry.hostIndex, mask: this._mask(), ...cur });
-            if (this._probe) this._probe.notePadSend();
+            this._readPad(gp);
         }
+        if (this._virtual) this._readPad(this._virtual);
         if (this._probe) this._noteRead();
+    }
+
+    /** One read of one pad, sent to the host if it has anything to say. */
+    _readPad(gp) {
+        // Also seen here, not only on the connect event: a pad plugged in
+        // before start() never fires one, and a mapping may have changed.
+        const entry = this._consider(gp);
+        if (!entry || this._paused) return;
+        this._checkChord(gp);
+
+        const src = entry.bindings ? readVirtualPad(gp, entry.bindings) : gp;
+        let buttons = 0;
+        for (const i in BUTTON_MAP) {
+            if (src.buttons[i] && src.buttons[i].pressed) buttons |= BUTTON_MAP[i];
+        }
+        const lt = src.buttons[6] ? Math.round(src.buttons[6].value * 255) : 0;
+        const rt = src.buttons[7] ? Math.round(src.buttons[7].value * 255) : 0;
+        // Y axes inverted: Limelight expects up = positive.
+        const lx = axisToShort(src.axes[0] || 0);
+        const ly = axisToShort(-(src.axes[1] || 0));
+        const rx = axisToShort(src.axes[2] || 0);
+        const ry = axisToShort(-(src.axes[3] || 0));
+
+        const cur = { buttons, lt, rt, lx, ly, rx, ry };
+        const now = performance.now();
+        const p = entry.last;
+        if (
+            p &&
+            p.buttons === buttons &&
+            p.lt === lt &&
+            p.rt === rt &&
+            p.lx === lx &&
+            p.ly === ly &&
+            p.rx === rx &&
+            p.ry === ry
+        ) {
+            // Unchanged — don't flood the input channel. Except that a pad
+            // held away from rest is repeated now and then: the host's
+            // watchdog centres it when the link goes quiet for too long,
+            // and nothing else would put it back until the stick MOVES.
+            // The state is idempotent on every host, so a repeat costs
+            // two small messages a second and never misleads.
+            if (!isActive(cur) || now - entry.sentAt < REEMIT_MS) return;
+        }
+        entry.last = cur;
+        entry.sentAt = now;
+        this._send({ type: 'gamepad', index: entry.hostIndex, mask: this._mask(), ...cur });
+        if (this._probe) this._probe.notePadSend();
     }
 
     /**
@@ -841,9 +970,16 @@ export class GamepadManager {
         // The host speaks of its controller numbers; a single-mode pad is
         // controller 0 whatever its browser index.
         let index = hostIndex;
+        let found = false;
         for (const [browserIndex, entry] of this._pads) {
-            if (entry.hostIndex === hostIndex) index = browserIndex;
+            if (entry.hostIndex === hostIndex) {
+                index = browserIndex;
+                found = true;
+            }
         }
+        // A controller already gone, whose number is this pad's browser index
+        // but not its controller number: that word is not for this pad.
+        if (!found && this._pads.has(hostIndex)) return;
         // Limelight motors are 16-bit; the Web API wants 0..1 magnitudes.
         const strong = Math.min(1, (low || 0) / 65535);
         const weak = Math.min(1, (high || 0) / 65535);
@@ -864,8 +1000,7 @@ export class GamepadManager {
         const entry = this._rumble.get(index);
         if (!entry) return;
 
-        const pads = navigator.getGamepads ? navigator.getGamepads() : [];
-        const gp = pads[index];
+        const gp = this._padAt(index);
         // No actuator (Safari, Firefox, a pad without motors): nothing to
         // hold, and nothing to keep re-arming for.
         if (!gp || !gp.vibrationActuator) {
@@ -895,8 +1030,7 @@ export class GamepadManager {
         if (entry && entry.timer) clearTimeout(entry.timer);
         this._rumble.delete(index);
 
-        const pads = navigator.getGamepads ? navigator.getGamepads() : [];
-        const gp = pads[index];
+        const gp = this._padAt(index);
         const actuator = gp && gp.vibrationActuator;
         if (!actuator) return;
         try {

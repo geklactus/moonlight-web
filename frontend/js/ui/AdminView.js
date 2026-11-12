@@ -74,6 +74,9 @@ export class AdminView {
         // rendezvous. Off by default: the LAN's door does not turn into the
         // internet's unless the owner asks for exactly that.
         this._remoteAdminInternet = false;
+        // Whether a device may also ask to pair by its QR code from outside the
+        // LAN. Off by default; either way it gets in only with the code it shows.
+        this._pairRequestInternet = false;
 
         // Server settings state
         this._httpsPort = 443;
@@ -139,6 +142,8 @@ export class AdminView {
         // (issue #39). Offered on Windows once the display is installed.
         this._vdExclusiveSupported = false;
         this._vdExclusive = false;
+        this._rdpReturnSupported = false;
+        this._rdpReturn = true;
         // This PC's keyboard layout for the touch keyboard's text (issue #44).
         // Offered when the server reads a layout here and a host runs here.
         this._hostLayoutOffered = false;
@@ -198,6 +203,11 @@ export class AdminView {
     }
 
     async start() {
+        // Have the host look at the releases now, unseen: this page shows no
+        // update, but Settings and the Hosts banner, likely the next stop, then
+        // read a fresh answer from the host's cache. Not awaited; the host bounds
+        // how often the look really happens.
+        BackendClient.checkForUpdate({ fresh: true });
         // Host check first: the whole admin page is host-machine-only. A remote
         // (authenticated) session gets a notice instead of the sections — and
         // none of the host-only requests below (they would just 403).
@@ -255,10 +265,13 @@ export class AdminView {
             this._httpsPort = admin.https_port || 443;
             this._httpPort = admin.http_port || 80;
             this._certAuthEnabled = admin.cert_auth_enabled || false;
+            this._pairRequestInternet = admin.pair_request_internet === true;
             this._streamNotifications = admin.stream_notifications !== false;
             this._packetMarking = admin.packet_marking !== false;
             this._vdExclusiveSupported = admin.virtual_display_exclusive_supported === true;
             this._vdExclusive = admin.virtual_display_exclusive === true;
+            this._rdpReturnSupported = admin.remote_desktop_return_supported === true;
+            this._rdpReturn = admin.remote_desktop_return !== false;
             this._hostLayoutOffered = admin.keyboard_host_layout_offered === true;
             this._hostLayoutDetected = admin.keyboard_host_layout_detected || '';
             this._hostLayout = admin.keyboard_host_layout === true;
@@ -467,6 +480,26 @@ export class AdminView {
         );
     }
 
+    // Take QR code pairing requests from outside the LAN too, or stop taking
+    // them. Saved on the spot through the admin settings; the box shows what
+    // the server kept, and goes back where it was when the save fails.
+    async _togglePairRequestInternet(enabled) {
+        try {
+            const res = await BackendClient.saveAdminSettings({ pair_request_internet: enabled });
+            this._pairRequestInternet = res?.pair_request_internet === true;
+            Toast.success(
+                this._pairRequestInternet
+                    ? t('admin.pairRequestInternetOn')
+                    : t('admin.pairRequestInternetOff'),
+            );
+        } catch (err) {
+            console.error('[Admin] Failed to save the QR code requests setting:', err);
+            Toast.error(t('admin.saveFailed', { message: err.message }));
+        }
+        const box = this.container.querySelector('#chk-pair-request-internet');
+        if (box) box.checked = this._pairRequestInternet;
+    }
+
     async _postRemoteAdmin(body, successMessage) {
         try {
             const result = await BackendClient.saveRemoteAdmin(body);
@@ -657,14 +690,12 @@ export class AdminView {
     }
 
     _isLocalhost() {
-        // Backend-driven: also true when the page was opened on the host machine
-        // through the public domain (host-key session), and when a LAN machine
-        // unlocked admin access with the remote admin password — not just on
-        // loopback. Named for what it gates (admin), not for where we are.
-        if (this._hasAdminAccess) return true;
-        if (BackendClient.adminLocked) return false; // booth mode (--noadmin)
-        const hostname = window.location.hostname;
-        return hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '::1';
+        // The host's word (/api/auth/status), never this page's address: true
+        // for the host machine's own browser, whichever address it came by, and
+        // for a LAN machine that unlocked admin access with the remote admin
+        // password; false for everyone in booth mode (--noadmin). Named for
+        // what it gates (admin), not for where we are.
+        return !!this._hasAdminAccess;
     }
 
     _buildLocalUrl(ip = this._getLocalIpForDisplay()) {
@@ -812,6 +843,7 @@ export class AdminView {
                             `
                                     : ''
                             }
+                            ${this._renderPairRequestInternet()}
                         </div>
                     </div>
                 `
@@ -914,6 +946,7 @@ export class AdminView {
                                           ? t('admin.rendezvousOffline')
                                           : t('admin.rendezvousReady')
                                 }</p>
+                                ${this._renderHostCode()}
                     `
                             : ''
                     }
@@ -1047,12 +1080,6 @@ export class AdminView {
                             <p class="setting-desc">
                                 ${t('admin.activeSessionsDesc')}
                             </p>
-                            <label class="settings-checkbox-label">
-                                <input type="checkbox" id="chk-stream-notifications"
-                                       ${this._streamNotifications ? 'checked' : ''} />
-                                <span class="settings-checkbox-text">${t('admin.streamNotifications')}</span>
-                            </label>
-                            <p class="setting-desc">${t('admin.streamNotificationsDesc')}</p>
                             <p class="settings-hint" id="admin-session-count">
                                 ${
                                     this._activeSessions > 0
@@ -1096,21 +1123,6 @@ export class AdminView {
                         </label>
                         <p class="setting-desc">${t('admin.packetMarkingDesc')}</p>
                     </div>
-
-                    ${
-                        this._vdExclusiveSupported
-                            ? `
-                    <div class="settings-field" id="admin-vd-exclusive">
-                        <label class="settings-checkbox-label">
-                            <input type="checkbox" id="chk-vd-exclusive"
-                                   ${this._vdExclusive ? 'checked' : ''} />
-                            <span class="settings-checkbox-text">${t('admin.vdExclusive')}</span>
-                        </label>
-                        <p class="setting-desc">${t('admin.vdExclusiveDesc')}</p>
-                    </div>
-                    `
-                            : ''
-                    }
 
                     ${
                         this._hostLayoutOffered
@@ -1186,7 +1198,7 @@ export class AdminView {
                         </div>
                     </div>
                 </div>
-                ${this._hostAppsSupported ? this._renderHostApps() : ''}
+                ${this._renderNativeHost()}
                 ${this._renderAdvanced()}
             </div>
         `;
@@ -1478,6 +1490,14 @@ export class AdminView {
                 this._toggleRemoteAdminInternet(internetAdminChk.checked),
             );
         }
+
+        // QR code requests from outside the LAN, under the PIN: saved on the spot.
+        const pairInternetChk = this.container.querySelector('#chk-pair-request-internet');
+        if (pairInternetChk) {
+            pairInternetChk.addEventListener('change', () =>
+                this._togglePairRequestInternet(pairInternetChk.checked),
+            );
+        }
         const setPassBtn = this.container.querySelector('#btn-set-admin-password');
         const passInput = this.container.querySelector('#admin-remote-password');
         if (setPassBtn && passInput) {
@@ -1615,6 +1635,29 @@ export class AdminView {
                         sel.removeAllRanges();
                         sel.addRange(range);
                     }
+                }
+            });
+        }
+
+        // The code alone, for the Connect page and the TV app.
+        const copyCode = this.container.querySelector('#btn-copy-host-code');
+        const codeInput = /** @type {HTMLInputElement|null} */ (
+            this.container.querySelector('#admin-host-code-input')
+        );
+        if (codeInput) codeInput.addEventListener('focus', () => codeInput.select());
+        if (copyCode && codeInput) {
+            copyCode.addEventListener('click', async () => {
+                try {
+                    await navigator.clipboard.writeText(codeInput.value);
+                    copyCode.textContent = t('common.copied');
+                    setTimeout(() => {
+                        copyCode.textContent = t('common.copy');
+                    }, 2000);
+                } catch (err) {
+                    console.warn('[Admin] Clipboard write failed:', err);
+                    // Selected, it can still be copied by hand.
+                    codeInput.focus();
+                    codeInput.select();
                 }
             });
         }
@@ -1804,6 +1847,24 @@ export class AdminView {
                     console.error('[Admin] Failed to save the other screens option:', err);
                     Toast.error(t('admin.saveFailed', { message: err.message }));
                     exclusiveChk.checked = !enabled; // revert
+                }
+            });
+        }
+
+        // ── A session left by Remote Desktop ───────────────────────────────
+        // Saved on the spot; read the next time Remote Desktop leaves one.
+        const rdpReturnChk = this.container.querySelector('#chk-rdp-return');
+        if (rdpReturnChk) {
+            rdpReturnChk.addEventListener('change', async () => {
+                const enabled = rdpReturnChk.checked;
+                try {
+                    await BackendClient.saveAdminSettings({ remote_desktop_return: enabled });
+                    this._rdpReturn = enabled;
+                    Toast.success(enabled ? t('admin.rdpReturnOn') : t('admin.rdpReturnOff'));
+                } catch (err) {
+                    console.error('[Admin] Failed to save the Remote Desktop option:', err);
+                    Toast.error(t('admin.saveFailed', { message: err.message }));
+                    rdpReturnChk.checked = !enabled; // revert
                 }
             });
         }
@@ -2293,6 +2354,21 @@ export class AdminView {
 
     // --- Remote admin access: the password door, the LAN's and on request the
     // internet's (through the rendezvous only) ---
+    // Under the PIN: whether a device may also ask to pair by its QR code from
+    // outside the LAN. Off by default; either way the administrator types the
+    // code it shows before it gets in.
+    _renderPairRequestInternet() {
+        return `
+                            <div class="u-mt-3">
+                                <label class="settings-checkbox-label">
+                                    <input type="checkbox" id="chk-pair-request-internet"
+                                           ${this._pairRequestInternet ? 'checked' : ''} />
+                                    <span class="settings-checkbox-text">${t('admin.pairRequestInternet')}</span>
+                                </label>
+                                <p class="setting-desc">${t('admin.pairRequestInternetDesc')}</p>
+                            </div>`;
+    }
+
     _renderRemoteAdmin() {
         return `
                 <div class="settings-section">
@@ -2365,12 +2441,118 @@ export class AdminView {
     // Always there, for the diagnostics. The picture chain only where the
     // choice means something: the server says whether this machine has a GPU
     // with a chain to choose.
+    /**
+     * This machine's code: the rendezvous id the link ends with. The Connect
+     * page and the TV app both ask for it, on devices where a whole link is
+     * painful to type, so it is shown on its own, in capitals (Crockford
+     * base32 reads them best: no I, L, O or U to mistake), with its own copy
+     * button. Both readers fold case. Nothing is shown for a link that does
+     * not end with a well-formed code.
+     * @returns {string} the code in capitals, or ''
+     */
+    _hostCode() {
+        let path = '';
+        try {
+            path = new URL(this._rendezvousUrl).pathname;
+        } catch (_) {
+            return '';
+        }
+        const last = path.split('/').filter(Boolean).pop() || '';
+        return /^[0-9abcdefghjkmnpqrstvwxyz]{26}$/i.test(last) ? last.toUpperCase() : '';
+    }
+
+    _renderHostCode() {
+        const code = this._hostCode();
+        if (!code) return '';
+        return `
+                                <div class="settings-field" id="admin-host-code">
+                                    <label class="settings-label" for="admin-host-code-input">
+                                        ${t('admin.hostCode')}
+                                    </label>
+                                    <div class="u-row">
+                                        <input type="text" id="admin-host-code-input"
+                                               class="settings-input u-grow admin-host-code-input"
+                                               readonly autocomplete="off" spellcheck="false"
+                                               value="${this.esc(code)}" />
+                                        <button class="btn btn-secondary u-shrink-0" id="btn-copy-host-code"
+                                                type="button">${t('common.copy')}</button>
+                                    </div>
+                                    <p class="settings-hint">${t('admin.hostCodeHint')}</p>
+                                </div>`;
+    }
+
+    /**
+     * What only this PC's own MoonlightWeb host uses, apart from what serves
+     * every host. Sunshine, Apollo and Wolf ignore all of it, and finding
+     * these boxes among the server's settings made them read as if they did.
+     * The section is shown only when it has at least one thing to offer.
+     */
+    _renderNativeHost() {
+        const notifications = this._isLocalhost();
+        if (
+            !this._vdExclusiveSupported &&
+            !this._rdpReturnSupported &&
+            !notifications &&
+            !this._videoPipelineSupported &&
+            !this._hostAppsSupported
+        ) {
+            return '';
+        }
+        return `
+                <!-- MoonlightWeb Host -->
+                <div class="settings-section" id="admin-section-native-host">
+                    <h3 class="settings-section-title">${t('admin.nativeHost')}</h3>
+                    <p class="settings-section-desc">${t('admin.nativeHostDesc')}</p>
+                    ${
+                        this._vdExclusiveSupported
+                            ? `
+                    <div class="settings-field" id="admin-vd-exclusive">
+                        <label class="settings-checkbox-label">
+                            <input type="checkbox" id="chk-vd-exclusive"
+                                   ${this._vdExclusive ? 'checked' : ''} />
+                            <span class="settings-checkbox-text">${t('admin.vdExclusive')}</span>
+                        </label>
+                        <p class="setting-desc">${t('admin.vdExclusiveDesc')}</p>
+                    </div>`
+                            : ''
+                    }
+                    ${
+                        this._rdpReturnSupported
+                            ? `
+                    <div class="settings-field" id="admin-rdp-return">
+                        <label class="settings-checkbox-label">
+                            <input type="checkbox" id="chk-rdp-return"
+                                   ${this._rdpReturn ? 'checked' : ''} />
+                            <span class="settings-checkbox-text">${t('admin.rdpReturn')}</span>
+                        </label>
+                        <p class="setting-desc">${t('admin.rdpReturnDesc')}</p>
+                    </div>`
+                            : ''
+                    }
+                    ${
+                        notifications
+                            ? `
+                    <div class="settings-field" id="admin-stream-notifications">
+                        <label class="settings-checkbox-label">
+                            <input type="checkbox" id="chk-stream-notifications"
+                                   ${this._streamNotifications ? 'checked' : ''} />
+                            <span class="settings-checkbox-text">${t('admin.streamNotifications')}</span>
+                        </label>
+                        <p class="setting-desc">${t('admin.streamNotificationsDesc')}</p>
+                    </div>`
+                            : ''
+                    }
+                    ${this._videoPipelineSupported ? this._renderVideoPipeline() : ''}
+                    ${this._hostAppsSupported ? this._renderHostApps() : ''}
+                </div>
+        `;
+    }
+
     _renderAdvanced() {
         return `
                 <!-- Advanced -->
                 <div class="settings-section" id="admin-section-advanced">
                     <h3 class="settings-section-title">${t('admin.advanced')}</h3>
-                    ${this._videoPipelineSupported ? this._renderVideoPipeline() : ''}
                     ${this._renderDiagMode('chk-debug-mode', this._debugMode, this._debugModeCli, 'debugMode', '--debug')}
                     ${this._renderDiagMode('chk-verbose-logs', this._verboseLogs, this._verboseLogsCli, 'verboseLogs', '--verbose')}
                     <div class="settings-field">
@@ -2546,9 +2728,10 @@ export class AdminView {
     // A card each on this host, beside the displays: the name the card shows,
     // the command or link that opens it, and its image. Where it opens is the
     // same for every app of this machine (screen): in its own gamescope, on
-    // the virtual display, or on the primary display. A section named for what
-    // it does, not for what runs it: folded under Advanced, it read as a
-    // diagnostic and explained nothing (Bruno, 13/10/2026).
+    // the virtual display, or on the primary display. Named for what it does:
+    // folded under Advanced, it read as a diagnostic and explained nothing
+    // (Bruno, 13/10/2026). It is the last part of the MoonlightWeb Host
+    // section, since only this PC's own host opens these cards.
     _renderHostApps() {
         const full = this._hostApps.length >= this._hostAppsMax;
         const screen = this._hostAppsScreen;
@@ -2608,8 +2791,8 @@ export class AdminView {
             )
             .join('');
         return `
-                <div class="settings-section host-apps" id="admin-section-host-apps">
-                    <h3 class="settings-section-title">${t('admin.hostApps')}</h3>
+                <div class="host-apps admin-subsection" id="admin-section-host-apps">
+                    <h4 class="admin-subsection-title">${t('admin.hostApps')}</h4>
                     <p class="settings-section-desc">${desc}</p>
                     ${
                         rows

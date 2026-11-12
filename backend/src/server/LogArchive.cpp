@@ -42,16 +42,26 @@ QString LogArchive::kindOf(const QString& fileName)
     QString kind = fileName;
     const int archive = kind.indexOf(QLatin1String(".log."));
     if (archive >= 0) kind.truncate(archive + 4);
-    static const QRegularExpression worker(QStringLiteral("^(.*-worker)-\\d+\\.log$"));
-    const QRegularExpressionMatch m = worker.match(kind);
-    if (m.hasMatch()) kind = m.captured(1) + QStringLiteral("-*.log");
+    // A name ending in numbers is one run's: `…-worker-<pid>.log`, and the bench
+    // traces `click-trace-<pid>-<ms>.csv`, `relay-frames-…`, `relay-audio-…`.
+    // Each of them counted as a kind of its own would put every run in the zip.
+    static const QRegularExpression perRun(QStringLiteral("^(.*?)(?:-\\d+)+(\\.[^.]+)$"));
+    const QRegularExpressionMatch m = perRun.match(kind);
+    if (m.hasMatch()) kind = m.captured(1) + QStringLiteral("-*") + m.captured(2);
     return kind;
 }
 
 QList<QFileInfo> LogArchive::latestPerKind(const QList<QFileInfo>& files)
 {
     QHash<QString, QFileInfo> latest;
-    for (const QFileInfo& f : files) {
+    for (const QFileInfo& listed : files) {
+        // Asked again by its path, not taken from the directory listing. On
+        // Windows the listing says what the file was when its writer last
+        // closed it: a log held open is 0 bytes there however much it holds.
+        // The client log is opened at the first batch and never closed, so it
+        // was never in an archive (issue #48, 01/11/2026); a server log born
+        // in this run (a first install, a rotation) is the same.
+        const QFileInfo f(listed.absoluteFilePath());
         if (!f.isFile() || f.size() == 0) continue;
         const QString kind = kindOf(f.fileName());
         auto it = latest.find(kind);

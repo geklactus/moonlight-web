@@ -15,6 +15,36 @@
  * this program. If not, see <https://www.gnu.org/licenses/>.
  */
 
+import { t } from '../i18n/i18n.js';
+
+/** The native host's key for "MoonlightWeb Virtual Display"; no other backend sends one. */
+const VIRTUAL_DISPLAY_KEY = 'moonlightweb-virtual-display';
+
+/**
+ * The order every list of a host's apps shows them in — its card on the hosts
+ * page and the sharing board's picker alike: "MoonlightWeb Virtual Display"
+ * always first, then alphabetical.
+ *
+ * Not the host's order: that one moves under the user — the native host lists
+ * the primary display first, and the display just streamed becomes primary —
+ * so the card they clicked would jump to the front. A fixed order keeps every
+ * app where the hand expects it.
+ *
+ * Sorts in place and returns the array. Takes App models or the host's raw
+ * entries alike: both carry `name` and `device`.
+ */
+export function sortApps(apps) {
+    const virtual = (a) => (a?.device?.key === VIRTUAL_DISPLAY_KEY ? 1 : 0);
+    return apps.sort(
+        (a, b) =>
+            virtual(b) - virtual(a) ||
+            String(a?.name ?? '').localeCompare(String(b?.name ?? ''), undefined, {
+                sensitivity: 'base',
+                numeric: true,
+            }),
+    );
+}
+
 /**
  * MoonlightWeb — Remote application data model
  */
@@ -35,7 +65,38 @@ export class App {
     }
 
     get displayName() {
+        // The server names it in English; the browser, in its own language.
+        if (this.isRemoteDesktopReturn) return t('apps.remoteDesktopReturn');
+        if (this.isSignInScreen) return t('apps.signInScreen');
         return this.name;
+    }
+
+    /**
+     * Is this card "This PC's sign-in screen" — the one card of a Windows
+     * native host whose session Remote Desktop left without a screen, when
+     * the host offers it? Opening it streams the PC's sign-in screen; once
+     * the user has signed in there, the same card streams the PC's screen.
+     */
+    get isSignInScreen() {
+        return this.device?.key === 'console-sign-in';
+    }
+
+    /**
+     * Is this card "This PC's screen" — the one card of a Windows native host
+     * whose session Remote Desktop left without a screen? Opening it brings
+     * the session back to the PC's screen, locked, and streams it.
+     */
+    get isRemoteDesktopReturn() {
+        return this.device?.key === 'remote-desktop-return';
+    }
+
+    /**
+     * Is this a display a stream turned off (issue #39: the other screens off
+     * while the virtual display streams)? The native host keeps its card, drawn
+     * dark; it opens nothing until the screens come back.
+     */
+    get isOff() {
+        return this.device?.off === true;
     }
 
     /**
@@ -46,7 +107,7 @@ export class App {
      * no other backend sends one.
      */
     get isVirtualDisplay() {
-        return this.device?.key === 'moonlightweb-virtual-display';
+        return this.device?.key === VIRTUAL_DISPLAY_KEY;
     }
 
     /**

@@ -560,6 +560,20 @@ DataChannelRelay::DataChannelRelay(IMediaEngine* engine, QObject* parent)
         } catch (const std::exception&) {}
     });
 
+    // The player number the native host's OS gave a pad: the page says so when
+    // a pad left plugged in there took player 1 first. Same road as rumble.
+    connect(m_Shim, &IMediaEngine::padPlayer, this, [this](int controller, int number) {
+        if (m_Stopping.load() || !m_InputDc) return;
+        QJsonObject m;
+        m["type"] = "padnumber";
+        m["index"] = controller;
+        m["number"] = number;
+        QByteArray j = QJsonDocument(m).toJson(QJsonDocument::Compact);
+        try {
+            m_InputDc->send(std::string(j.constData(), j.size()));
+        } catch (const std::exception&) {}
+    });
+
     // What the host's OS asked of a recreated HID device, for the page to
     // pass to the real one (output reports, features). Same thread as rumble.
     connect(m_Shim, &IMediaEngine::hidRequest, this,
@@ -1380,7 +1394,7 @@ void DataChannelRelay::createDataChannels()
 
             // The bench's cap on the host's other uploads (hostcap=), the
             // stream exempt with its own marking.
-            if (m_HostCapMbps > 0) m_HostCap.start(m_HostCapMbps, PacketMarking::current()[1]);
+            if (m_HostCapMbps > 0) m_HostCap.start(m_HostCapMbps, PacketMarking::current());
 
             if (m_ClipboardEnabled) {
                 // Advertise clipboard sync, then push the current host
@@ -3538,6 +3552,7 @@ void DataChannelRelay::createRtpVideoTracks()
         const uint32_t ssrc = rd();
         desc.addSSRC(ssrc, "vaudio");
         m_VideoTrack = m_Pc->addTrack(desc);
+        m_VideoTrack->setVideoDscp(); // frames, not sound: never in the sound's class
         auto cfg = std::make_shared<rtc::RtpPacketizationConfig>(
             ssrc, "vaudio", static_cast<uint8_t>(pt), rtc::OpusRtpPacketizer::DefaultClockRate);
         m_VideoTrack->setMediaHandler(std::make_shared<rtc::OpusRtpPacketizer>(cfg));
@@ -3620,6 +3635,7 @@ void DataChannelRelay::createRtpVideoTracks()
         const uint32_t ssrc = rd();
         desc.addSSRC(ssrc, "uaudio");
         m_UltraTrack = m_Pc->addTrack(desc);
+        m_UltraTrack->setVideoDscp(); // frames, not sound: never in the sound's class
         auto cfg = std::make_shared<rtc::RtpPacketizationConfig>(
             ssrc, "uaudio", static_cast<uint8_t>(pt), rtc::OpusRtpPacketizer::DefaultClockRate);
         m_UltraTrack->setMediaHandler(std::make_shared<rtc::OpusRtpPacketizer>(cfg));

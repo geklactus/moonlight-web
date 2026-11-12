@@ -16,6 +16,7 @@
  */
 
 #include "HttpServer.h"
+#include "common/LoopbackKey.h"
 #include "HttpParser.h"
 #include "PortFallback.h"
 #include "RequestGuard.h"
@@ -23,8 +24,10 @@
 #include "StaticFileHandler.h"
 #include "server/AuthManager.h"
 #include "server/HomeScreenShell.h"
+#include "server/LocalChannel.h"
 #include "common/Edition.h"
 #include "common/Logger.h"
+#include "common/PairingCrypto.h"
 
 #include <QCoreApplication>
 #include <QCryptographicHash>
@@ -51,6 +54,11 @@
 // sending headers/body that never complete.
 static constexpr int MAX_HEADER_BYTES = 32 * 1024;     // 32 KB of headers
 static constexpr int MAX_BODY_BYTES = 8 * 1024 * 1024; // 8 MB body
+
+// The SubjectPublicKeyInfo of the certificate a TLS socket was served, kept on
+// the socket once its handshake is done and copied into each of its requests
+// (HttpRequest::tlsSpki): what MW-TLS-v1 vouches for and MW-PIN-v1 binds to.
+static constexpr char TLS_SPKI_PROPERTY[] = "mw_tls_spki";
 
 // Drop anything that could end a header line early (CR, LF, NUL). Applied to
 // every header we emit so no value can ever inject a header of its own.
@@ -543,6 +551,10 @@ QTcpServer* HttpServer::createHttpsServer(quint16 port)
     auto* ssl = new SslServer(
         m_Certs.publicConfig(), m_Certs.localConfig(),
         [this](QSslSocket* socket) {
+            // Once per connection, and the certificate THIS one was served: the
+            // SNI choice above may differ from one connection to the next.
+            socket->setProperty(TLS_SPKI_PROPERTY,
+                                PairingCrypto::certificateSpki(socket->localCertificate().toDer()));
             m_Buffers[socket] = QByteArray();
             connect(socket, &QSslSocket::readyRead, this, &HttpServer::onReadyRead);
             connect(socket, &QSslSocket::disconnected, this, &HttpServer::onDisconnected);
@@ -868,18 +880,8 @@ bool HttpServer::adminKeyMatches(const HttpRequest& req) const
 {
     const QByteArray given = req.headers.value(QStringLiteral("x-mw-admin-key")).toUtf8();
     const QByteArray expected = m_AdminKey.toUtf8();
-    if (expected.isEmpty()) return false; // fail closed
-
-    // Constant-time: fold the length difference into the accumulator so the
-    // running time never depends on where the first mismatch is.
-    const int n = qMax(given.size(), expected.size());
-    quint8 diff = static_cast<quint8>(given.size() ^ expected.size());
-    for (int i = 0; i < n; ++i) {
-        const quint8 a = i < given.size() ? static_cast<quint8>(given[i]) : 0;
-        const quint8 b = i < expected.size() ? static_cast<quint8>(expected[i]) : 0;
-        diff |= static_cast<quint8>(a ^ b);
-    }
-    return diff == 0;
+    // Constant-time, and closed on an empty key (RequestGuard::secretMatches).
+    return RequestGuard::secretMatches(given, expected);
 }
 
 // --- Abuse mitigation -------------------------------------------------------
@@ -1026,6 +1028,8 @@ void HttpServer::processRequest(QTcpSocket* socket, const QByteArray& requestDat
 {
     HttpRequest req = HttpParser::parse(requestData);
     req.clientAddress = socket->peerAddress().toString();
+    // Empty on plain HTTP: no such property there.
+    req.tlsSpki = socket->property(TLS_SPKI_PROPERTY).toByteArray();
 
     // A request target carrying control characters is refused before anything
     // reads it: the redirect below puts the path in a Location header, and a
@@ -1204,8 +1208,18 @@ void HttpServer::serveRequest(HttpRequest req, Arrival arrival, ResponseCallback
         return;
     }
 
-    const bool peerLocal = !viaTunnel && isLocalRequest(req.clientAddress);
-    const QString sessionToken = sessionTokenFromRequest(req);
+    // The local channel: a program of this install asked, through a door of
+    // this machine. It reaches the routes named for it and no other — not a
+    // page, not a stream, not a session — and it carries no cookie: whatever
+    // such a request holds, none is read.
+    const bool viaLocal = (arrival == Arrival::Local);
+    if (viaLocal && !RequestGuard::localChannelRoute(req.method, req.path)) {
+        respond(HttpResponse::error(404, "Not Found"));
+        return;
+    }
+
+    const bool peerLocal = arrival == Arrival::Socket && isLocalRequest(req.clientAddress);
+    const QString sessionToken = viaLocal ? QString() : sessionTokenFromRequest(req);
 
     // The single exception, computed once so the two lines below cannot drift
     // apart: a host session that was itself created on this path, by redeeming
@@ -1229,6 +1243,7 @@ void HttpServer::serveRequest(HttpRequest req, Arrival arrival, ResponseCallback
     ctx.adminKeyOk = (!viaTunnel || tunnelHost || ctx.adminSession) && adminKeyMatches(req);
     ctx.publicDomain = m_Certs.domain();
     ctx.adminLocked = m_AdminLocked;
+    ctx.localChannel = viaLocal;
 
     const RequestGuard::Decision decision =
         RequestGuard::evaluate(RequestGuard::describe(req), ctx);
@@ -1248,6 +1263,17 @@ void HttpServer::serveRequest(HttpRequest req, Arrival arrival, ResponseCallback
         Logger::warning(QString("[HttpServer] Local privilege denied for untrusted Host '%1' "
                                 "(possible DNS rebinding) on %2")
                             .arg(req.headers.value("host"), req.path));
+    }
+
+    // A host session made through a line by an earlier version, without a
+    // browser key: it takes the key of this line, once, on its first request
+    // from an address that can be this machine. Here and not sooner: the cookie
+    // is one no other key holds (tunnelKeyRefused) and the request is admitted.
+    if (tunnelHost) {
+        m_AuthManager->adoptLineKey(sessionToken, req.tunnelKey, [this, &req]() {
+            return m_HostAddressPlausible &&
+                   m_HostAddressPlausible(AuthManager::cleanClientAddress(req.clientAddress));
+        });
     }
 
     if (m_AdminLocked && RequestGuard::lockedByNoAdmin(req.method, req.path, m_BoothShare)) {
@@ -1455,15 +1481,18 @@ void HttpServer::serveRequest(HttpRequest req, Arrival arrival, ResponseCallback
     }
 
     // ── Auth check for API routes ──────────────────────────────────────────
-    // Exemptions: localhost, /api/auth/*, /api/health, /api/server/hostname.
-    // Only /api/server/hostname is public (the login screen displays the PC name
-    // before authentication); /api/server/status (ports) now requires a session.
-    // /api/share/player/* is the one other public surface: a player has no
-    // MoonlightWeb session and never gets one — those routes authenticate the
-    // device from its own mw_player cookie and report their own failures.
-    if (m_AuthManager && !localPrivilege && req.path != "/api/health" &&
-        req.path != "/api/server/hostname" && !req.path.startsWith("/api/auth/") &&
-        !req.path.startsWith("/api/share/player/") && !isAuthenticated(req)) {
+    // Exemptions: localhost, /api/auth/*, /api/health, and /api/server/hostname
+    // for whoever may know this machine's name without a session (this LAN, the
+    // host machine: AuthManager::mayKnowMachineName); /api/server/status (ports)
+    // requires a session. /api/share/player/* is the one other public surface: a
+    // player has no MoonlightWeb session and never gets one — those routes
+    // authenticate the device from its own mw_player cookie and report their
+    // own failures.
+    const bool hostnameWithoutSession = req.path == QLatin1String("/api/server/hostname") &&
+                                        AuthManager::mayKnowMachineName(req, false);
+    if (m_AuthManager && !localPrivilege && req.path != "/api/health" && !hostnameWithoutSession &&
+        !req.path.startsWith("/api/auth/") && !req.path.startsWith("/api/share/player/") &&
+        !isAuthenticated(req)) {
         // Unauthenticated remote API hit = credential scanning; feed the guard
         // so repeated failures ban the source IP.
         m_ConnGuard.reportAuthFailure(req.clientAddress);
@@ -1484,6 +1513,15 @@ void HttpServer::serveRequest(HttpRequest req, Arrival arrival, ResponseCallback
         if (!out.headers.contains("Cache-Control")) out.headers["Cache-Control"] = "no-store";
         respond(out);
     });
+}
+
+void HttpServer::serveLocal(const mw::localchannel::Request& request,
+                            std::function<void(const mw::localchannel::Reply&)> respond)
+{
+    serveRequest(mw::localchannel::httpRequestFor(request), Arrival::Local,
+                 [respond = std::move(respond)](const HttpResponse& response) {
+                     respond(mw::localchannel::replyFor(response));
+                 });
 }
 
 void HttpServer::handleWebSocketUpgrade(QTcpSocket* clientSocket, const QByteArray& requestData)
@@ -1565,7 +1603,8 @@ void HttpServer::handleWebSocketUpgrade(QTcpSocket* clientSocket, const QByteArr
     // session and never will, so the mw_player cookie bound to that slot's
     // activation is what opens it — and nothing else, not even a local peer.
     const bool localPrivilege = HttpServer::isLocalRequest(peerAddr) &&
-                                RequestGuard::isLocalHostName(up.headers.value("host"));
+                                RequestGuard::isLocalHostName(up.headers.value("host")) &&
+                                !RequestGuard::forwardedByProxy(up.headers);
     if (playerSlot) {
         if (!m_PlayerSlotAuth || !m_PlayerSlotAuth(up, wsSlot)) {
             m_ConnGuard.reportAuthFailure(peerAddr);
@@ -1591,7 +1630,7 @@ void HttpServer::handleWebSocketUpgrade(QTcpSocket* clientSocket, const QByteArr
     // Copy the upgrade request BEFORE removing from m_Buffers.  requestData is a
     // const reference to the QByteArray inside m_Buffers — remove() destroys it.
     // NOLINTNEXTLINE(performance-unnecessary-copy-initialization) — copy is required.
-    QByteArray upgradeRequest = requestData;
+    QByteArray upgradeRequest = mw::loopback::stampUpgrade(requestData, mw::loopback::key());
 
     // Remove from our tracking — HttpServer should no longer manage this socket.
     m_Buffers.remove(clientSocket);

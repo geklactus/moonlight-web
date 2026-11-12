@@ -32,7 +32,13 @@
 #include <QAction>
 #include <QGuiApplication>
 #include <QMenu>
+#include <QPainter>
 #include <QSignalBlocker>
+
+#ifdef Q_OS_WIN
+#include <windows.h>
+#include <shellapi.h>
+#endif
 
 TrayManager::TrayManager(HttpServer* server, QObject* parent)
     : QObject(parent)
@@ -93,7 +99,10 @@ bool TrayManager::init()
         qInfo() << "[TrayManager] app icon not found, using standard icon";
         icon = QApplication::style()->standardIcon(QStyle::SP_ComputerIcon);
     }
-    m_TrayIcon->setIcon(icon);
+    m_Icon = icon;
+    m_IconWatched = withDot(icon);
+    m_TrayIcon->setIcon(m_Icon);
+    m_Clock.start();
 
     // The name, and — only while it is true — who is watching this screen. A
     // hover tooltip is read at a glance, by someone who is already at this
@@ -120,6 +129,11 @@ bool TrayManager::init()
     // and the tooltip already answers "is anyone?" without a click.
     m_StreamingAction = m_Menu->addAction(tr("Streaming"));
     m_StreamingAction->setVisible(false);
+    // Who watched lately, and when: what a notice that went unseen would have
+    // said (A137). In memory only, gone with this process; hidden while empty.
+    m_RecentMenu = m_Menu->addMenu(tr("Recent viewers"));
+    m_RecentMenu->menuAction()->setVisible(false);
+    connect(m_Menu, &QMenu::aboutToShow, this, &TrayManager::refreshRecentMenu);
     m_StreamingSeparator = m_Menu->addSeparator();
     m_StreamingSeparator->setVisible(false);
     connect(m_StreamingAction, &QAction::triggered, this, &TrayManager::onOpenSessions);
@@ -160,6 +174,9 @@ bool TrayManager::init()
 
     m_TrayIcon->setContextMenu(m_Menu);
     m_TrayIcon->show();
+#ifdef Q_OS_WIN
+    noticeIcon(); // rendered now, at startup, rather than at the first stream's start
+#endif
 
 #ifdef Q_OS_MACOS
     // Dock right-click menu — reuse the tray actions; macOS appends its own
@@ -213,17 +230,36 @@ void TrayManager::refreshTooltip(int count)
     m_TrayIcon->setToolTip(tip);
 }
 
-// What to call a viewer in a notification.
-//
-// The device name from the sessions table, except for a browser on this very
-// machine: its row reads "Host machine (remote link)", which distinguishes it
-// from the other rows and says nothing to somebody reading a notice on that
-// machine. And "Someone" when there is no name at all — a local stream carries
-// no session row to take one from.
-QString TrayManager::viewerName(const StreamViewer& v)
+void TrayManager::notify(const QString& text)
 {
-    if (v.self) return tr("This computer");
-    return v.name.isEmpty() ? tr("Someone") : v.name;
+#ifdef Q_OS_WIN
+    m_TrayIcon->showMessage(mw::edition::displayName(), text, noticeIcon(), 5000);
+#else
+    // Elsewhere the type itself is read: the icon name and the urgency of a
+    // freedesktop notification come from it.
+    m_TrayIcon->showMessage(mw::edition::displayName(), text, QSystemTrayIcon::Information, 5000);
+#endif
+}
+
+// The information icon of a notification, rendered once per device pixel ratio.
+//
+// Handed the style's icon, Qt for Windows renders it anew for every notice, at
+// up to 256 px. That work runs on two threads of Qt's GUI pool, which end 30 s
+// later, each with a hidden window. A window created or destroyed anywhere in
+// the session holds the next SendInput press for up to one DWM frame (D29,
+// 07/11/2026). The arrival notice comes at a stream's start, so its two threads
+// ended half a minute into the stream. Kept, the same pixmap shows the same
+// notice and is never drawn again.
+QIcon TrayManager::noticeIcon()
+{
+    const qreal dpr = qApp->devicePixelRatio();
+    if (m_NoticeIcon.isNull() || m_NoticeIconDpr != dpr) {
+        const QIcon style = QApplication::style()->standardIcon(QStyle::SP_MessageBoxInformation);
+        // The size Qt for Windows asks of the icon a notice is given.
+        m_NoticeIcon = QIcon(style.pixmap(style.actualSize(QSize(256, 256))));
+        m_NoticeIconDpr = dpr;
+    }
+    return m_NoticeIcon;
 }
 
 // One poll, three consequences: the tooltip, the menu entry, and a notification
@@ -241,43 +277,109 @@ void TrayManager::pollActivity()
     const StreamActivity activity = m_Activity();
     if (!activity.valid) return; // no answer is not an answer — keep what we had
 
-    QSet<QString> ids;
-    for (const StreamViewer& v : activity.viewers)
-        ids.insert(v.id);
+    const ViewerNotices::Changes changes =
+        m_Notices.observe(activity.viewers, QDateTime::currentDateTime(), activity.notify);
 
     // Logged as well as shown, because whether the desktop actually DISPLAYS a
     // notification is not ours to decide: Do Not Disturb, focus assist and the
     // shell's own rate limiting all swallow them silently, and without a line
     // here "no notification appeared" cannot be told from "none was sent".
-    if (m_ViewersKnown && activity.notify) {
-        for (const StreamViewer& v : activity.viewers) {
-            if (m_Viewers.contains(v.id)) continue;
-            qInfo() << "[TrayManager] Notifying: arrival of" << viewerName(v);
-            m_TrayIcon->showMessage(mw::edition::displayName(),
-                                    tr("%1 started streaming this screen").arg(viewerName(v)),
-                                    QSystemTrayIcon::Information, 5000);
-        }
-        // Departures are named from the previous snapshot, which is the only
-        // place a viewer who is gone still has a name.
-        for (const StreamViewer& v : m_LastViewers) {
-            if (ids.contains(v.id)) continue;
-            qInfo() << "[TrayManager] Notifying: departure of" << viewerName(v);
-            m_TrayIcon->showMessage(mw::edition::displayName(),
-                                    tr("%1 stopped streaming this screen").arg(viewerName(v)),
-                                    QSystemTrayIcon::Information, 5000);
-        }
+    if (activity.notify) {
+        for (const StreamViewer& v : changes.arrived)
+            qInfo() << "[TrayManager] Notifying: arrival of" << ViewerNotices::nameOf(v);
+        for (const StreamViewer& v : changes.left)
+            qInfo() << "[TrayManager] Notifying: departure of" << ViewerNotices::nameOf(v);
     }
+    releaseNotice();
 
-    m_Viewers = ids;
-    m_LastViewers = activity.viewers;
-    m_ViewersKnown = true;
+    // The dot says "someone is watching" on its own, whatever became of the
+    // notices: a wrong reading of Windows' state, or a balloon nobody saw,
+    // still leaves it there until the last viewer has gone.
+    const bool watched = m_Notices.watched();
+    if (watched != m_ShowsDot) {
+        m_ShowsDot = watched;
+        m_TrayIcon->setIcon(watched ? m_IconWatched : m_Icon);
+    }
 
     refreshTooltip(activity.count());
     if (m_StreamingAction) {
         m_StreamingAction->setText(tr("Streaming (%1)").arg(activity.count()));
         m_StreamingAction->setVisible(activity.count() > 0);
-        if (m_StreamingSeparator) m_StreamingSeparator->setVisible(activity.count() > 0);
     }
+    const bool anyRecent = !m_Notices.recent().isEmpty();
+    if (m_RecentMenu) m_RecentMenu->menuAction()->setVisible(anyRecent);
+    if (m_StreamingSeparator) m_StreamingSeparator->setVisible(activity.count() > 0 || anyRecent);
+}
+
+// One notice at a time, and only once Windows says it would show it.
+//
+// SHQueryUserNotificationState is read before each: a full-screen game, a
+// presentation or quiet hours make the notice wait (A137). Waiting is logged
+// once when it starts, and each notice let out after a wait once — never with a
+// name: who watched is the tray's to say, not the log's.
+void TrayManager::releaseNotice()
+{
+    const qint64 nowMs = m_Clock.elapsed();
+    if (!m_Notices.due(nowMs)) return;
+#ifdef Q_OS_WIN
+    QUERY_USER_NOTIFICATION_STATE state = QUNS_NOT_PRESENT;
+    const bool ok = SUCCEEDED(SHQueryUserNotificationState(&state));
+    const bool shows = ViewerNotices::windowsShows(ok, static_cast<int>(state));
+#else
+    // Elsewhere the notification service applies its own do-not-disturb, and
+    // there is no state to ask for: a notice always goes out.
+    const int state = 5;
+    const bool shows = true;
+#endif
+    if (!shows) {
+        if (m_Notices.hold())
+            qInfo() << "[TrayManager] Notice held (state" << static_cast<int>(state) << "),"
+                    << m_Notices.waiting() << "waiting";
+        return;
+    }
+    const bool wasHeld = m_Notices.nextWasHeld();
+    notify(m_Notices.take(QDateTime::currentDateTime(), nowMs));
+    if (wasHeld)
+        qInfo() << "[TrayManager] Held notice released," << m_Notices.waiting() << "waiting";
+    static int droppedSaid = 0;
+    if (m_Notices.dropped() != droppedSaid) {
+        droppedSaid = m_Notices.dropped();
+        qWarning() << "[TrayManager]" << droppedSaid
+                   << "waiting notice(s) dropped, oldest first, over" << ViewerNotices::kMaxPeople
+                   << "people";
+    }
+}
+
+void TrayManager::refreshRecentMenu()
+{
+    if (!m_RecentMenu) return;
+    m_RecentMenu->clear();
+    const QDateTime now = QDateTime::currentDateTime();
+    for (const ViewerNotices::Viewing& v : m_Notices.recent())
+        m_RecentMenu->addAction(m_Notices.recentLine(v, now))->setEnabled(false);
+}
+
+// The app's icon with a red dot in its lower right corner, white-ringed so it
+// reads on a dark taskbar and a light one alike. Painted once, at init, for
+// every size a tray asks for: never while somebody is streaming (see noticeIcon
+// for what drawing then costs).
+QIcon TrayManager::withDot(const QIcon& base)
+{
+    QIcon out;
+    for (int size : {16, 20, 24, 32, 40, 48, 64}) {
+        QPixmap pm = base.pixmap(size, size);
+        if (pm.isNull()) continue;
+        QPainter p(&pm);
+        p.setRenderHint(QPainter::Antialiasing);
+        const qreal d = size * 0.5;
+        const QRectF dot(size - d, size - d, d, d);
+        p.setPen(QPen(Qt::white, qMax<qreal>(1.0, size / 16.0)));
+        p.setBrush(QColor(0xE5, 0x1A, 0x1A));
+        p.drawEllipse(dot.adjusted(0.5, 0.5, -0.5, -0.5));
+        p.end();
+        out.addPixmap(pm);
+    }
+    return out.isNull() ? base : out;
 }
 
 void TrayManager::onActivated(QSystemTrayIcon::ActivationReason reason)
@@ -332,7 +434,7 @@ void TrayManager::openAppPage(const QString& path)
         QUrl logged(link);
         logged.setFragment(QString());
         qInfo() << "[TrayManager] Opening" << (path.isEmpty() ? QStringLiteral("/") : path)
-                << "over the internet link" << logged.toString();
+                << "by the owner's link" << logged.toString();
         QDesktopServices::openUrl(QUrl(link));
         return;
     }

@@ -75,7 +75,13 @@ const RIDE_OUT_LOSS = true;
  * }} BackendError
  */
 
-import { loadOrCreateIdentity, rememberHostIdentity } from '../util/pairingCrypto.js';
+import {
+    loadOrCreateIdentity,
+    rememberHostIdentity,
+    signPairApproval,
+    signPairRefusal,
+    signShareOwnerProof,
+} from '../util/pairingCrypto.js';
 import {
     CANVAS_TEARING_IS_REAL,
     decoderRidesOutGaps,
@@ -207,10 +213,32 @@ export class BackendClient {
         }
     }
 
-    static async get(path) {
-        const resp = await fetch(path);
-        if (!resp.ok) return this._handleError(resp, path);
-        return this._json(resp);
+    static async get(path, { timeoutMs = 0 } = {}) {
+        // Without a timeout a GET carries no init at all, as it always has.
+        if (!(timeoutMs > 0) || typeof AbortController === 'undefined') {
+            const resp = await fetch(path);
+            if (!resp.ok) return this._handleError(resp, path);
+            return this._json(resp);
+        }
+        // A request to a server that went away without closing the socket can
+        // stay pending for good; the caller would wait on it forever.
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), timeoutMs);
+        try {
+            const resp = await fetch(path, { signal: controller.signal });
+            if (!resp.ok) return this._handleError(resp, path);
+            return await this._json(resp);
+        } catch (err) {
+            if (err && err.name === 'AbortError') {
+                const e = /** @type {BackendError} */ (new Error('server_timeout'));
+                e.statusCode = 0;
+                e.aborted = true;
+                throw e;
+            }
+            throw err;
+        } finally {
+            clearTimeout(timer);
+        }
     }
 
     static async post(path, body = {}, { timeoutMs = 0, _retried = false } = {}) {
@@ -382,10 +410,13 @@ export class BackendClient {
      * slot 1 derives a STABLE second ID (last byte XOR 0xFF) so the standby
      * session coexists with the primary in Sunshine's per-uniqueid keying and
      * survives reloads (a reload can /resume its own standby session).
+     * Every other slot — an app slot past the owner's two, where a second
+     * device or a second app lands — was launched with the regular ID, and its
+     * Stop must carry that one (two devices on one Wolf, 12/11/2026).
      */
     static clientUniqueIdForSlot(slot) {
         const id = this.clientUniqueId();
-        if (!slot) return id;
+        if (slot !== 1) return id;
         const last = parseInt(id.slice(14, 16), 16) ^ 0xff;
         return id.slice(0, 14) + last.toString(16).padStart(2, '0').toUpperCase();
     }
@@ -439,7 +470,8 @@ export class BackendClient {
     /**
      * How the stream this page knows as @p streamId ended, asked once its
      * link went (stream/CrashRelaunch.js): "crashed", "live", "ended",
-     * "stopped" — and "unknown" for anything else, a late answer included,
+     * "stopped", "signed_in" (a Windows PC's sign-in screen, signed in
+     * through) — and "unknown" for anything else, a late answer included,
      * which ends the stream as it always has.
      * @returns {Promise<string>}
      */
@@ -573,7 +605,7 @@ export class BackendClient {
      * @param {{host_uuid?: string, app_id?: number, ttl_secs?: number}} [target]
      */
     static async shareActivate(slot, target) {
-        return this.post(`/api/share/slots/${slot}/activate`, target || {});
+        return this._sharePostProven('activate', slot, target);
     }
     /**
      * The link and PIN of a share that is already live, for an owner reopening
@@ -581,14 +613,33 @@ export class BackendClient {
      * only the digests are persisted.
      */
     static async shareCredentials(slot) {
-        return this.post(`/api/share/slots/${slot}/credentials`);
+        return this._sharePostProven('credentials', slot);
     }
     /**
      * Move a player's input permissions. Accepted at any time — the backend
      * carries the change down to a running stream rather than freezing it.
      */
     static async sharePermissions(slot, permissions) {
-        return this.post(`/api/share/slots/${slot}/permissions`, permissions);
+        return this._sharePostProven('permissions', slot, permissions);
+    }
+    /**
+     * A board request that hands out a guest's way in — a link and PIN, or the
+     * rights they carry — signed by this browser's pairing key over the host's
+     * single-use challenge (OwnerProof on the backend). The host asks for it
+     * only where its line has not already proved the key: it answers
+     * {required:false} through the tunnel, and nothing is signed.
+     * @param {'activate'|'credentials'|'permissions'} action
+     * @param {number} slot
+     * @param {object} [body]
+     */
+    static async _sharePostProven(action, slot, body) {
+        const payload = { ...(body || {}) };
+        const challenge = await this.post('/api/share/owner-proof', {});
+        if (challenge?.required && challenge.nonce) {
+            const sig = await signShareOwnerProof(challenge.host_id, challenge.nonce, action, slot);
+            if (sig) payload.owner_proof = { nonce: challenge.nonce, sig };
+        }
+        return this.post(`/api/share/slots/${slot}/${action}`, payload);
     }
     /** How long this invitation lives; 0 is unlimited. */
     static async shareTtl(slot, ttlSecs) {
@@ -711,6 +762,9 @@ export class BackendClient {
      * internet it answers 403 and the visitor pairs with a PIN instead. Silent
      * and best-effort by design: a browser that cannot bind still streams, it
      * simply does so without the fingerprint binding.
+     *
+     * @returns the identity, with `sessionKeyRefused` set when the session is
+     *          already bound to another browser's key.
      */
     static async ensurePairingKey() {
         const identity = await loadOrCreateIdentity();
@@ -736,6 +790,11 @@ export class BackendClient {
                 console.log('[MW-BIND] Host-machine access, no session — binding not applicable');
             } else if (e.statusCode === 403) {
                 console.log('[MW-BIND] Remote peer — pair with a PIN to bind this browser');
+            } else if (e.statusCode === 409) {
+                // The one answer that is not a shrug: this session is bound to
+                // another browser's key, and no stream will start from here.
+                console.warn('[MW-BIND] This session belongs to another browser — PIN required');
+                return { ...identity, sessionKeyRefused: true };
             } else {
                 console.log('[MW-BIND] Silent pairing not available:', e.message);
             }
@@ -767,11 +826,28 @@ export class BackendClient {
     static async logout() {
         return this.post('/api/auth/logout');
     }
-    /** Redeem the host key (?mwk=... from the host machine's own entry points)
-     *  for a localhost-equivalent session over the public domain. */
-    static async redeemHostKey(key) {
-        const resp = await this.post('/api/auth/host-key', { key });
+    /**
+     * Spend the host key (`#k=`, from the host machine's own entry points) for
+     * a host-machine session.
+     *
+     * On a page the host serves itself (`direct`), this is also where this
+     * browser's MW-BIND-v1 key is registered, as a PIN login registers it: the
+     * host binds the session to it, signs the offer of a stream for it, and
+     * answers with its own identity, kept here to check that signature
+     * against. Through the rendezvous the line's own key is the one, and the
+     * page pinned the host as it arrived: nothing to send, nothing to keep.
+     */
+    static async redeemHostKey(key, { direct = false } = {}) {
+        const body = { key };
+        if (direct) {
+            const identity = await loadOrCreateIdentity();
+            if (identity?.publicKeyBase64) body.public_key = identity.publicKeyBase64;
+        }
+        const resp = await this.post('/api/auth/host-key', body);
         this._hadSession = true;
+        if (direct && resp?.host_public_key) {
+            await rememberHostIdentity(resp.host_public_key, resp.host_id);
+        }
         return resp;
     }
     /**
@@ -797,6 +873,38 @@ export class BackendClient {
         }
         this._hadSession = true;
         return resp;
+    }
+
+    /**
+     * A device's request to pair, from the QR code it shows: its name, and
+     * whether it has sent its half of the code yet (`ready`). The
+     * administrator's alone; the code itself is never sent.
+     */
+    static async getPairRequest(id) {
+        return this.get(`/api/auth/pair-request/${encodeURIComponent(id)}`);
+    }
+
+    /**
+     * Let that device in, with the code typed from its screen. The yes is signed
+     * with this browser's own pairing key: the host refuses one from a cookie
+     * that left the browser it was made in.
+     */
+    static async approvePairRequest(id, code, hostId) {
+        const identity = await loadOrCreateIdentity();
+        const sig = identity ? await signPairApproval(identity, hostId, id, code) : null;
+        return this.post(`/api/auth/pair-request/${encodeURIComponent(id)}/approve`, {
+            code,
+            sig: sig || undefined,
+        });
+    }
+
+    /** Turn that device away, signed as a yes is. */
+    static async refusePairRequest(id, hostId) {
+        const identity = await loadOrCreateIdentity();
+        const sig = identity ? await signPairRefusal(identity, hostId, id) : null;
+        return this.post(`/api/auth/pair-request/${encodeURIComponent(id)}/refuse`, {
+            sig: sig || undefined,
+        });
     }
 
     /** Spend the remote admin password to give this (already authenticated)
@@ -873,10 +981,17 @@ export class BackendClient {
      *  Returns { current, latest, update_available, download_url, release_url,
      *  asset_name, self_update: { supported, method, requires_host_confirmation } }.
      *  Best-effort — resolves null on any failure so callers can stay silent when
-     *  offline / rate-limited. */
-    static async checkForUpdate() {
+     *  offline / rate-limited.
+     *
+     *  `fresh` asks the host to look at the releases now rather than answer from
+     *  its cache, at the moments a user would read the answer (opening Settings
+     *  or the app, closing a stream). The host bounds it: at most one look per
+     *  few minutes for all clients, none while a stream runs, and an answer
+     *  within a few seconds either way. */
+    static async checkForUpdate({ fresh = false } = {}) {
         try {
-            return await this.get('/api/update/check');
+            if (!fresh) return await this.get('/api/update/check');
+            return await this.get('/api/update/check?fresh=1', { timeoutMs: 15000 });
         } catch (_) {
             return null;
         }
@@ -890,21 +1005,44 @@ export class BackendClient {
 
     /** Progress of the running update: { state, percent, version, error,
      *  requires_host_confirmation }. Stops answering once the installer takes the
-     *  server down — that is the expected end of the polling loop. */
-    static async getUpdateStatus() {
-        return this.get('/api/update/status');
+     *  server down — that is the expected end of the polling loop. `timeoutMs`
+     *  bounds one request, so a server gone without closing the socket ends the
+     *  loop too instead of leaving it waiting on a request that never settles. */
+    static async getUpdateStatus({ timeoutMs = 0 } = {}) {
+        return this.get('/api/update/status', { timeoutMs });
     }
 
     /** Liveness + version probe, used to detect the host coming back up after an
      *  update. Raw fetch on purpose: the shared error path would reload the page
      *  on the 401/connection failures that are normal while the server restarts. */
     static async probeHealth() {
+        return (await this.probeHealthOutcome()).health;
+    }
+
+    /** probeHealth with the reason it got nothing: `{ health }` on an answer,
+     *  `{ health: null, network: true }` when no HTTP answer came back at all
+     *  (server down, or a certificate the browser no longer accepts — the page
+     *  cannot tell those apart), `{ health: null, network: false }` on an HTTP
+     *  error. Bounded by `timeoutMs`; running out counts as a network failure. */
+    static async probeHealthOutcome({ timeoutMs = 5000 } = {}) {
+        const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+        const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
+        let resp;
         try {
-            const resp = await fetch('/api/health', { cache: 'no-store' });
-            if (!resp.ok) return null;
-            return await resp.json();
+            resp = await fetch('/api/health', {
+                cache: 'no-store',
+                signal: controller ? controller.signal : undefined,
+            });
         } catch (_) {
-            return null;
+            return { health: null, network: true };
+        } finally {
+            if (timer) clearTimeout(timer);
+        }
+        if (!resp.ok) return { health: null, network: false };
+        try {
+            return { health: await resp.json(), network: false };
+        } catch (_) {
+            return { health: null, network: false };
         }
     }
 
@@ -956,6 +1094,20 @@ export class BackendClient {
 
     static async getStreamingSettings() {
         return this.get('/api/settings/streaming');
+    }
+    /**
+     * The app whose sound a running stream carries under "Stream audio from":
+     * `{app: "huntgame.exe" | "", supported: boolean}`.
+     */
+    static async getAudioFocused() {
+        return this.get('/api/audio/focused');
+    }
+    /**
+     * The apps with sound on the host, to pick one from under "Stream audio
+     * from": `{apps: [{exe: "chrome.exe", name: "Google Chrome"}], supported: boolean}`.
+     */
+    static async getAudioApps() {
+        return this.get('/api/audio/apps');
     }
     static async saveStreamingSettings(settings) {
         return this.post('/api/settings/streaming', settings);

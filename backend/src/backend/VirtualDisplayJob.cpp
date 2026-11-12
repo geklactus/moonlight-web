@@ -121,6 +121,7 @@ VirtualDisplayJob::VirtualDisplayJob(QObject* parent)
         // went off four seconds into the new stream.
         if (m_InUse && m_InUse()) {
             Logger::info(QStringLiteral("[vdisplay] still streamed — stays on"));
+            if (othersDueBack()) enqueue(Action::OthersBack, 0, 0, 0, false, false, nullptr);
             return;
         }
         Logger::info(QStringLiteral("[vdisplay] no stream left on the virtual display"));
@@ -135,6 +136,13 @@ VirtualDisplayJob::VirtualDisplayJob(QObject* parent)
         }
         deactivate(nullptr);
     });
+}
+
+bool VirtualDisplayJob::othersDueBack() const
+{
+    if (!m_OwnerOn) return false;
+    return VirtualDisplay::othersComeBack(m_OwnerOn(),
+                                          QFile::exists(VirtualDisplay::othersOffPath()));
 }
 
 bool VirtualDisplayJob::running() const
@@ -162,7 +170,15 @@ QJsonObject VirtualDisplayJob::statusJson() const
 
 // ── Entry points ────────────────────────────────────────────────────────────
 
-void VirtualDisplayJob::activate(int width, int height, int refreshMilliHz, bool hdr, Callback cb)
+void VirtualDisplayJob::activate(int width, int height, int refreshMilliHz, bool hdr,
+                                 bool othersOff, Callback cb)
+{
+    activateAs(VirtualDisplay::Asker::Owner, width, height, refreshMilliHz, hdr, othersOff,
+               std::move(cb));
+}
+
+void VirtualDisplayJob::activateAs(VirtualDisplay::Asker asker, int width, int height,
+                                   int refreshMilliHz, bool hdr, bool othersOff, Callback cb)
 {
     m_Release.stop();
     // Linux: the stream's own portal session makes the display, at the
@@ -199,7 +215,10 @@ void VirtualDisplayJob::activate(int width, int height, int refreshMilliHz, bool
             return;
         }
     }
-    enqueue(Action::Activate, width, height, refresh, hdr, std::move(cb));
+    enqueue(Action::Activate, width, height, refresh, hdr,
+            VirtualDisplay::othersGoOff(asker, othersOff, m_GuestOn && m_GuestOn(),
+                                        QFile::exists(VirtualDisplay::othersOffPath())),
+            std::move(cb));
 }
 
 void VirtualDisplayJob::activateIfOff(int width, int height, int refreshMilliHz, Callback cb)
@@ -209,12 +228,15 @@ void VirtualDisplayJob::activateIfOff(int width, int height, int refreshMilliHz,
         if (cb) cb(true, QString());
         return;
     }
-    // On its way on, in whatever mode: that operation's outcome is the
-    // answer. (One on its way off is followed by this one.)
-    const bool lastIsActivate = m_Queue.isEmpty()
-                                    ? running() && m_Request.action == Action::Activate
-                                    : m_Queue.last().action == Action::Activate;
-    if (lastIsActivate) {
+    // On its way on, in whatever mode, or on with the other displays coming
+    // back: that operation's outcome is the answer. (One on its way off is
+    // followed by this one.)
+    const auto keepsItOn = [](Action action) {
+        return action == Action::Activate || action == Action::OthersBack;
+    };
+    const bool lastKeepsItOn = m_Queue.isEmpty() ? running() && keepsItOn(m_Request.action)
+                                                 : keepsItOn(m_Queue.last().action);
+    if (lastKeepsItOn) {
         if (!cb) return;
         if (m_Queue.isEmpty()) {
             m_Callbacks.append(std::move(cb));
@@ -228,10 +250,17 @@ void VirtualDisplayJob::activateIfOff(int width, int height, int refreshMilliHz,
         return;
     }
     if (!running() && m_Queue.isEmpty() && VirtualDisplay::probe().active) {
+        // Arrived during the grace of an owner who left it exclusive: that grace
+        // was just cancelled, and nothing else would bring the others back.
+        if (othersDueBack()) {
+            enqueue(Action::OthersBack, 0, 0, 0, false, false, std::move(cb));
+            return;
+        }
         if (cb) cb(true, QString());
         return;
     }
-    activate(width, height, refreshMilliHz, false, std::move(cb));
+    activateAs(VirtualDisplay::Asker::Guest, width, height, refreshMilliHz, false, false,
+               std::move(cb));
 }
 
 void VirtualDisplayJob::deactivate(Callback cb)
@@ -245,7 +274,7 @@ void VirtualDisplayJob::deactivate(Callback cb)
             return;
         }
     }
-    enqueue(Action::Deactivate, 0, 0, 0, false, std::move(cb));
+    enqueue(Action::Deactivate, 0, 0, 0, false, false, std::move(cb));
 }
 
 void VirtualDisplayJob::releaseSoon(int graceMs)
@@ -262,12 +291,14 @@ void VirtualDisplayJob::releaseSoon(int graceMs)
 }
 
 void VirtualDisplayJob::enqueue(Action action, int width, int height, int refreshMilliHz, bool hdr,
-                                Callback cb)
+                                bool exclusive, Callback cb)
 {
     // The same verb AND the same mode as the running or last queued
     // operation: join it. A different mode is a different operation, and it
     // waits its turn rather than riding on one that will not deliver it.
     // While a mode falls back, the caller's own one is what it is running.
+    // A join keeps the operation's exclusive choice, so one that leaves the
+    // other displays on (a guest's) never starts turning them off.
     const VirtualDisplay::Request& runningAsked =
         m_AskedBeforeFallback ? *m_AskedBeforeFallback : m_Request;
     if (running() && runningAsked.action == action && runningAsked.width == width &&
@@ -288,7 +319,7 @@ void VirtualDisplayJob::enqueue(Action action, int width, int height, int refres
         }
         return;
     }
-    m_Queue.append(Pending{action, width, height, refreshMilliHz, hdr, std::move(cb)});
+    m_Queue.append(Pending{action, width, height, refreshMilliHz, hdr, exclusive, std::move(cb)});
     if (!running()) startNext();
 }
 
@@ -302,10 +333,17 @@ void VirtualDisplayJob::startNext()
     m_Request.height = next.height;
     m_Request.refreshMilliHz = next.refreshMilliHz;
     m_Request.hdr = next.hdr;
-    m_Request.exclusive =
-        next.action == Action::Activate && AppSettings().virtualDisplayExclusive();
+    // Bench only (MW_BENCH_VD_HDR=1): a stream that asked for HDR keeps the
+    // Windows display in HDR. See Request::benchHdr.
+    m_Request.benchHdr = next.action == Action::Activate && next.hdr &&
+                         qEnvironmentVariableIntValue("MW_BENCH_VD_HDR") == 1;
+    // Bench only (MW_BENCH_VD_SECONDARY=1): the primary display keeps its
+    // role. See Request::benchSecondary.
+    m_Request.benchSecondary = next.action == Action::Activate &&
+                               qEnvironmentVariableIntValue("MW_BENCH_VD_SECONDARY") == 1;
+    m_Request.exclusive = next.exclusive;
     // The GPU the owner chose on the display's card, read as each activation
-    // starts like the choice above: the next stream follows a change.
+    // starts: the next stream follows a change.
     if (next.action == Action::Activate) m_Request.gpu = AppSettings().virtualDisplayGpu();
     m_Callbacks.clear();
     if (next.cb) m_Callbacks.append(std::move(next.cb));
@@ -388,7 +426,9 @@ void VirtualDisplayJob::fail(const QString& error)
     Logger::warning(QStringLiteral("[vdisplay] %1 failed: %2")
                         .arg(VirtualDisplay::toString(m_Request.action), error));
     setState(State::Failed);
-    settle(false, error);
+    // The other displays staying off takes nothing from a guest's stream: the
+    // display is on, and whoever waited on this goes ahead.
+    settle(m_Request.action == Action::OthersBack, error);
 }
 
 void VirtualDisplayJob::succeed(const VirtualDisplay::Result& res)
@@ -478,6 +518,7 @@ void VirtualDisplayJob::dispatch()
                 m_NextStages = {QStringLiteral("snapshot"), QStringLiteral("driver"),
                                 QStringLiteral("mode")};
                 break;
+            case Action::OthersBack: m_NextStages = {QStringLiteral("mode")}; break;
             case Action::Deactivate:
                 m_NextStages = {QStringLiteral("mode"), QStringLiteral("driver")};
                 break;

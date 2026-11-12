@@ -102,6 +102,7 @@ function reattachView(overrides = {}) {
         _stopMediaStatsPolling: vi.fn(),
         _notePresentation: vi.fn(),
         _markFirstFrame: vi.fn(),
+        _mountTouchPad: vi.fn(),
         _initMobileFullscreen: vi.fn(),
         _applyFullscreenOnStart: vi.fn(),
         _handleStatsMessage: vi.fn(),

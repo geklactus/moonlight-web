@@ -18,6 +18,7 @@
 #pragma once
 
 #include <QString>
+#include <QtGlobal>
 
 /**
  * The launcher service: a stream worker that runs as SYSTEM on the console
@@ -89,6 +90,28 @@ QString serviceName();
 /// DEV install and a production one never answer for each other.
 QString controlPipeName();
 
+/// The control pipe's security descriptor, in SDDL. SYSTEM and the
+/// administrators have it all. The interactive user gets 0x12019b: connect
+/// (SYNCHRONIZE), read and write the data, the attributes and the extended
+/// attributes, and read the descriptor. Not FILE_CREATE_PIPE_INSTANCE (0x4):
+/// only this service makes instances of its own pipe.
+inline constexpr char kControlPipeSddl[] = "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x12019b;;;IU)";
+
+/// What a caller opens the control pipe with: GENERIC_READ and FILE_WRITE_DATA.
+/// GENERIC_WRITE would also ask for FILE_APPEND_DATA, which on a pipe is
+/// FILE_CREATE_PIPE_INSTANCE, and kControlPipeSddl gives the user no such
+/// right.
+constexpr quint32 kControlPipeClientAccess = 0x80000000u | 0x00000002u;
+
+/// Whether the pipe a caller reached is this service's: the process at its
+/// server end (GetNamedPipeServerProcessId) is the one the service manager
+/// runs the service as (@p servicePid, 0 when it is not running). A pipe of
+/// that name served by anything else is never spoken to.
+inline bool controlPipeServerIsService(quint32 pipeServerPid, quint32 servicePid)
+{
+    return servicePid != 0 && pipeServerPid == servicePid;
+}
+
 /// Whether a native worker started from this desktop process should go through
 /// the service: Windows, on the desktop, the service registered with THIS
 /// executable as its image, and in a state it can be started from. Cached like
@@ -104,12 +127,34 @@ bool available();
 /// the worker connecting back is then awaited on the pipes themselves.
 bool requestWorker(const QString& base, QString* error);
 
+/// Ask the service for a worker on the console's sign-in screen, attached to
+/// the three pipes named after `base`: Remote Desktop left this process's
+/// session Disconnected, with no display, and the console shows the sign-in
+/// screen of a session nobody is signed in on (RemoteDesktopReturnPolicy.h).
+/// The worker streams that screen and nothing else (--signin-screen, which
+/// the service writes). True once the service reports the process created;
+/// a refusal comes back as the reason, in English.
+bool requestSignInWorker(const QString& base, QString* error);
+
 /// Ask the service to press Ctrl+Alt+Suppr on the console session. Windows
 /// takes SendSAS from a service in session 0 and ignores it from the worker,
 /// which runs in the console session, SYSTEM or not (design §31.7). The same
 /// checks on the caller as for a worker; true once the service says it
 /// pressed it, false with the reason (the machine's policy, most often).
 bool requestSecureAttention(QString* error);
+
+/// Ask the service to put this process's own session back on the console:
+/// Remote Desktop left it Disconnected, with no display at all, and nobody is
+/// signed in on the PC (RemoteDesktopReturnPolicy.h). True once the service
+/// says it is done; the caller then locks the session (RemoteDesktopReturn).
+/// A refusal comes back as the reason, in English.
+bool requestConsoleReturn(QString* error);
+
+/// The way back when a return could not lock the session: ask the service to
+/// disconnect this process's own session again, as Remote Desktop had left it.
+/// Only while that session is Active on the console. Used when the server's
+/// own WTSDisconnectSession is refused.
+bool requestHide(QString* error);
 
 /// `--worker-service`: the service's own entry point. Runs the control loop
 /// until the SCM stops it, and returns the process exit code.

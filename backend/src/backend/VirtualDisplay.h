@@ -299,6 +299,22 @@ constexpr bool kVddMatchProduct = false;
 /// driver's own ceiling.
 int refreshForStream(int streamFps, int benchHz, bool faster = false);
 
+/// The size a stream asks of the display, 0 x 0 for the mode it has.
+///   - @p match ("Match my screen"): the client's own size, whatever it is.
+///   - Otherwise the stream's size when it holds more pixels than the default
+///     mode (kWidth x kHeight): a 1440p or 2160p stream gets a desktop of its
+///     size, instead of the 1080p one scaled up or, under a box the host
+///     never upscales, a stream that stays at 1080p without a word.
+///   - A smaller stream keeps the display's mode (the default 1080p desktop,
+///     scaled down), as before.
+/// The size still goes through normaliseMode where it is applied.
+struct ModeSize
+{
+    int width = 0;
+    int height = 0;
+};
+ModeSize sizeForStream(int width, int height, bool match);
+
 /// Whether this platform's virtual display runs faster than the stream
 /// (refreshForStream's @p faster): Windows (decision A of plan framerate-hote,
 /// 30/09/2026) and Linux, whose portal monitor the stream itself makes (C0 of
@@ -376,6 +392,7 @@ struct Request
         Uninstall,  ///< uninstaller: remove our node, the package if unused
         Activate,   ///< a stream starts: enable, set the mode, make primary
         Deactivate, ///< the last stream ended: restore the primary, disable
+        OthersBack, ///< the owner left, guests stay: the other displays back on
     };
     Action action = Action::Activate;
     /// Deactivate: the display to make primary again, as Activate reported
@@ -396,9 +413,27 @@ struct Request
     /// when the viewer asked for HDR. Applied in process, never written to
     /// the request file: Windows' display is SDR, whatever this says.
     bool hdr = false;
+    /// Activate, Windows, bench only: leave the display in HDR (advanced
+    /// colour) instead of SDR, so a stream that asked for HDR gets it. Set by
+    /// the server only when the viewer asked for HDR AND MW_BENCH_VD_HDR=1 is
+    /// in its environment (the Auto-bitrate bench measures HDR streams this
+    /// way); written as `bench_hdr`. Off, the display is SDR as always.
+    bool benchHdr = false;
+    /// Activate, Windows, bench only: the primary display stays the primary.
+    /// Ours stays where the activation put it (on the right of the others
+    /// when the layout from before is imposed) and is not made the primary
+    /// (LayoutStep::Primary is skipped).
+    /// The stream still captures ours: the Virtual Display card names it,
+    /// not the primary. Set by the server only when MW_BENCH_VD_SECONDARY=1
+    /// is in its environment (a bench on a desk whose primary must not move);
+    /// written as `bench_secondary`. An exclusive stream turns the others off
+    /// all the same, which leaves ours the only display. Off, ours is the
+    /// primary while it streams, as always.
+    bool benchSecondary = false;
     /// Activate, Windows: every other display goes off while ours streams
-    /// (issue #39), the owner's choice (AppSettings::virtualDisplayExclusive).
-    /// Never saved to Windows' database: see savesLayout().
+    /// (issue #39), the owner's choice (AppSettings::virtualDisplayExclusive),
+    /// for the owner's own streams only: see othersGoOff(). Never saved to
+    /// Windows' database: see savesLayout().
     bool exclusive = false;
     /// Activate, Windows: the GPU the display is to be drawn by, as the OS
     /// names it (AppSettings::virtualDisplayGpu, the owner's choice on the
@@ -411,7 +446,7 @@ struct Request
 };
 
 /// Parse and validate a request. The file is read by an elevated process, so
-/// its contents are a choice among four verbs, one display key and a mode,
+/// its contents are a choice among five verbs, one display key and a mode,
 /// never free-form input. Returns nullopt with @p error filled on any deviation.
 std::optional<Request> parseRequest(const QByteArray& json, QString* error);
 QByteArray toJson(const Request& req);
@@ -429,6 +464,42 @@ QString notAppearedError();
 /// failure is not one a mode explains: a launch at the default mode is
 /// better than no launch, which is what normaliseMode() already promises.
 std::optional<Request> fallbackTowardsDefault(const Request& tried, const QString& error);
+
+/// Who a stream's activation of the display is for.
+enum class Asker
+{
+    Owner, ///< a signed-in session's /start
+    Guest, ///< someone with an invitation, who may be anywhere
+};
+
+/// Whether an activation has every other display off (Request::exclusive): the
+/// option in force (@p optionOn), and the owner asking. A guest may open an
+/// invitation cold while someone works at the PC, and an invitation gives no
+/// say over its screens: the guest's stream runs with them on. An owner who
+/// finds a guest on the display (@p guestOn) leaves them as they are, on until
+/// the owner's next stream; off already (@p othersOff), they stay off through
+/// the owner's change of mode.
+bool othersGoOff(Asker asker, bool optionOn, bool guestOn, bool othersOff);
+
+/// The option an owner's stream brings to othersGoOff(): two keys, both
+/// needed. The admin allows it (@p allowed, AppSettings::virtualDisplayExclusive)
+/// and the viewer turned it on in this browser's streaming settings (@p choice,
+/// sent with the stream). A browser that never chose (@p hasChoice false) takes
+/// what the PC did before the choice moved to the viewer (@p inherited): on
+/// where the admin's box was already ticked, so an update changes nothing.
+bool ownerWantsOthersOff(bool allowed, bool hasChoice, bool choice, bool inherited);
+
+/// The display cards drawn dark on the native host's card: with the other
+/// displays off (@p othersOff), the ones last seen lit (@p lit, in their
+/// order) that the PC no longer lists (@p listed). Windows detaches them, so
+/// without this their cards would vanish for the length of the stream. None
+/// with the displays on.
+QList<int> darkDisplays(const QList<int>& lit, const QList<int>& listed, bool othersOff);
+
+/// With a stream still on the display: whether the other displays come back on
+/// now. They were the owner's to turn off, so they go with the owner's stream
+/// (@p ownerOn), whatever the guests still watching.
+bool othersComeBack(bool ownerOn, bool othersOff);
 
 /// The display layout changes the Windows helper makes, in the order an
 /// activation takes them (Restore is a deactivation's).
@@ -612,6 +683,8 @@ QPoint placeBeside(const QList<DesktopRect>& others);
 QString stagingDir();
 QString requestPath();
 QString resultPath();
+/// The helper's marker: an exclusive stream has the other displays off.
+QString othersOffPath();
 
 // ── Status ──────────────────────────────────────────────────────────────────
 

@@ -58,6 +58,8 @@ import { createVideoRenderer } from './renderers/createRenderer.js';
 import { SliceQpReader } from '../util/SliceQp.js';
 import { PipelineDiag } from './PipelineDiag.js';
 import { shouldFlushAtKeyframe } from './DecodeQueuePolicy.js';
+import { queueBrake } from './DecodeBrake.js';
+import { DecoderErrorTrail } from './DecoderErrorTrail.js';
 import { EnhancerGovernor, ladderRung, rendererAlgo } from './EnhancerGovernor.js';
 import { drawCapFor } from './RenderPacing.js';
 import { FramePacer } from './FramePacer.js';
@@ -125,6 +127,8 @@ const S = {
     // Why those three legs move: arrival cadence, queue depths, draw split and
     // drop causes (posted with the counters — see PipelineDiag).
     diag: new PipelineDiag(2000),
+    // What the decoder had just been fed, for the line logged with its error.
+    trail: new DecoderErrorTrail(),
     // Steps the enhancer down when its GPU cost stops fitting between two
     // frames; created at init with the setting as its ceiling.
     governor: null,
@@ -359,6 +363,7 @@ function setupDecoder() {
         },
         error: (err) => {
             console.error('[VideoWorker] VideoDecoder error:', err.message);
+            console.warn('[VideoWorker] ' + S.trail.line(err, performance.now(), S.videoCodec));
             handleDecoderError(err);
         },
     });
@@ -711,6 +716,7 @@ function flushDecodeQueue() {
     S.diag.noteDrop('backpressure', queued);
     S.diag.noteRecovery('flush');
     S._lastQueueFlushMs = performance.now();
+    S.trail.noteFlush(S._lastQueueFlushMs);
     console.warn('[VideoWorker] Decode queue flushed at the keyframe: ' + queued + ' stale');
     return true;
 }
@@ -789,6 +795,7 @@ function decodeFrame(data, isKeyframe, backendTs, arrivalAbs, zones = null) {
         if (zones && S.renderer && S.renderer.wantsFrameZones)
             S.renderer.noteFrameZones(timestamp, zones);
         trackChunkSubmit(timestamp, backendTs);
+        S.trail.noteDecode(isKeyframe, S.decoder.decodeQueueSize);
         if (arrivalAbs > 0) addStageSample(S._arriveSamples, nowAbs() - arrivalAbs);
         S.decoder.decode(chunk);
         S.stats.received++;
@@ -849,6 +856,8 @@ function configureAv1Decoder(seqHeaderObu) {
                 if (result.supported) {
                     try {
                         S.decoder.configure(cfg);
+                        // Applied again after a queue flush (flushDecodeQueue).
+                        S._activeDecoderCfg = cfg;
                         S.decoderConfigured = true;
                         S.decoderConfiguring = false;
                         while (S.pendingFrames.length > 0 && !S.pendingFrames[0].isKeyframe) {
@@ -879,11 +888,55 @@ function decodeAv1Frame(data, isKeyframe, arrivalAbs, zones = null) {
     }
     if (!S.decoder) return;
 
+    // The brakes of decodeFrame above, which AV1 had none of (DecodeBrake.js).
+    if (!isKeyframe && !S._referenceValid) {
+        S.stats.dropped++;
+        S.diag.noteDrop('backpressure');
+        requestIdr('reference invalid');
+        return;
+    }
+
+    S.diag.noteDecodeQueue(S.decoder.decodeQueueSize);
+
+    const brake = queueBrake({
+        isKeyframe,
+        queued: S.decoder.decodeQueueSize,
+        queueMax: S.DECODE_QUEUE_MAX,
+        stallStart: S._queueStallStart,
+        now: performance.now(),
+        stallMs: S.QUEUE_STALL_MS,
+        resetMs: S.QUEUE_RESET_MS,
+    });
+    S._queueStallStart = brake.stallStart;
+    if (brake.verdict === 'reset') {
+        handleDecoderError(new Error('Decode queue stalled'));
+        return;
+    }
+    if (brake.verdict === 'drop') {
+        S.stats.dropped++;
+        S.diag.noteDrop('backpressure');
+        S._referenceValid = false;
+        requestIdr('decode queue overflow');
+        return;
+    }
+
     const timestamp = S.frameCount * 16667;
     S.frameCount++;
     const type = isKeyframe ? 'key' : 'delta';
     const obuData = stripNonEssentialObus(data);
-    S.diag.noteDecodeQueue(S.decoder.decodeQueueSize);
+
+    // A keyframe behind a saturated queue: flush the stale pictures first.
+    if (
+        isKeyframe &&
+        shouldFlushAtKeyframe({
+            queued: S.decoder.decodeQueueSize,
+            arrivalMs: S.diag.arrivalAvgMs,
+            sinceLastFlushMs: performance.now() - S._lastQueueFlushMs,
+        })
+    ) {
+        flushDecodeQueue();
+    }
+
     try {
         // AV1 has no backendTs here (synthetic chunk timestamps), so the pacer
         // sees 0 and leaves this path on the present-on-decode behavior.
@@ -892,9 +945,15 @@ function decodeAv1Frame(data, isKeyframe, arrivalAbs, zones = null) {
         if (zones && S.renderer && S.renderer.wantsFrameZones)
             S.renderer.noteFrameZones(timestamp, zones);
         trackChunkSubmit(timestamp, 0);
+        S.trail.noteDecode(isKeyframe, S.decoder.decodeQueueSize);
         if (arrivalAbs > 0) addStageSample(S._arriveSamples, nowAbs() - arrivalAbs);
         S.decoder.decode(chunk);
         S.stats.received++;
+        if (isKeyframe) {
+            S._referenceValid = true;
+            S._idrRequested = false;
+            S._queueStallStart = 0;
+        }
     } catch (err) {
         S.stats.dropped++;
     }
@@ -1046,6 +1105,7 @@ function processFrame(data, isKeyframe, backendTs, arrivalAbs, zones = null) {
     // host now sends 60fps of heavy frames" from "the browser slowed down" when
     // the legs inflate together.
     S.diag.noteArrival(data.length);
+    S.trail.noteArrival(performance.now());
 
     if (S.videoCodec === CODEC_AV1) {
         handleAv1Frame(data, isKeyframe, arrivalAbs, zones);

@@ -20,6 +20,7 @@
 #include "server/TunnelFrame.h"
 
 #include "common/Logger.h"
+#include "common/LoopbackKey.h"
 #include "streaming/PacketMarking.h"
 #include "common/PairingCrypto.h"
 #include "network/RendezvousClient.h"
@@ -33,9 +34,11 @@
 #include "streaming/SdpFingerprint.h"
 
 #include <QCryptographicHash>
+#include <QElapsedTimer>
 #include <QHostAddress>
 #include <QJsonDocument>
 #include <QMetaObject>
+#include <QNetworkRequest>
 #include <QStringList>
 #include <QTimer>
 #include <QUrl>
@@ -129,13 +132,19 @@ ControlTunnel::ControlTunnel(HttpServer* http, AuthManager* auth, AppSettings* s
         m_Ports->ensureStarted();
         // Already discovered on behalf of a stream: the signal below has fired.
         if (m_Ports->gatewayState() == RouterPortAllocator::GatewayState::Ready &&
-            m_PublicIP.empty())
+            (m_PublicIP.empty() || m_Ports->heldTunnelPorts().isEmpty()))
             onGatewayReady(m_Ports->publicIp());
     });
     connect(m_Ports, &RouterPortAllocator::gatewayReady, this, &ControlTunnel::onGatewayReady);
     connect(m_Ports, &RouterPortAllocator::gatewayMissing, this,
             [this]() { giveUpWaiting(QStringLiteral("no IGD on this network")); });
     connect(m_Ports, &RouterPortAllocator::portLost, this, &ControlTunnel::onPortLost);
+    connect(m_Ports, &RouterPortAllocator::switchedOff, this, [this]() {
+        const QList<uint16_t> spare = m_FreePorts;
+        m_FreePorts.clear();
+        for (const uint16_t port : spare)
+            m_Ports->releaseTunnelPort(port);
+    });
 
     Logger::info(QStringLiteral("[Tunnel] Ready — host key %1").arg(hostKeyFingerprint()));
 }
@@ -171,6 +180,12 @@ void ControlTunnel::requestTunnelPort()
                                           const QString& why) {
         if (claim.external == 0) {
             giveUpWaiting(why);
+            return;
+        }
+        // Switched off while the router was answering.
+        if (!m_Ports->enabled()) {
+            m_Ports->releaseTunnelPort(claim.external);
+            giveUpWaiting(QStringLiteral("UPnP is off"));
             return;
         }
         if (m_PublicIP.empty()) m_PublicIP = m_Ports->publicIp().toStdString();
@@ -247,6 +262,10 @@ uint16_t ControlTunnel::takeTunnelPort()
 void ControlTunnel::releaseTunnelPort(uint16_t port)
 {
     if (port == 0 || m_FreePorts.contains(port)) return;
+    if (!m_Ports->enabled()) {
+        m_Ports->releaseTunnelPort(port);
+        return;
+    }
     // Only a hole this host still holds: one lost at renewal is gone for good.
     for (const RouterPortAllocator::Claim& c : m_Ports->heldTunnelPorts()) {
         if (c.external != port) continue;
@@ -281,8 +300,11 @@ QString ControlTunnel::peerAddress(const Peer& p) const
     // told us — it is where our own stack is sending packets — which makes it
     // the one trustworthy statement about where this peer sits, and it is what
     // lets a browser on the same LAN keep its direct path when it launches a
-    // stream. It never grants privilege: serveRequest() shuts the local
-    // exemption for every tunnel arrival regardless of what this returns.
+    // stream. It grants no admin right: serveRequest() shuts the local
+    // exemption for every tunnel arrival regardless of what this returns. It
+    // does place a caller on this LAN for the rules that ask where one is
+    // (AuthManager::fromThisLan): the remote admin unlock, a device asking by
+    // its QR code, and a paired session answering such a request.
     if (!p.pc) return peerLabel(p.sessionId);
     try {
         rtc::Candidate local;
@@ -447,6 +469,23 @@ void ControlTunnel::buildPeerConnection(Peer& p)
         config.portRangeBegin = p.port;
         config.portRangeEnd = p.port;
     }
+    // The ICE-TCP-on-443 prototype's bench key (AppSettings::
+    // debugTunnelPublicAddress), only where no router hole is held: a port the
+    // router forwards by a rule of its own, offered under the address given.
+    // Held by something else, the bind fails and this one session is refused
+    // (createPeerConnection), which is the answer such a bench wants.
+    QString pinnedIp;
+    quint16 pinnedPort = 0;
+    if (p.port == 0 && TunnelPeerPolicy::parsePublicAddress(m_Settings->debugTunnelPublicAddress(),
+                                                            &pinnedIp, &pinnedPort)) {
+        config.portRangeBegin = pinnedPort;
+        config.portRangeEnd = pinnedPort;
+        Logger::warning(QStringLiteral("[Tunnel] Session %1: DEBUG debug_tunnel_public_address is "
+                                       "ON — port %2 bound, offered as %3:%2")
+                            .arg(sessionId.left(8))
+                            .arg(pinnedPort)
+                            .arg(pinnedIp));
+    }
     // The settings value, which defaults to our own server. This is the host
     // half of the connection bootstrap/v1/tunnel.js makes: that page refuses
     // Google's web fonts so that nobody outside learns who is connecting to
@@ -490,8 +529,8 @@ void ControlTunnel::buildPeerConnection(Peer& p)
             Qt::QueuedConnection);
     });
 
-    const std::string publicIP = m_PublicIP;
-    const uint16_t mappedPort = p.port;
+    const std::string publicIP = pinnedPort != 0 ? pinnedIp.toStdString() : m_PublicIP;
+    const uint16_t mappedPort = pinnedPort != 0 ? pinnedPort : p.port;
     p.pc->onLocalCandidate([this, id, attempt, publicIP, mappedPort,
                             dropUdp](const rtc::Candidate& candidate) {
         const std::string cand = candidate.candidate();
@@ -537,7 +576,7 @@ void ControlTunnel::buildPeerConnection(Peer& p)
 
         QMetaObject::invokeMethod(
             this,
-            [this, id, attempt, cand, mid, publicCand, tcp]() {
+            [this, id, attempt, cand, mid, publicCand, tcp, publicIP, mappedPort]() {
                 Peer* pp = peer(id);
                 if (!pp || pp->attempt != attempt) return;
                 const auto send = [this, &id, &mid](const std::string& line) {
@@ -560,8 +599,8 @@ void ControlTunnel::buildPeerConnection(Peer& p)
                     // is silent at both ends.
                     Logger::info(QStringLiteral("[Tunnel] Session %1 offered %2:%3 as its public "
                                                 "address%4")
-                                     .arg(id.left(8), QString::fromStdString(m_PublicIP))
-                                     .arg(pp->port)
+                                     .arg(id.left(8), QString::fromStdString(publicIP))
+                                     .arg(mappedPort)
                                      .arg(tcp ? QStringLiteral(" (TCP, listening)") : QString()));
                 }
             },
@@ -767,6 +806,8 @@ void ControlTunnel::onSignal(const QString& sessionId, const QJsonObject& payloa
         handleAnswer(*p, payload);
     else if (type == QLatin1String("ice"))
         handleIce(*p, payload);
+    else if (type == QLatin1String("diag"))
+        handleDiag(*p, payload);
 }
 
 void ControlTunnel::handleHello(Peer& p, const QJsonObject& msg)
@@ -905,6 +946,56 @@ void ControlTunnel::handleIce(Peer& p, const QJsonObject& msg)
     }
 }
 
+namespace {
+
+/// A clock for the failure reports' hourly limit, which wall-clock changes
+/// must not move.
+qint64 diagClockMs()
+{
+    static QElapsedTimer clock = [] {
+        QElapsedTimer t;
+        t.start();
+        return t;
+    }();
+    return clock.elapsed();
+}
+
+} // namespace
+
+void ControlTunnel::handleDiag(Peer& p, const QJsonObject& msg)
+{
+    // Only from a browser whose signed answer verified, once per connection,
+    // and only while its channel is not open: a report from anyone else is
+    // dropped without a word, so it cannot be used to write in this log.
+    if (!p.answerVerified || p.diagSeen || channelOpen(p)) return;
+    p.diagSeen = true;
+
+    const qint64 now = diagClockMs();
+    closeDiagWindow();
+    if (!m_DiagLimiter.admit(now)) {
+        // Counted, and said once when the hour is over.
+        if (!m_DiagWindowTimer) {
+            m_DiagWindowTimer = true;
+            QTimer::singleShot(m_DiagLimiter.msLeft(now) + 1, this, [this]() {
+                m_DiagWindowTimer = false;
+                closeDiagWindow();
+            });
+        }
+        return;
+    }
+    Logger::info(QStringLiteral("[Tunnel] Session %1: %2")
+                     .arg(p.sessionId.left(8), TunnelDiag::describe(msg)));
+}
+
+void ControlTunnel::closeDiagWindow()
+{
+    if (const int ignored = m_DiagLimiter.closeWindow(diagClockMs()))
+        Logger::info(QStringLiteral("[Tunnel] %1 more browser failure reports in the past hour, "
+                                    "past the %2 an hour that are written")
+                         .arg(ignored)
+                         .arg(TunnelDiag::kMaxLinesPerWindow));
+}
+
 // ── The channel ─────────────────────────────────────────────────────────────
 
 void ControlTunnel::sendFrame(Peer& p, const QByteArray& frame)
@@ -1002,19 +1093,22 @@ void ControlTunnel::handleRequestFrame(Peer& p, quint32 id, const QByteArray& pa
 
     const QString hostHeader = req.headers.value(QStringLiteral("host"));
     const QString sessionId = p.sessionId;
+    const bool mayDeflate = head.value(QLatin1String(TunnelFrame::kEncodingField)).toString() ==
+                                QLatin1String(TunnelFrame::kDeflate) &&
+                            TunnelFrame::mayDeflate(req.method, req.path);
     p.inFlight++;
 
     m_Http->serveRequest(std::move(req), HttpServer::Arrival::Tunnel,
-                         [this, sessionId, id, hostHeader](const HttpResponse& resp) {
+                         [this, sessionId, id, hostHeader, mayDeflate](const HttpResponse& resp) {
                              Peer* pp = peer(sessionId);
                              if (!pp) return;
                              pp->inFlight--;
-                             sendResponse(sessionId, id, resp, hostHeader);
+                             sendResponse(sessionId, id, resp, hostHeader, mayDeflate);
                          });
 }
 
 void ControlTunnel::sendResponse(const QString& sessionId, quint32 id, const HttpResponse& response,
-                                 const QString& hostHeader)
+                                 const QString& hostHeader, bool mayDeflate)
 {
     Peer* p = peer(sessionId);
     if (!p) return;
@@ -1032,14 +1126,29 @@ void ControlTunnel::sendResponse(const QString& sessionId, quint32 id, const Htt
     for (auto it = response.headers.cbegin(); it != response.headers.cend(); ++it)
         headers.insert(it.key(), it.value());
 
-    const QByteArray head = TunnelFrame::encodeHead(
-        QJsonObject{{QStringLiteral("s"), response.statusCode}, {QStringLiteral("h"), headers}},
-        QByteArray());
+    QJsonObject headObj{{QStringLiteral("s"), response.statusCode}, {QStringLiteral("h"), headers}};
+
+    // The interface's files, deflated for a page that can inflate them: about a
+    // quarter of the bytes for the scripts, which over a long round trip and a
+    // TCP path is what the first visit spends its time on (docs/design/
+    // ice-tcp-passive.md §5.5). Kept only when it is smaller.
+    QByteArray body = response.body;
+    if (mayDeflate &&
+        TunnelFrame::worthDeflating(response.statusCode, response.contentType, body.size())) {
+        QByteArray deflated = TunnelFrame::deflate(body);
+        if (!deflated.isEmpty() && deflated.size() < body.size()) {
+            body = std::move(deflated);
+            headObj.insert(QLatin1String(TunnelFrame::kEncodingField),
+                           QLatin1String(TunnelFrame::kDeflate));
+        }
+    }
+
+    const QByteArray head = TunnelFrame::encodeHead(headObj, QByteArray());
     sendFrame(*p, TunnelFrame::build(TunnelFrame::Response, id, head));
 
-    for (qsizetype offset = 0; offset < response.body.size(); offset += TunnelFrame::kChunkBytes)
+    for (qsizetype offset = 0; offset < body.size(); offset += TunnelFrame::kChunkBytes)
         sendFrame(*p, TunnelFrame::build(TunnelFrame::Body, id,
-                                         response.body.mid(offset, TunnelFrame::kChunkBytes)));
+                                         body.mid(offset, TunnelFrame::kChunkBytes)));
 
     sendFrame(*p, TunnelFrame::build(TunnelFrame::End, id, QByteArray()));
 }
@@ -1108,7 +1217,9 @@ void ControlTunnel::handleWsOpen(Peer& p, quint32 id, const QByteArray& payload)
         sendFrame(*pp, TunnelFrame::build(TunnelFrame::WsClose, id, why));
     });
 
-    ws->open(QUrl(QStringLiteral("ws://127.0.0.1:%1/").arg(port)));
+    QNetworkRequest request(QUrl(QStringLiteral("ws://127.0.0.1:%1/").arg(port)));
+    request.setRawHeader(mw::loopback::kHeader, mw::loopback::key());
+    ws->open(request);
 }
 
 void ControlTunnel::handleWsText(Peer& p, quint32 id, const QString& text)

@@ -81,6 +81,13 @@ bool isTrustedHost(const QString& hostHeader, const QString& publicDomain);
 /// redirect.
 bool isLocalHostName(const QString& hostHeader);
 
+/// Whether a request carries a header that only a proxy on the way writes
+/// (keys lowercase): the forwarding headers of reverse proxies, CDNs and
+/// tunnels. The peer of such a request is the proxy, not the browser, so
+/// nothing may be granted on the peer's address. It only ever takes away: a
+/// caller that forges one loses what its address was worth.
+bool forwardedByProxy(const QMap<QString, QString>& headers);
+
 /// Whether a request body may be accepted. Requires application/json for any
 /// non-empty body, which also forces a CORS preflight on cross-origin writes.
 bool isBodyContentTypeAllowed(const QString& contentType, qsizetype bodySize);
@@ -113,6 +120,10 @@ struct Context
     bool adminKeyOk = false;   ///< request carries the current admin key
     bool adminLocked = false;  ///< launched with --noadmin: nobody administers
     QString publicDomain;      ///< the domain we answer to, "" when none
+    /// The request came over the local channel (HttpServer::Arrival::Local),
+    /// from a program of this install on this machine. Set by the code that
+    /// reads that channel and by nothing a request carries.
+    bool localChannel = false;
 };
 
 enum class Outcome
@@ -133,6 +144,13 @@ struct Decision
 };
 
 Decision evaluate(const Request& req, const Context& ctx);
+
+/// Whether a request that came over the local channel may be routed at all:
+/// what the tray icon, the command line and a second launch ask of the running
+/// server, each with its verb, and nothing else. An allow-list, so a route
+/// added later stays off this channel until it is named here. Streams, pairing
+/// and sessions have no business on it.
+bool localChannelRoute(const QString& method, const QString& path);
 
 /// The HTTP status a refused outcome must be answered with, 0 for Allow. Here
 /// rather than at the call site so the status is part of the tested contract.
@@ -162,8 +180,8 @@ AdminTokenReply adminTokenReply(const Decision& decision, const Context& ctx, bo
 /// booth offers without being admin routes: every change to the host list
 /// (add, scan, remove, rename, pair, restart its service, set up its backend,
 /// its seats — anything but waking a host and playing on it), the
-/// self-update, letting a new device or guest in (PIN login, share slots, a
-/// guest's PIN), the admin unlock and the system actions. shareAllowed
+/// self-update, letting a new device or guest in (PIN login, a device's QR code,
+/// share slots, a guest's PIN), the admin unlock and the system actions. shareAllowed
 /// (share_in_booth_mode, issue #40) lets the share slots and a guest's PIN
 /// through, and nothing else.
 bool lockedByNoAdmin(const QString& method, const QString& path, bool shareAllowed = false);
@@ -173,5 +191,11 @@ bool lockedByNoAdmin(const QString& method, const QString& path, bool shareAllow
 /// key, empty for a session older than key binding. A request off the tunnel
 /// carries no key and is never refused here.
 bool tunnelKeyRefused(bool viaTunnel, const QByteArray& tunnelKey, const QByteArray& boundKey);
+
+/// Whether the key a request presents is @p expected, in a time that depends
+/// only on the longer of the two and never on where they first differ. Keys
+/// of different lengths never match, and an empty @p expected matches nothing
+/// (HttpServer::adminKeyMatches fails closed on it).
+bool secretMatches(const QByteArray& given, const QByteArray& expected);
 
 } // namespace RequestGuard

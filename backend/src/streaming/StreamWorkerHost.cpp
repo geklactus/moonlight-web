@@ -98,9 +98,14 @@ bool StreamWorkerHost::startAs(const QJsonObject& config, Launch how)
     QByteArray configLine;
     prepare(config, args, configLine);
     const bool native = config["backendType"].toString() == QLatin1String("native");
+    // A config of the sign-in screen goes nowhere else (start()).
+    if (config[QStringLiteral("signInScreen")].toBool(false) != (how == Launch::SignInScreen))
+        return false;
     switch (how) {
     case Launch::ConsoleAsUser: return startInConsoleSession(args, configLine, how);
     case Launch::ServiceAsSystem:
+        return WorkerService::available() && startInConsoleSession(args, configLine, how);
+    case Launch::SignInScreen:
         return WorkerService::available() && startInConsoleSession(args, configLine, how);
     case Launch::TaskElevated:
         return ConsoleSession::elevatedWorkerAvailable() &&
@@ -121,6 +126,13 @@ bool StreamWorkerHost::start(const QJsonObject& config)
     // worker goes to the console session, as the user sitting there. Every
     // other backend talks to a host over the network and runs fine from here.
     const bool native = config["backendType"].toString() == QLatin1String("native");
+    // The console's sign-in screen (RemoteDesktopReturnPolicy): through the
+    // launcher service, in its sign-in screen mode, or not at all. A worker
+    // with less reach, in the session Remote Desktop left, would see no
+    // display — and one without the mode is never what this stream gets.
+    if (config[QStringLiteral("signInScreen")].toBool(false))
+        return native && WorkerService::available() &&
+               startInConsoleSession(args, configLine, Launch::SignInScreen);
     if (native && ConsoleSession::launchesElsewhere())
         return startInConsoleSession(args, configLine, Launch::ConsoleAsUser);
     // On the desktop, the native worker is raised as far as the machine lets
@@ -205,19 +217,26 @@ bool StreamWorkerHost::startInConsoleSession(const QStringList& args, const QByt
     connect(m_Console, &ConsoleProcess::finished, this, &StreamWorkerHost::onChildFinished);
 
     QString error;
-    if (how == Launch::ServiceAsSystem || how == Launch::TaskElevated) {
+    const bool viaLauncher = how == Launch::ServiceAsSystem || how == Launch::TaskElevated ||
+                             how == Launch::SignInScreen;
+    if (viaLauncher) {
         // Neither a task nor a service can be handed our pipes, and neither
         // takes the arguments from here: both carry the fixed ones themselves
         // (--stream-worker, --dev), and only the pipe name travels.
         const bool started =
-            how == Launch::ServiceAsSystem
-                ? m_Console->startThroughService(&error)
+            how == Launch::ServiceAsSystem ? m_Console->startThroughService(&error)
+            : how == Launch::SignInScreen
+                ? m_Console->startThroughSignInService(&error)
                 : m_Console->startThroughTask(ConsoleSession::elevatedWorkerTaskName(), &error);
         if (!started) {
             qWarning() << "[StreamWorkerHost]"
                        << (how == Launch::ServiceAsSystem ? "SYSTEM worker service"
+                           : how == Launch::SignInScreen  ? "Sign-in screen worker"
                                                           : "Elevated worker task")
-                       << "unavailable, falling back to a worker with less reach:" << error;
+                       << (how == Launch::SignInScreen
+                               ? "refused, and nothing else streams the sign-in screen:"
+                               : "unavailable, falling back to a worker with less reach:")
+                       << error;
             m_Console->deleteLater();
             m_Console = nullptr;
             return false;
@@ -236,6 +255,7 @@ bool StreamWorkerHost::startInConsoleSession(const QStringList& args, const QByt
     // (HidParkingTransfer). Never to the guests' feed: it has no page to give
     // them to, and would hold them unanswered for the whole shared session.
     QByteArray line = configLine;
+    // Never to the sign-in screen's worker: keyboard and mouse only there.
     if (how == Launch::ServiceAsSystem || how == Launch::TaskElevated) {
         QJsonObject config = QJsonDocument::fromJson(configLine).object();
         if (config[QStringLiteral("backendType")].toString() == QLatin1String("native") &&
@@ -406,6 +426,21 @@ void StreamWorkerHost::onChildFinished(int exitCode, bool crashed)
     onFinished(exitCode, crashed ? QProcess::CrashExit : QProcess::NormalExit);
 }
 
+namespace {
+/// audioFocusApp(): written and read on the main thread (the workers' stdout
+/// and the HTTP routes both run there).
+QString& audioFocusSlot()
+{
+    static QString app;
+    return app;
+}
+} // namespace
+
+QString StreamWorkerHost::audioFocusApp()
+{
+    return audioFocusSlot();
+}
+
 void StreamWorkerHost::onStdoutData(const QByteArray& data)
 {
     m_Buf += data;
@@ -443,6 +478,9 @@ void StreamWorkerHost::onStdoutData(const QByteArray& data)
         } else if (type == QLatin1String("hidParked")) {
             // The stream is over, its wheels stay: their handles are ours now.
             HidParkingTransfer::takeIn(event);
+        } else if (type == QLatin1String("audioFocus")) {
+            audioFocusSlot() = event["app"].toString().left(260);
+            m_ReportedAudioFocus = true;
         } else if (type == QLatin1String("mouseKeys")) {
             m_MouseKeysHeld = event["on"].toBool();
             m_MouseKeysSaved = m_MouseKeysHeld ? event["saved"].toObject() : QJsonObject();
@@ -455,6 +493,10 @@ void StreamWorkerHost::onStdoutData(const QByteArray& data)
 void StreamWorkerHost::onFinished(int exitCode, QProcess::ExitStatus status)
 {
     qInfo() << "[StreamWorkerHost] Worker finished, exitCode=" << exitCode << "status=" << status;
+    if (m_ReportedAudioFocus) {
+        audioFocusSlot().clear();
+        m_ReportedAudioFocus = false;
+    }
     // Gone without taking the kept devices: they answer the game here again.
     if (m_HidBatch) HidParkingTransfer::settle(m_HidBatch, false);
     m_HidBatch = 0;

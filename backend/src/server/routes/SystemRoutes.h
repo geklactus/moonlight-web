@@ -26,11 +26,12 @@ class AppSettings;
 class AuthManager;
 class InternetAccessManager;
 class ComputerManager;
+struct HttpRequest;
 
 /// Register Internet-access, first-run setup, admin-settings and streaming-settings routes.
-/// @param onHostKeyRotated Invoked after a host-key redemption rotated the key
-///        (single-use), so the entry points embedding it (Desktop shortcut)
-///        are rewritten with the fresh key.
+/// @param spendHostKey Spends the key a link of this machine carried, for
+///        POST /api/auth/host-key (HostKeyVault::spend): true once, for a key
+///        made here and still waiting.
 /// @param onInternetAccessToggled Invoked with the new state whenever the
 ///        Internet-access switch is thrown here. The rendezvous line follows the
 ///        same switch — it is an outbound connection that announces this machine
@@ -42,8 +43,13 @@ class ComputerManager;
 ///        answers at is now the ONLY way its owner can learn it: nothing is
 ///        published in DNS any more, so an unsurfaced URL means a reachable
 ///        machine nobody can reach.
+/// @param viewerOnLan Whether the browser asking reaches this machine over its
+///        own network, as a stream would plan it (main.cpp streamClientKind):
+///        GET /api/settings/streaming says so as `viewer_lan`, and the page's
+///        automatic bitrate takes the LAN rule (frontend/js/util/AutoBitrate.js).
 void registerSystemRoutes(HttpServer& server, AppSettings& appSettings, AuthManager& authManager,
                           InternetAccessManager& internetAccess, ComputerManager& computerManager,
-                          std::function<void()> onHostKeyRotated = {},
+                          std::function<bool(const QString& key)> spendHostKey = {},
                           std::function<void(bool)> onInternetAccessToggled = {},
-                          std::function<QJsonObject()> rendezvousStatus = {});
+                          std::function<QJsonObject()> rendezvousStatus = {},
+                          std::function<bool(const HttpRequest&)> viewerOnLan = {});

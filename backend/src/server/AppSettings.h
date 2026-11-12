@@ -100,8 +100,8 @@ public:
 
     // ── Packet priority (DSCP) ────────────────────────────────────────────────
     // Stored as JSON bool "packet_marking", DEFAULT true, set from the admin
-    // page (« Network priority »): the stream's packets leave in AF41, the
-    // Wi-Fi's video queue (streaming/PacketMarking.h). false marks nothing —
+    // page (« Network priority »): the stream's sound leaves in EF, the rest in
+    // AF41, the Wi-Fi's video queue (streaming/PacketMarking.h). false marks nothing —
     // for a house whose other devices suffer while a stream runs, or a network
     // that mishandles marked packets. Read before each stream.
     bool packetMarking() const;
@@ -126,6 +126,16 @@ public:
     // network that lets UDP out (mw::ice::stripUdpCandidates). Read when each
     // connection is built.
     bool debugIceDropUdp() const;
+    // A DEBUG switch for a bench, never for a user: JSON string
+    // "debug_tunnel_public_address", "a.b.c.d:port", DEFAULT absent, typed into
+    // the file by hand like the one above, and read by no API. With it, the entry
+    // link's tunnel binds that port (UDP and passive TCP) instead of a router
+    // hole or an ephemeral port, and offers it under that address. It is the
+    // ICE-TCP-on-443 prototype (v0.4.2): the router already forwards the port to
+    // this machine by a rule of its own, and nothing else here may hold it. One
+    // browser at a time. Malformed is off (TunnelPeerPolicy::parsePublicAddress).
+    // Read when each connection is built.
+    QString debugTunnelPublicAddress() const;
 
     // ── The guests' shared feed ───────────────────────────────────────────────
     //
@@ -334,6 +344,71 @@ public:
     int streamFps() const;
     void setStreamFps(int fps);
 
+    // ── The administrator's ceilings ──────────────────────────────────────────
+    //
+    // What no viewer may stream above, whatever its Settings say, on every
+    // host — the native one and its virtual display included (issue #53).
+    // 0 means no limit:
+    //
+    //   "max_allowed_frame_rate"         frames per second, e.g. 60.
+    //   "max_allowed_bitrate"            Mbps, e.g. 40.
+    //   "max_allowed_stream_resolution"  a box, "1920x1080". "1920" is a
+    //                                    1920x1920 box; a 0 side is free
+    //                                    ("0x1440" holds the height only);
+    //                                    "0" and "0x0" hold nothing.
+    //
+    // The server holds every launch to them (/start: the size keeps its shape,
+    // an automatic bitrate follows the frame rate and the pixels it lost), and
+    // so does the native session mid-stream (cadence steps, the bitrate that
+    // follows the frame). The browser reads them from GET
+    // /api/settings/streaming, so that Settings offers nothing above them.
+    // File-only — no UI writes them — seeded at 0 so they can be found, and
+    // set on the running instance by `moonlightweb --max-allowed-frame-rate`
+    // and its two siblings. Read at each stream start.
+    struct StreamLimits
+    {
+        int fps = 0;
+        int bitrateMbps = 0;
+        int width = 0;
+        int height = 0;
+        bool any() const { return fps > 0 || bitrateMbps > 0 || width > 0 || height > 0; }
+    };
+    StreamLimits streamLimits() const;
+    void setMaxAllowedFrameRate(int fps);
+    void setMaxAllowedBitrate(int mbps);
+    void setMaxAllowedStreamResolution(int width, int height);
+    /// "1920x1080", "1920" (a square box), "0x1440", "0", "0x0"; a JSON number
+    /// reads as "N". False, and both sides 0, for anything else.
+    static bool parseStreamResolution(const QString& text, int* width, int* height);
+    /// The written form: "1920x1080", "0x0".
+    static QString streamResolutionText(int width, int height);
+    /// A side, or a rate, as the file may hold it: 0 to kLimitMax.
+    static constexpr int kLimitMax = 16384;
+
+    /// A launch's size held to the resolution ceiling. The request as /start
+    /// reads it: `width` × `height` (height 0: the native display's own size),
+    /// a box to fit or not, "Match my screen" and its fallback box.
+    struct LimitedSize
+    {
+        int width = 0;
+        int height = 0;
+        bool fitBox = false;
+        int fallbackWidth = 0;
+        int fallbackHeight = 0;
+        bool changed = false;
+    };
+    /// - An explicit size keeps its shape: scaled down, both sides together,
+    ///   until it fits (a 2560x1440 asked under 1920x1080 is 1920x1080, a
+    ///   2560x1080 is 1920x810).
+    /// - A box (the native host fits its display's shape inside) is clipped
+    ///   side by side, except "Match my screen"'s, which is a size too.
+    /// - The native host keeps a height and takes its display's shape, so
+    ///   under a width ceiling its request becomes a box of that width; its
+    ///   "own size" (height 0) becomes the ceiling's box.
+    static LimitedSize limitStreamSize(const StreamLimits& limits, int width, int height,
+                                       bool fitBox, bool matchDisplay, bool nativeHost,
+                                       int fallbackWidth, int fallbackHeight);
+
     // ── HDR ───────────────────────────────────────────────────────────────────
     //
     // Whether HDR streaming is requested. Stored as JSON bool "hdr_enabled",
@@ -350,6 +425,19 @@ public:
     bool muteHostAudio() const;
     void setMuteHostAudio(bool enabled);
 
+    // ── Which sound the stream carries ───────────────────────────────────────
+    //
+    // "audio_source": "all" (default) streams everything the host plays, as an
+    // OS normally would. On the native Windows 11 host (per-process loopback),
+    // "focused" streams only the app in focus, a game, so Discord or a browser
+    // stay on the host's speakers and out of the stream, and "app:discord.exe"
+    // streams one app picked by its executable. Anything else reads as "all".
+
+    QString audioSource() const;
+    void setAudioSource(const QString& source);
+    /// The value in its one form: "all", "focused" or "app:<lower-case exe>".
+    static QString canonicalAudioSource(const QString& source);
+
     // ── Streaming notifications (tray) ────────────────────────────────────────
     //
     // Whether the desktop gets a notification when someone starts — or stops —
@@ -364,6 +452,19 @@ public:
 
     bool streamNotifications() const;
     void setStreamNotifications(bool enabled);
+
+    // ── A session left by Remote Desktop (Windows) ──────────────────────────
+    //
+    // Stored as JSON bool "remote_desktop_return", default true, set from the
+    // admin page (Windows, the launcher service installed). Closing a Remote
+    // Desktop window leaves the user's session with no screen at all, and the
+    // native host with nothing to stream: on, its card offers "This PC's
+    // screen", and opening it has the launcher put the session back on this
+    // PC's screen, locked at once (RemoteDesktopReturn). Off, Windows' own
+    // behaviour stays: the session waits, screenless, until the user signs in
+    // on the PC. Read each time the card is listed or opened.
+    bool remoteDesktopReturn() const;
+    void setRemoteDesktopReturn(bool enabled);
 
     // ── Diagnostic modes (admin page → Advanced) ────────────────────────────
     //
@@ -456,12 +557,21 @@ public:
     void clearVirtualDisplay();
 
     // Stored as JSON bool "virtual_display_exclusive", DEFAULT false, set from
-    // the admin page (Windows, the virtual display installed): every other
-    // display goes off while a stream runs on ours, and comes back on at its
-    // end (issue #39, VirtualDisplay::Request::exclusive). Read as each
-    // activation starts.
+    // the admin page (Windows, the virtual display installed): the admin
+    // ALLOWS streams to turn every other display off while they run on ours;
+    // each viewer then chooses it in the browser's streaming settings (issue
+    // #39, VirtualDisplay::ownerWantsOthersOff). Read as each activation
+    // starts.
     bool virtualDisplayExclusive() const;
+    // Also writes "virtual_display_exclusive_inherited" false: once the admin
+    // has changed the box, a browser that never chose starts unticked.
     void setVirtualDisplayExclusive(bool enabled);
+
+    // What a browser that never chose gets. Stored as JSON bool
+    // "virtual_display_exclusive_inherited"; absent, it is the admin's box
+    // itself: a PC updated with the box ticked (when the box alone decided)
+    // keeps its other displays going off until each viewer chooses.
+    bool virtualDisplayExclusiveInherited() const;
 
     // Stored as JSON string "virtual_display_gpu", DEFAULT "" (the driver's
     // own choice), set from the virtual display's card on a PC with several
@@ -908,6 +1018,14 @@ public:
     /// Open or close the internet side of the remote admin door.
     void setRemoteAdminInternet(bool enabled);
 
+    /// Whether a device may also ask to pair by its QR code from outside the
+    /// LAN (routes/PairRequestRoutes.cpp). Default: false. Either way only the
+    /// administrator lets it in, with the code it shows.
+    bool pairRequestInternet() const;
+
+    /// Take or stop taking QR code pairing requests from outside the LAN.
+    void setPairRequestInternet(bool enabled);
+
     // ── Rendezvous identity (0.3.0+) ────────────────────────────────────────
     //
     // How the instance is reached from the internet:
@@ -958,21 +1076,22 @@ public:
     /// predates versioning (DNS-mechanism wording), 2+ otherwise.
     int internetConsentVersion() const;
 
-    // ── Host key (host-machine recognition over the public domain) ──────────
+    // ── Host key ────────────────────────────────────────────────────────────
     //
-    // Long random token embedded in the host machine's own entry-point URLs
-    // (Desktop shortcut, tray, startup open) as ?mwk=..., so a browser opened
-    // on the host via the public domain can prove it runs on the host and be
-    // granted a localhost-equivalent session. Single-use: each successful
-    // redemption rotates the key (and the entry points are rewritten), so a
-    // leaked URL cannot be replayed.
+    // The key a link of this machine carries is made per link and kept in
+    // memory (server/HostKeyVault.h). An earlier version kept one here, as
+    // `local_key`.
 
-    /// Persistent random key; generated on first call.
-    QString localKey();
+    /// Removes the key an earlier version stored, if the file still holds one.
+    /// Nothing reads it any more. True when one was removed; the file is left
+    /// alone when it could not be read whole.
+    bool forgetLocalKey();
 
-    /// Replace the host key with a fresh random one (after a redemption).
-    /// Returns the new key.
-    QString rotateLocalKey();
+    /// When this installation first ran a version that binds a host session
+    /// to its browser's key as the session is made (unix seconds). Written
+    /// once, on the first call that reads the settings whole; 0 until then.
+    /// AuthManager::adoptLineKey reads which sessions are older than it.
+    qint64 hostSessionRepairBefore();
 
     // ── MW-BIND-v1 host identity key ────────────────────────────────────────
     //
@@ -1001,7 +1120,12 @@ public:
     /// Read the entire settings JSON object.
     QJsonObject readAll() const;
 
-    /// Write back a full JSON object.
+    /// The same, saying whether the file's content was read: false when the
+    /// file is there but could not be read. Such a read is never written back.
+    QJsonObject readAll(bool* complete) const;
+
+    /// Write back a full JSON object. Refused when this thread's last read
+    /// was not complete.
     void writeAll(const QJsonObject& obj);
 
     /// Full path to settings.json.

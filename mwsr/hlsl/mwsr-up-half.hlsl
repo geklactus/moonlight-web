@@ -1,4 +1,4 @@
-// MWSR — MoonlightWeb Super Resolution: the upscale's edge path in min16float, HLSL.
+// MWSR — MoonlightWeb Super Resolution: the upscale's colour arithmetic in min16float, HLSL.
 // Copyright (c) 2026 Bruno Martin <brunoocto@gmail.com>
 // SPDX-License-Identifier: MIT
 //
@@ -49,15 +49,21 @@ VSOut MwsrVS(uint vid : SV_VertexID) {
 cbuffer MwsrConstants : register(MWSR_CB_REGISTER) {
     float2 texel;
     float2 scale;
-    float tau;
-    float sharp;
-    float gaze;
-    float pad;
+    float2 dims;
+    float2 across;
+    float kc;
+    float ft;
+    float kg;
+    float kwc;
     float2 zc;
     float2 zr;
     float zring;
-    float ztau;
-    float zsharp;
+    float zft;
+    float zkg;
+    float gaze;
+    float kl;
+    float zref;
+    float pad1;
     float pad2;
 };
 
@@ -67,66 +73,22 @@ SamplerState samp : register(MWSR_SAMPLER_REGISTER);
 float3 S(float2 uv) {
     return tex.SampleLevel(samp, uv, 0.0).rgb;
 }
-float3 L(int2 c) {
-    return tex.Load(int3(c, 0)).rgb;
-}
 
 typedef min16float hf;
 typedef min16float3 h3;
-static const hf EPS_H = 0.001;
 
 #ifndef MWSR_SHOW
 #define MWSR_SHOW 0u
 #endif
 static const uint SHOW = MWSR_SHOW;
-#ifndef MWSR_W_ALONG
-#define MWSR_W_ALONG 0.15
-#endif
-static const float W_ALONG = MWSR_W_ALONG;
-#ifndef MWSR_W_ACROSS
-#define MWSR_W_ACROSS 0.3
-#endif
-static const float W_ACROSS = MWSR_W_ACROSS;
-#ifndef MWSR_R_ALONG
-#define MWSR_R_ALONG 0.5
-#endif
-static const float R_ALONG = MWSR_R_ALONG;
-#ifndef MWSR_R_ACROSS
-#define MWSR_R_ACROSS 1.0
-#endif
-static const float R_ACROSS = MWSR_R_ACROSS;
-#ifndef MWSR_S_FULL
-#define MWSR_S_FULL 1.5
-#endif
-static const float S_FULL = MWSR_S_FULL;
-#ifndef MWSR_W_MIN
-#define MWSR_W_MIN -0.5
-#endif
-static const float W_MIN = MWSR_W_MIN;
-#ifndef MWSR_DERING
-#define MWSR_DERING 2u
-#endif
-static const uint DERING = MWSR_DERING;
 #ifndef MWSR_CHROMA444
 #define MWSR_CHROMA444 0u
 #endif
 static const uint CHROMA444 = MWSR_CHROMA444;
-#ifndef MWSR_FLAT_TAPS
-#define MWSR_FLAT_TAPS 5u
-#endif
-static const uint FLAT_TAPS = MWSR_FLAT_TAPS;
-#ifndef MWSR_FLAT_C
-#define MWSR_FLAT_C 0.5
-#endif
-static const float FLAT_C = MWSR_FLAT_C;
 #ifndef MWSR_GAZE
 #define MWSR_GAZE 0u
 #endif
 static const uint GAZE = MWSR_GAZE;
-#ifndef MWSR_FLAT_ZONE
-#define MWSR_FLAT_ZONE 0u
-#endif
-static const uint FLAT_ZONE = MWSR_FLAT_ZONE;
 #ifndef MWSR_R_DOWN
 #define MWSR_R_DOWN 1.0
 #endif
@@ -138,31 +100,6 @@ static const uint LINEAR_LIGHT = MWSR_LINEAR_LIGHT;
 
 static const float3 LUMA = float3(0.25, 0.625, 0.125);
 
-float luma(float3 c) {
-    return dot(c, LUMA);
-}
-
-hf lumah(h3 c) {
-    return dot(c, (h3)LUMA);
-}
-
-h3 blend(h3 C, h3 T1, h3 T2, h3 X1, h3 X2, h3 wT, h3 wX) {
-    h3 R = (C + wT * (T1 + T2) + wX * (X1 + X2)) / (1.0 + 2.0 * (wT + wX));
-    if (DERING == 2u) {
-        return R;
-    }
-    h3 lo = min(min(C, T1), min(T2, min(X1, X2)));
-    h3 hi = max(max(C, T1), max(T2, max(X1, X2)));
-    return clamp(R, lo, hi);
-}
-
-hf coherence(hf c, hf t1, hf t2, hf x1, hf x2) {
-    hf jump = abs(x2 - x1);
-    hf ridge = abs(x1 + x2 - 2.0 * c);
-    hf variation = abs(x2 - c) + abs(c - x1) + abs(t2 - c) + abs(c - t1) + EPS_H;
-    return max(jump, ridge) / variation;
-}
-
 // The gaze zone's weight, the WGSL text's gazeWeight line for line.
 float gazeWeight(float2 uv) {
     if (GAZE != 1u) {
@@ -172,142 +109,70 @@ float gazeWeight(float2 uv) {
     return (1.0 - smoothstep(1.0, 1.0 + zring, d)) * gaze;
 }
 
-// The flat path's picture, the WGSL text's flatPath line for line.
-float3 flatPath(float2 uv, float3 C, float zg) {
-    if (FLAT_TAPS != 3u && FLAT_TAPS != 5u && FLAT_TAPS != 9u) {
-        return C;
-    }
-    if (GAZE == 1u && FLAT_ZONE == 1u && zg <= 0.0) {
-        return C;
-    }
-    float2 sp = uv / texel;
-    float3 R;
-    if (FLAT_TAPS == 3u) {
-        float2 tn = floor(sp) + 0.5;
-        float2 h = sp - tn;
-        float2 s = float2(h.x >= 0.0 ? 1.0 : -1.0, h.y >= 0.0 ? 1.0 : -1.0);
-        float2 ah = abs(h);
-        float2 wf = ah * ah - 0.5 * ah;
-        float2 wm = 1.0 - wf;
-        float2 wn = ah * ah + 0.5 * ah;
-        float2 pm = (tn + s * wn / wm) * texel;
-        float2 pf = (tn - s) * texel;
-        float3 sm = S(pm);
-        float3 sfx = S(float2(pf.x, pm.y));
-        float3 sfy = S(float2(pm.x, pf.y));
-        float3 acc = sm * (wm.x * wm.y) + sfx * (wf.x * wm.y) + sfy * (wm.x * wf.y);
-        float norm = wm.x * wm.y + wf.x * wm.y + wm.x * wf.y;
-        float3 lo = min(sm, min(sfx, sfy));
-        float3 hi = max(sm, max(sfx, sfy));
-        R = clamp(acc / norm, lo, hi);
-    } else {
-        float2 tc = floor(sp - 0.5) + 0.5;
-        float2 f = sp - tc;
-        float c = FLAT_C;
-        float2 w0 = -c * f * (1.0 - f) * (1.0 - f);
-        float2 w1 = (2.0 - c) * f * f * f - (3.0 - c) * f * f + 1.0;
-        float2 w3 = -c * (1.0 - f) * f * f;
-        float2 w2 = 1.0 - w0 - w1 - w3;
-        float2 w12 = w1 + w2;
-        float2 p0 = (tc - 1.0) * texel;
-        float2 p12 = (tc + w2 / w12) * texel;
-        float2 p3 = (tc + 2.0) * texel;
-        float3 s12 = S(p12);
-        float3 s02 = S(float2(p0.x, p12.y));
-        float3 s32 = S(float2(p3.x, p12.y));
-        float3 s20 = S(float2(p12.x, p0.y));
-        float3 s23 = S(float2(p12.x, p3.y));
-        float3 acc = s12 * (w12.x * w12.y) + s02 * (w0.x * w12.y) + s32 * (w3.x * w12.y)
-            + s20 * (w12.x * w0.y) + s23 * (w12.x * w3.y);
-        float norm = w12.x * w12.y + w0.x * w12.y + w3.x * w12.y + w12.x * w0.y + w12.x * w3.y;
-        float3 lo = min(min(s12, s02), min(s32, min(s20, s23)));
-        float3 hi = max(max(s12, s02), max(s32, max(s20, s23)));
-        if (FLAT_TAPS == 9u) {
-            float3 s00 = S(p0);
-            float3 s30 = S(float2(p3.x, p0.y));
-            float3 s03 = S(float2(p0.x, p3.y));
-            float3 s33 = S(p3);
-            acc += s00 * (w0.x * w0.y) + s30 * (w3.x * w0.y) + s03 * (w0.x * w3.y) + s33 * (w3.x * w3.y);
-            norm += w0.x * w0.y + w3.x * w0.y + w0.x * w3.y + w3.x * w3.y;
-            lo = min(lo, min(min(s00, s30), min(s03, s33)));
-            hi = max(hi, max(max(s00, s30), max(s03, s33)));
-        }
-        R = clamp(acc / norm, lo, hi);
-    }
-    if (GAZE == 1u && FLAT_ZONE == 1u) {
-        return lerp(C, R, zg);
-    }
-    return R;
-}
-
-// The exact bound, the WGSL text's texelBound line for line.
-float3 texelBound(float2 uv, float3 R) {
-    uint w, h;
-    tex.GetDimensions(w, h);
-    int2 dims = int2(w, h);
-    float2 pt = uv * float2(dims) - 0.5;
-    int2 i0 = clamp(int2(floor(pt)), int2(0, 0), dims - 1);
-    int2 i1 = min(i0 + 1, dims - 1);
-    float3 q00 = L(i0);
-    float3 q10 = L(int2(i1.x, i0.y));
-    float3 q01 = L(int2(i0.x, i1.y));
-    float3 q11 = L(i1);
-    return clamp(R, min(min(q00, q10), min(q01, q11)), max(max(q00, q10), max(q01, q11)));
-}
-
 float4 MwsrPS(VSOut i) : SV_Target {
     float2 uv = i.uv;
-    float3 C = S(uv);
-    float lC = luma(C);
+    float2 sp = uv * dims;
+    float2 f0 = floor(sp - 0.5);
+    float2 t = sp - 0.5 - f0;
+    float2 s = 1.0 - t;
+    float2 ku = kc * t * s;
+    float2 w12 = 1.0 + ku;
+    float2 p12 = (f0 + 0.5 + (t * t * (3.0 - 2.0 * t) + ku * s) / w12) * texel;
+    float3 rM = S(p12);
     float zg = gazeWeight(uv);
-    float t = lerp(tau, ztau, zg);
-    float3 dx = ddx_coarse(C) * scale.x;
-    float3 dy = ddy_coarse(C) * scale.y;
-    float3 m = abs(dx) + abs(dy);
-    bool rg = m.g > m.r;
-    bool b = m.b > max(m.r, m.g);
-    bool c444 = CHROMA444 == 1u;
-    float gx = c444 ? (b ? dx.b : (rg ? dx.g : dx.r)) : dot(dx, LUMA);
-    float gy = c444 ? (b ? dy.b : (rg ? dy.g : dy.r)) : dot(dy, LUMA);
-    bool isFlat = (c444 ? max(m.r, max(m.g, m.b)) : abs(gx) + abs(gy)) < t;
+    float vote = ft;
+    if (GAZE == 1u) {
+        vote = lerp(ft, zft, zg);
+    }
+    float2 gM;
+    bool isFlat;
+    if (CHROMA444 == 1u) {
+        float3 dx = ddx_coarse(rM) * scale.x;
+        float3 dy = ddy_coarse(rM) * scale.y;
+        float3 m = abs(dx) + abs(dy);
+        bool rg = m.g > m.r;
+        bool b = m.b > max(m.r, m.g);
+        gM = float2(b ? dx.b : (rg ? dx.g : dx.r), b ? dy.b : (rg ? dy.g : dy.r));
+        isFlat = max(m.r, max(m.g, m.b)) < vote;
+    } else {
+        float lM = dot(rM, LUMA);
+        gM = float2(ddx_coarse(lM), ddy_coarse(lM)) * scale;
+        isFlat = abs(gM.x) + abs(gM.y) < vote;
+    }
     if (SHOW == 1u) {
         return float4((isFlat ? 0.0 : 1.0).xxx, 1.0);
     }
     if (SHOW == 2u) {
         return float4(zg.xxx, 1.0);
     }
-    float smin = min(scale.x, scale.y);
-    float strength = clamp((smin - 1.0) / (S_FULL - 1.0), 0.0, 1.0);
     if (isFlat) {
-        return float4(flatPath(uv, C, zg), 1.0);
+        return float4(rM, 1.0);
     }
-    float2 n = float2(gx, gy) * rsqrt(max(gx * gx + gy * gy, 1e-12));
-    float2 dt = float2(-n.y, n.x) * texel * R_ALONG;
-    float2 dn = n * texel * R_ACROSS;
-    h3 Ch = (h3)C;
-    h3 T1 = (h3)S(uv - dt);
-    h3 T2 = (h3)S(uv + dt);
-    h3 X1 = (h3)S(uv - dn);
-    h3 X2 = (h3)S(uv + dn);
-    hf lCh = (hf)lC;
-    hf lT1 = lumah(T1);
-    hf lT2 = lumah(T2);
-    hf lX1 = lumah(X1);
-    hf lX2 = lumah(X2);
-    h3 a;
-    if (CHROMA444 == 1u) {
-        a = h3(coherence(Ch.r, T1.r, T2.r, X1.r, X2.r),
-               coherence(Ch.g, T1.g, T2.g, X1.g, X2.g),
-               coherence(Ch.b, T1.b, T2.b, X1.b, X2.b)) * (hf)strength;
-    } else {
-        a = (coherence(lCh, lT1, lT2, lX1, lX2) * (hf)strength).xxx;
+    float2 p0 = (f0 - 0.5) * texel;
+    float2 p3 = (f0 + 2.5) * texel;
+    float3 rT = S(float2(p12.x, p0.y));
+    float3 rL = S(float2(p0.x, p12.y));
+    float3 rR = S(float2(p3.x, p12.y));
+    float3 rB = S(float2(p12.x, p3.y));
+    float2 dn = gM * rsqrt(dot(gM, gM)) * across;
+    float3 ra = S(uv - dn);
+    float3 rb = S(uv + dn);
+    float sharp = kg;
+    if (GAZE == 1u) {
+        sharp = lerp(kg, zkg, zg);
     }
-    h3 wT = (hf)W_ALONG * a;
-    float sh = lerp(sharp, zsharp, zg);
-    h3 wX = max(-(hf)W_ACROSS * (hf)sh * a, ((hf)W_MIN).xxx);
-    float3 R = (float3)blend(Ch, T1, T2, X1, X2, wT, wX);
-    if (DERING != 0u) {
-        R = texelBound(uv, R);
-    }
-    return float4(R, 1.0);
+    h3 hM = (h3)rM;
+    h3 hA = (h3)ra;
+    h3 hB = (h3)rb;
+    hf hux = (hf)ku.x;
+    hf huy = (hf)ku.y;
+    hf h12x = (hf)w12.x;
+    hf h12y = (hf)w12.y;
+    h3 K = (h12x * (h12y * hM - huy * ((hf)s.y * (h3)rT + (hf)t.y * (h3)rB)) - h12y * hux * ((hf)s.x * (h3)rL + (hf)t.x * (h3)rR)) / ((hf)1.0 - hux * huy);
+    h3 D = K - (hf)0.5 * (hA + hB);
+    h3 R = K + (hf)sharp * D + (hf)kwc * (D - (h3)dot(D, (h3)LUMA));
+    h3 mn = min(hM, min(hA, hB));
+    h3 mx = max(hM, max(hA, hB));
+    h3 mg = (mx - mn) * (hf)kl;
+    return float4((float3)clamp(R, max(mn - mg, (h3)(hf)0.0), mx + mg), 1.0);
 }

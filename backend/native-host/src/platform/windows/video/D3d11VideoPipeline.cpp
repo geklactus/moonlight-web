@@ -86,7 +86,7 @@ bool D3d11VideoPipeline::buildConverter(const capture::IWindowsCapture& capture,
                            capture.height(), build.outputWidth, build.outputHeight,
                            build.yuv444 ? convert::ColorConvert::Chroma::C444
                                         : convert::ColorConvert::Chroma::C420,
-                           build.hdr, build.filter, error))
+                           build.hdr, build.filter, error, capture.turn()))
         return false;
 
     // MWSR's statistics, when the client reads the zones: never a reason to
@@ -118,7 +118,12 @@ bool D3d11VideoPipeline::buildEncoder(const capture::IWindowsCapture& capture,
     case EncoderApi::Nvenc: m_Encoder = std::make_unique<encode::NvencEncoder>(); break;
     case EncoderApi::Amf: m_Encoder = std::make_unique<encode::AmfEncoder>(); break;
     case EncoderApi::Vpl: m_Encoder = std::make_unique<encode::VplEncoder>(); break;
-    case EncoderApi::MediaFoundation: m_Encoder = std::make_unique<encode::MfEncoder>(); break;
+    case EncoderApi::MediaFoundation: {
+        auto mf = std::make_unique<encode::MfEncoder>();
+        mf->setHardwareOnly(build.hardwareOnly);
+        m_Encoder = std::move(mf);
+        break;
+    }
     case EncoderApi::Software: m_Encoder = std::make_unique<encode::SoftwareEncoder>(); break;
     default:
         error = std::string("no encoder implementation for ") + toString(build.encoder) + " yet";
@@ -221,8 +226,11 @@ bool D3d11VideoPipeline::prepareBlank(const capture::IWindowsCapture* capture, s
 {
     m_Blank.Reset();
     ID3D11Device* device = pipelineDevice(capture);
-    const int width = capture ? capture->width() : 0;
-    const int height = capture ? capture->height() : 0;
+    // The size of the capture's textures, which the converter reads it as: a
+    // quarter turn swaps them (IWindowsCapture::turn).
+    const bool swap = capture && (capture->turn() & 1) != 0;
+    const int width = capture ? (swap ? capture->height() : capture->width()) : 0;
+    const int height = capture ? (swap ? capture->width() : capture->height()) : 0;
     if (!device || width <= 0 || height <= 0) {
         error = "the capture has no device to make it on";
         return false;

@@ -17,11 +17,13 @@
 
 #pragma once
 
+#include "AudioSource.h"
 #include "Capabilities.h"
 #include "EncoderTuning.h"
 #include "VideoPipeline.h"
 
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -93,6 +95,14 @@ struct SessionConfig
     /// needs to know what else the client would accept.
     std::vector<Codec> clientCodecs;
 
+    /// The viewer left the codec to the host ("Auto"): its list is an offer,
+    /// not a wish. Read where a backend learns late that the codec picked has
+    /// no hardware behind it — Media Foundation on Windows, whose hardware
+    /// HEVC may refuse to start beside a hardware H.264 that works (issue
+    /// #54): then H.264 on the hardware rather than HEVC in software. A
+    /// codec chosen by hand stays the codec, at whatever cost.
+    bool codecAuto = false;
+
     /// Ask for HDR. Honoured only when the display is actually in an HDR mode
     /// AND the chosen encoder does 10-bit; otherwise the session runs SDR and
     /// says so in SessionInfo, rather than failing.
@@ -140,8 +150,8 @@ struct SessionConfig
     int governorFloorPercent = 20;
 
     /// Where the pictures come from — see VideoSource. With External, only
-    /// `displayId`, `allowElevatedInput` and `muteHostAudio` are read, plus
-    /// the rectangle below; the video fields are the feed's business.
+    /// `displayId`, `allowElevatedInput`, `muteHostAudio` and `audioSource` are
+    /// read, plus the rectangle below; the video fields are the feed's business.
     VideoSource videoSource = VideoSource::Capture;
 
     /// With External: where the display sits on the host's desktop, which is
@@ -217,6 +227,23 @@ struct SessionConfig
     /// where the tap sits), and SessionInfo::hostMuted says what happened.
     /// False leaves the speakers alone.
     bool muteHostAudio = false;
+
+    /// Which sound the stream carries (AudioSource.h). Anything but AllApps is
+    /// Windows with per-process loopback only: the caller checks the build, and
+    /// other platforms stream the whole mix. The speakers are not concerned.
+    AudioSourceChoice audioSource;
+
+    /// The app that sound comes from, each time it changes, empty when none.
+    /// Called on the capture's own thread. May be empty.
+    std::function<void(const std::string&)> onAudioAppChanged;
+
+    /// The player number Windows gave the virtual pad for a client's
+    /// controller (XInput's user index, 0 for player 1), once known and each
+    /// time it changes. A pad left plugged in by another program (a Sunshine
+    /// session kept open) takes player 1 first, and a game listening to
+    /// player 1 then never hears the client's. Windows only; called on a ViGEm
+    /// thread or the input thread. May be empty.
+    std::function<void(uint8_t controllerNumber, int hostNumber)> onPadNumber;
 
     /// A consent the user gave the ScreenCast portal on an earlier session, to
     /// be replayed so it is not asked for again.

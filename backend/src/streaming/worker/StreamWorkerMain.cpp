@@ -18,6 +18,7 @@
 #include "StreamWorkerMain.h"
 
 #include "../Session.h"
+#include "../../common/LoopbackKey.h"
 #include "../InputMessageCodec.h"
 #include "../../server/AppSettings.h"
 #include "mw/native/FeedArbiter.h"
@@ -548,13 +549,32 @@ int runStreamWorker(QCoreApplication& app)
         PacketMarking::setHandover(std::move(marking));
     }
 
+    // Sign-in screen mode (--signin-screen, which only the launcher service
+    // writes): one stream of the console's sign-in screen, its pictures and
+    // the viewer's keyboard and mouse, nothing else. The engine holds the
+    // rest (platform/SignInScreen.h); what the config asks beyond that is
+    // refused here or never looked at below.
+    const bool signInOnly = mw::native::NativeHost::signInScreenOnly();
+    if (signInOnly && (cfg[QStringLiteral("role")].toString() == QLatin1String("feed") ||
+                       !cfg[QStringLiteral("feedPipe")].toString().isEmpty() ||
+                       cfg[QStringLiteral("backendType")].toString() != QLatin1String("native"))) {
+        qWarning() << "[StreamWorker] sign-in screen: refused a config that is not one native "
+                      "stream of its own";
+        emitEvent({{QStringLiteral("event"), QStringLiteral("response")},
+                   {QStringLiteral("code"), 403},
+                   {QStringLiteral("body"),
+                    QJsonObject{{QStringLiteral("error"),
+                                 QStringLiteral("the sign-in screen streams on its own")}}}});
+        return 1;
+    }
+
     // The guests' shared feed: an engine and a pipe, nothing a browser meets.
     if (cfg[QStringLiteral("role")].toString() == QLatin1String("feed")) return runFeedWorker(cfg);
 
     // The wheels the server kept from the last stream, first of all: until
     // this process answers for them, the game's force feedback requests wait.
     // The server learns at once, and lets go of its copies.
-    if (cfg.contains(QStringLiteral("hidParked"))) {
+    if (cfg.contains(QStringLiteral("hidParked")) && !signInOnly) {
         const int taken = HidParkingTransfer::adoptFromServer(
             cfg[QStringLiteral("hidParked")].toObject(), ConsoleSession::workerServerPid());
         emitEvent({{QStringLiteral("event"), QStringLiteral("hidAdopted")},
@@ -629,6 +649,9 @@ int runStreamWorker(QCoreApplication& app)
     };
 
     // ── Build the session exactly like main.cpp's createSession ─────────────
+    // On stdin with the rest of the configuration, like the MW-BIND material.
+    mw::loopback::setKey(cfg["loopbackKey"].toString().toLatin1());
+
     auto* session = new StreamSession(
         host, cfg["appId"].toInt(), http, std::move(respond),
         static_cast<quint16>(cfg["signalingPort"].toInt(48001)), cfg["serverHost"].toString(),
@@ -649,6 +672,23 @@ int runStreamWorker(QCoreApplication& app)
     session->setDebugIceDropUdp(cfg["debugIceDropUdp"].toBool(false));
     session->setLowAudio(cfg["lowAudio"].toBool());
     session->setMuteHostAudio(cfg["muteHostAudio"].toBool(true));
+    // Absent (an older parent) → the whole mix, as before.
+    session->setAudioSource(cfg["audioSource"].toString());
+    // The app followed, for Settings ("Automatic — huntgame.exe"): told to the
+    // parent, which alone serves the page and may run in another session. Only
+    // the owner's worker reports: a guest's would overwrite and clear it.
+    if (cfg["audioReportApp"].toBool(false)) {
+        session->setAudioAppObserver([&app](const std::string& exe) {
+            const QString name = QString::fromStdString(exe);
+            QMetaObject::invokeMethod(
+                &app,
+                [name]() {
+                    emitEvent({{QStringLiteral("event"), QStringLiteral("audioFocus")},
+                               {QStringLiteral("app"), name}});
+                },
+                Qt::QueuedConnection);
+        });
+    }
     // Absent (an older parent, a guest) → no microphone.
     session->setMicRequested(cfg["mic"].toBool(false));
     session->setMicDevice(cfg["micDevice"].toString());
@@ -700,8 +740,12 @@ int runStreamWorker(QCoreApplication& app)
     // Absent (an older parent, or a rate the viewer named) → no ceiling, and
     // the cadence keeps every freedom it had.
     session->setMaxFps(cfg["fpsCeiling"].toInt(0));
+    // The administrator's ceilings. Absent (an older parent) → none.
+    session->setStreamLimits(cfg["fpsLimit"].toInt(0), cfg["bitrateLimitKbps"].toInt(0));
     // Absent (an older parent) → the frame keeps its size, today's behaviour.
     session->setFollowDisplayShape(cfg["followDisplayShape"].toBool(false));
+    // Absent (an older parent) → the codec named is the codec kept.
+    session->setCodecAuto(cfg["codecAuto"].toBool(false));
     // Absent (an older parent) → the height is kept, today's behaviour.
     session->setFrameFit(cfg["fitRequestedBox"].toBool(false), cfg["allowUpscale"].toBool(false),
                          cfg["matchClientDisplay"].toBool(false), cfg["fallbackWidth"].toInt(0),
@@ -745,6 +789,21 @@ int runStreamWorker(QCoreApplication& app)
         if (cfg["viewerAdmin"].toBool(false))
             qInfo() << "[StreamWorker] administrator windows open to this invited player"
                        " (share_guests_admin_windows)";
+    }
+    // The sign-in screen: keyboard and mouse at most, whatever the config
+    // says — no pad, no HID device, and with them no clipboard and no
+    // microphone (both are an unrestricted session's alone, Session.cpp).
+    if (signInOnly) {
+        InputMsg::Policy policy;
+        policy.gamepad = false;
+        policy.hid = false;
+        policy.keyboardMouse =
+            !cfg.contains(QStringLiteral("inputPolicy")) ||
+            cfg["inputPolicy"].toObject()[QStringLiteral("keyboardMouse")].toBool(false);
+        session->setInputPolicy(policy);
+        session->setMicRequested(false);
+        qInfo() << "[StreamWorker] sign-in screen: keyboardMouse=" << policy.keyboardMouse
+                << ", no gamepad, no HID, no clipboard, no microphone, no audio";
     }
     // What the media path revealed about the host's OS. Only the parent keeps a
     // host list, so this is the only way the observation outlives the stream —
@@ -849,6 +908,11 @@ int runStreamWorker(QCoreApplication& app)
                 QMetaObject::invokeMethod(qApp, []() { teardownAndExit(2); }, Qt::QueuedConnection);
             } else if (cmd == QLatin1String("sessionEnded")) {
                 QMetaObject::invokeMethod(qApp, []() { teardownAndExit(3); }, Qt::QueuedConnection);
+            } else if (cmd == QLatin1String("setPolicy") &&
+                       mw::native::NativeHost::signInScreenOnly()) {
+                // The sign-in screen's policy is fixed at the start, and can
+                // only be what it is.
+                qWarning() << "[StreamWorker] sign-in screen: a policy change refused";
             } else if (cmd == QLatin1String("setPolicy")) {
                 // The owner moved this player's inputs while they were playing.
                 // Not a teardown: the stream carries on under the new rules.

@@ -65,6 +65,11 @@ public:
         /// From the desktop, through the LocalSystem launcher service: SYSTEM
         /// on the console desktop, so the secure desktop does too (level 2).
         ServiceAsSystem,
+        /// From the desktop Remote Desktop left, through the launcher service:
+        /// SYSTEM on the console's sign-in screen, in sign-in screen mode
+        /// (WorkerService::requestSignInWorker). Only for a config that asks
+        /// for it (signInScreen), and nothing below it is ever tried.
+        SignInScreen,
     };
 
     /// Spawn the worker and hand it the session config. Returns false when the
@@ -110,6 +115,11 @@ public:
     /// supervisor that starts it.
     void setStreamId(const QString& id) { m_StreamId = id; }
     const QString& streamId() const { return m_StreamId; }
+
+    /// The app whose sound a running stream carries under "Stream audio from"
+    /// ("huntgame.exe"), as its worker last reported it (an
+    /// `audioFocus` event); empty when no worker reports one. For Settings.
+    static QString audioFocusApp();
 
 signals:
     /// The worker's /start HTTP reply (exactly once — synthesized 502 when the
@@ -180,4 +190,7 @@ private:
     /// put back if it dies holding them (a `mouseKeys` event; Windows only).
     bool m_MouseKeysHeld = false;
     QJsonObject m_MouseKeysSaved;
+    /// This worker reported the app in front (audioFocusApp): cleared when it
+    /// exits, so a finished stream never shows a stale name.
+    bool m_ReportedAudioFocus = false;
 };
