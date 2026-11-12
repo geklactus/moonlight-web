@@ -8,7 +8,8 @@
 // constants overridable at pipeline creation, the GLSL ES 3.00 twins (WebGL2,
 // OpenGL ES) with the product's defaults baked in, the HLSL twins (Direct3D
 // 11 and 12) with their constants as defines, the C++ header of the CPU side
-// (cpp/mwsr.h), and a copy of the module itself. cpp/example_d3d11.cpp is
+// (cpp/mwsr.h), the libplacebo / mpv user shader (Vulkan) with the law worked
+// out in it, the Metal text, and a copy of the module itself. cpp/example_d3d11.cpp is
 // written by hand. frontend/test/mwsrDist.test.js fails when a file here lags
 // behind.
 //
@@ -20,13 +21,13 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import {
+    MWSR_CONSTANTS,
+    MWSR_DOWN_LAW,
     MWSR_DOWN_TAPS,
     MWSR_DOWN_TAPS_SRGB,
+    MWSR_LAW,
     MWSR_OVERRIDES,
     MWSR_OVERRIDE_SPEC,
-    MWSR_SHARP_REF_SCALE,
-    MWSR_SHARP_X2,
-    MWSR_UNIFORMS,
     MWSR_ZONE,
     mwsrGlsl,
     mwsrHlsl,
@@ -89,7 +90,7 @@ const cppNumber = (v) => (Number.isInteger(v) ? String(v) + '.0' : String(v));
 
 /**
  * cpp/mwsr.h: the CPU side of a native renderer, the twin of the module's
- * mwsrRegime(), mwsrSharpness() and mwsrUniforms(), its tables written from
+ * mwsrRegime(), mwsrLaw(), mwsrDownLaw() and mwsrUniforms(), its tables written from
  * the module's own so that the defaults cannot drift apart.
  * @returns {string}
  */
@@ -100,19 +101,29 @@ function cppHeader() {
         .map(([k, [t, v]]) => `    {"${k}", ${t === 'u32' ? 'true' : 'false'}, ${cppNumber(v)}},`)
         .join('\n');
     const z = MWSR_ZONE;
+    const lawTable = (t) =>
+        Object.entries(t)
+            .map(([k, c]) => `    {${c.map(cppNumber).join(', ')}},  // ${k}`)
+            .join('\n');
+    const { force } = MWSR_LAW;
+    const dl = MWSR_DOWN_LAW;
+    const pair = ([a, b]) => `{${cppNumber(a)}, ${cppNumber(b)}}`;
     return `${header('the CPU side for a native renderer (C++17, header only)', 'generate.mjs or the tables of that module')}
 //
 // What it gives a Direct3D 11 or 12 renderer (or any other), with no
 // dependency: the mode a frame of inW x inH drawn at outW x outH takes and its
-// shader file (regime, shaderFile), the 64 bytes of the constant buffer at
-// register b0 (constants), and the defines to compile the shader with
-// (defines), each the twin of the JavaScript module's function of that name.
+// shader file (regime, shaderFile), the kernel's values for those sizes (law),
+// the 96 bytes of the constant buffer at register b0 (constants), and the
+// defines to compile the shader with (defines), each the twin of the JavaScript
+// module's function of that name.
 // example_d3d11.cpp shows them at work.
 
 #pragma once
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -123,7 +134,7 @@ enum class Mode { Copy, Up, Down };
 
 struct Regime {
     Mode mode = Mode::Copy;
-    int taps = 0;              // Up: 5 (the flat path's); Down: the grid's samples, 1, 4, 9 or 16
+    int taps = 0;              // Down: the grid's samples, 1, 4, 9 or 16
     double rDown = 0.0;        // Down: MWSR_R_DOWN
     unsigned linearLight = 0;  // Down: MWSR_LINEAR_LIGHT
 };
@@ -132,36 +143,48 @@ struct Regime {
 struct Constants {
     float texel[2];        // 1 / inW, 1 / inH
     float scale[2];        // outW / inW, outH / inH
-    float tau;             // the vote's threshold, luma per input texel
-    float sharp;           // the sharpness (x W_ACROSS)
-    float gaze;            // the gaze zone's weight, 0 without one
-    float pad0;
+    float dims[2];         // inW, inH
+    float across[2];       // the distance of the across taps, as a share of the input
+    float kc;              // the cubic's sharpness
+    float ft;              // the vote's threshold, luma per input texel
+    float kg;              // the sharpness along the across reads: 0 at 1:1, whole from kFullScale on
+    float kwc;             // the colour's sharpness, the same way
     float zoneCentre[2];   // the gaze zone, read only with MWSR_GAZE 1
     float zoneHalfAxes[2];
     float zoneRing;
-    float zoneTau;
-    float zoneSharp;
+    float zoneFt;
+    float zoneKg;
+    float gaze;            // its weight, 0 without one
+    float kl;              // the bound's margin, as a share of the three reads' range
+    float zoneRef;         // what the native host's zones count their drops against, read by no shader here
     float pad1;
+    float pad2;
 };
-static_assert(sizeof(Constants) == 64, "the constant buffer is 16 floats");
+static_assert(sizeof(Constants) == 96, "the constant buffer is 24 floats");
 
 // The gaze zone: its centre and half-axes as fractions of the picture, the
-// ring's width as a fraction of the half-axes, its threshold and sharpness.
+// ring's width as a fraction of the half-axes, its threshold and its sharpness
+// as a multiple of the law's.
 struct Zone {
     double cx = ${cppNumber(z.cx)}, cy = ${cppNumber(z.cy)};
     double rx = ${cppNumber(z.rx)}, ry = ${cppNumber(z.ry)};
     double ring = ${cppNumber(z.ring)};
-    double tau = ${cppNumber(z.tau)}, sharp = ${cppNumber(z.sharp)};
+    double ft = ${cppNumber(z.ft)}, boost = ${cppNumber(z.boost)};
 };
 
-// The per-frame defaults, the scale whose across weight the sharpness law holds,
-// and the sharpness from x2 up with the scale its ramp starts from.
-constexpr double kTau = ${cppNumber(MWSR_UNIFORMS.tau)};
-constexpr double kSharp = ${cppNumber(MWSR_UNIFORMS.sharp)};
-constexpr double kSharpRefScale = ${cppNumber(MWSR_SHARP_REF_SCALE)};
-constexpr double kSharpX2 = ${cppNumber(MWSR_SHARP_X2.sharp)};
-constexpr double kSharpX2From = ${cppNumber(MWSR_SHARP_X2.from)};
-constexpr double kSFull = ${cppNumber(MWSR_OVERRIDES.S_FULL)};  // MWSR_S_FULL's default
+// The law's coefficients (mwsrLaw()), value = c0 + c1 x + c2 x^2, x = ln(scale),
+// in the order of kc, kg, kr, kl; the scales it holds at their ends; the force
+// of the sharpness on kg and kl, 1 at kForceFrom, kForceTop from kForceTo, a
+// straight line in x between them.
+constexpr double kLaw[4][3] = {
+${lawTable(MWSR_LAW.curves)}
+};
+constexpr double kLawScaleMin = ${cppNumber(MWSR_LAW.scale[0])}, kLawScaleMax = ${cppNumber(MWSR_LAW.scale[1])};
+constexpr double kForceFrom = ${cppNumber(force.from)}, kForceTo = ${cppNumber(force.to)}, kForceTop = ${cppNumber(force.top)};
+constexpr double kLawFt = ${cppNumber(MWSR_LAW.ft)}, kLawKwc = ${cppNumber(MWSR_LAW.kwc)};
+
+// The scale from which the kernel's sharpening is whole.
+constexpr double kFullScale = ${cppNumber(MWSR_CONSTANTS.S_FULL)};
 
 // The reduction's grids, by the smallest scale they serve: {minimum scale, samples, R_DOWN}.
 struct Grid {
@@ -198,7 +221,7 @@ inline Regime regime(int inW, int inH, int outW, int outH, bool srgbViews = fals
         return {Mode::Copy, 0, 0.0, 0};
     const double s = std::min(double(outW) / inW, double(outH) / inH);
     if (s >= 1.0)
-        return {Mode::Up, 5, 0.0, 0};
+        return {Mode::Up, 0, 0.0, 0};
     const Grid* table = srgbViews || linearFeed ? kDownGridsSrgb : kDownGrids;
     const unsigned light = srgbViews ? 0u : linearFeed ? 3u : 1u;
     for (int i = 0; i < 3; ++i)
@@ -215,32 +238,62 @@ inline std::string shaderFile(const Regime& r, bool half = false)
     return half ? "mwsr-up-half.hlsl" : "mwsr-up.hlsl";
 }
 
-// The sharpness law (mwsrSharpness()): sharp up to the reference scale, then
-// held so that the across weight stays the one of that scale; from x2From a
-// ramp to x2 at x2, held above (never above sharp).
-inline double sharpness(double scale, double sharp = kSharp, double ref = kSharpRefScale, double x2 = kSharpX2,
-                        double x2From = kSharpX2From)
+// The kernel's values for an input of inW x inH drawn at outW x outH (mwsrLaw()):
+// each a curve over the scale, the smaller axis.
+struct Law {
+    double kc, ft, kg, kr, kwc, kl;
+};
+
+inline Law law(int inW, int inH, int outW, int outH)
 {
-    auto strength = [](double s) { return std::min(std::max((s - 1.0) / (kSFull - 1.0), 0.0), 1.0); };
-    const double at = strength(scale);
-    if (at <= 0.0)
-        return sharp;
-    const double held = sharp * std::min(1.0, strength(ref) / at);
-    const double t = std::min(std::max((scale - x2From) / (2.0 - x2From), 0.0), 1.0);
-    return std::min(sharp, held + t * (x2 - held));
+    auto hold = [](double v, double lo, double hi) { return std::min(std::max(v, lo), hi); };
+    const double s = hold(std::min(double(outW) / inW, double(outH) / inH), kLawScaleMin, kLawScaleMax);
+    const double x = std::log(s);
+    auto value = [&](int i) { return kLaw[i][0] + x * (kLaw[i][1] + x * kLaw[i][2]); };
+    const double force = 1.0 + (kForceTop - 1.0) * hold(std::log(s / kForceFrom) / std::log(kForceTo / kForceFrom), 0.0, 1.0);
+    return {value(0), kLawFt, value(1) * force, value(2), kLawKwc, value(3) * force};
+}
+
+// A reduction's sharpening (mwsrDownLaw()): each pair at x0.5, then at x2/3 and
+// above, a straight line in the scale between them; below x0.5 none, and both
+// gains fall to none between kDownFade and 1:1.
+constexpr double kDownScale[2] = ${pair(dl.scale)};
+constexpr double kDownGain[2] = ${pair(dl.gain)};
+constexpr double kDownEdgeGain[2] = ${pair(dl.edgeGain)};
+constexpr double kDownMargin[2] = ${pair(dl.margin)};
+constexpr double kDownEdgeMargin[2] = ${pair(dl.edgeMargin)};
+constexpr double kDownFade = ${cppNumber(dl.fade)}, kDownFt = ${cppNumber(dl.ft)};
+
+// Its values, under the names of the constant buffer's places that hold them:
+// kg the gain, kwc the gain at a strong edge, kl the margin, zref the margin
+// at a strong edge.
+struct DownLaw {
+    double ft, kg, kwc, kl, zref;
+};
+
+inline DownLaw downLaw(int inW, int inH, int outW, int outH)
+{
+    const double s = std::min(double(outW) / inW, double(outH) / inH);
+    if (s < kDownScale[0])
+        return {kDownFt, 0.0, 0.0, 0.0, 0.0};
+    const double t = std::min((s - kDownScale[0]) / (kDownScale[1] - kDownScale[0]), 1.0);
+    auto at = [&](const double (&p)[2]) { return p[0] + (p[1] - p[0]) * t; };
+    const double f = std::min(std::max((1.0 - s) / (1.0 - kDownFade), 0.0), 1.0);
+    return {kDownFt, at(kDownGain) * f, at(kDownEdgeGain) * f, at(kDownMargin), at(kDownEdgeMargin)};
 }
 
 struct Options {
-    double tau = kTau;
-    double sharp = -1.0;  // below 0: the sharpness law at this scale
-    double gaze = 0.0;    // 0 to 1, read only with MWSR_GAZE 1
+    // a value named here replaces the law's
+    std::optional<double> kc, ft, kg, kr, kwc, kl, sfull;
+    double gaze = 0.0;  // 0 to 1, read only with MWSR_GAZE 1
     Zone zone;
+    bool hdr = false;  // the feed holds values past 1.0: the bound takes no margin, a reduction does not sharpen
 };
 
 // The constant buffer for an input of inW x inH drawn at outW x outH (mwsrUniforms()).
 inline Constants constants(int inW, int inH, int outW, int outH, const Options& o = {})
 {
-    const double sharp = o.sharp >= 0.0 ? o.sharp : sharpness(std::min(double(outW) / inW, double(outH) / inH));
+    const Law l = law(inW, inH, outW, outH);
     // a ring of no width would put the smoothstep's two edges together
     const double ring = std::max(o.zone.ring, 1e-3);
     Constants c{};
@@ -248,16 +301,33 @@ inline Constants constants(int inW, int inH, int outW, int outH, const Options& 
     c.texel[1] = float(1.0 / inH);
     c.scale[0] = float(double(outW) / inW);
     c.scale[1] = float(double(outH) / inH);
-    c.tau = float(o.tau);
-    c.sharp = float(sharp);
-    c.gaze = float(std::min(std::max(o.gaze, 0.0), 1.0));
+    c.dims[0] = float(inW);
+    c.dims[1] = float(inH);
+    const double kr = o.kr.value_or(l.kr);
+    c.across[0] = float(kr / inW);
+    c.across[1] = float(kr / inH);
+    // the sharpening's strength: none at 1:1 (the renderer copies the frame there), whole from kFullScale on
+    const double smin = std::min(double(outW) / inW, double(outH) / inH);
+    const double strength = std::min(std::max((smin - 1.0) / (o.sfull.value_or(kFullScale) - 1.0), 0.0), 1.0);
+    // a reduction's own values, in the same places: its text reads them under these names
+    const bool down = smin < 1.0;
+    const DownLaw d = down ? downLaw(inW, inH, outW, outH) : DownLaw{};
+    const double kg = down ? o.kg.value_or(o.hdr ? 0.0 : d.kg) : o.kg.value_or(l.kg) * strength;
+    c.kc = float(o.kc.value_or(l.kc));
+    // the edge's direction divides by the slope's length: a vote of 0 would let a slope of 0 through
+    c.ft = float(std::max(o.ft.value_or(down ? d.ft : l.ft), 1e-6));
+    c.kg = float(kg);
+    c.kwc = float(down ? o.kwc.value_or(o.hdr ? 0.0 : d.kwc) : o.kwc.value_or(l.kwc) * strength);
     c.zoneCentre[0] = float(o.zone.cx);
     c.zoneCentre[1] = float(o.zone.cy);
     c.zoneHalfAxes[0] = float(o.zone.rx);
     c.zoneHalfAxes[1] = float(o.zone.ry);
     c.zoneRing = float(ring);
-    c.zoneTau = float(o.zone.tau);
-    c.zoneSharp = float(o.zone.sharp);
+    c.zoneFt = float(std::max(o.zone.ft, 1e-6));
+    c.zoneKg = float(kg * o.zone.boost);
+    c.gaze = float(std::min(std::max(o.gaze, 0.0), 1.0));
+    c.kl = float(o.kl.value_or(down ? d.kl : o.hdr ? 0.0 : l.kl));
+    c.zoneRef = down ? float(d.zref) : 1.0f;
     return c;
 }
 
@@ -276,8 +346,7 @@ inline std::string number(double v)
 
 // The defines of a regime's shader: a reduction's span and light, or, for the
 // upscale, the constants given (by name, without the prefix) over the
-// defaults, such as {{"FLAT_TAPS", "3"}} on a phone or {{"CHROMA444", "1"}}
-// on a 4:4:4 stream.
+// defaults, such as {{"CHROMA444", "1"}} on a 4:4:4 stream.
 inline std::vector<Define> defines(const Regime& r, const std::vector<Define>& up = {})
 {
     std::vector<Define> d;
@@ -292,6 +361,251 @@ inline std::vector<Define> defines(const Regime& r, const std::vector<Define>& u
 }
 
 }  // namespace mwsr
+`;
+}
+
+// A JavaScript number as a GLSL or MSL float literal.
+const glNumber = (v) => (Number.isInteger(v) ? v.toFixed(1) : String(v));
+
+/**
+ * libplacebo/mwsr-up.hook: the upscale as a libplacebo / mpv user shader, one
+ * pass that needs nothing from its renderer: its per-draw values are the
+ * module's law, written here from MWSR_LAW, as cpp/mwsr.h's constants() works
+ * them out (the twin of mwsrUniforms() for an upscale).
+ * @returns {string}
+ */
+function hookText() {
+    const { curves, force, scale, ft, kwc } = MWSR_LAW;
+    const curve = ([c0, c1, c2]) => `${glNumber(c0)} + x * (${glNumber(c1)} + x * ${glNumber(c2)})`;
+    const luma = MWSR_CONSTANTS.LUMA.map(glNumber).join(', ');
+    return `${header('the upscale, a libplacebo / mpv user shader', 'generate.mjs or the tables of that module')}
+//
+// The kernel of hlsl/mwsr-up.hlsl line for line, one pass on the RGB picture
+// (MAIN) when both axes grow, drawn at the output's size: libplacebo's own
+// scalers then have nothing left to do. Its per-draw values are worked out here
+// from the input's and the output's sizes, as cpp/mwsr.h's constants() does.
+// In a libplacebo renderer: pl_mpv_user_shader_parse(), then the parameters
+// below. In mpv: --vo=gpu-next --glsl-shaders=mwsr-up.hook, with
+// --glsl-shader-opts=MWSR_HDR=1 on PQ content.
+
+//!PARAM MWSR_HDR
+//!DESC 1 when the input holds PQ code values (HDR): the bound then takes no margin
+//!TYPE DEFINE
+//!MINIMUM 0
+//!MAXIMUM 1
+0
+
+//!PARAM MWSR_CHROMA444
+//!DESC 1 for a 4:4:4 stream: the borders between two colours of one luma are sharpened too
+//!TYPE DEFINE
+//!MINIMUM 0
+//!MAXIMUM 1
+0
+
+//!HOOK MAIN
+//!BIND HOOKED
+//!DESC MWSR (MoonlightWeb Super Resolution)
+//!WIDTH OUTPUT.w
+//!HEIGHT OUTPUT.h
+//!WHEN OUTPUT.w HOOKED.w > OUTPUT.h HOOKED.h > *
+
+// The coarse derivatives of the other texts, where the GLSL version has them.
+#if __VERSION__ >= 450
+#define MWSR_DX dFdxCoarse
+#define MWSR_DY dFdyCoarse
+#else
+#define MWSR_DX dFdx
+#define MWSR_DY dFdy
+#endif
+
+const vec3 MWSR_LUMA = vec3(${luma});
+
+vec3 mwsrS(vec2 uv) {
+    return (HOOKED_mul * textureLod(HOOKED_raw, uv, 0.0)).rgb;
+}
+
+vec4 hook() {
+    // constants() for this input drawn at this output: the law's curves over the scale's logarithm,
+    // held at x${scale[0]} and x${scale[1]}, the sharpness forced from x${glNumber(force.from)} to x${force.to}, whole from x${MWSR_CONSTANTS.S_FULL} on
+    vec2 texel = HOOKED_pt;
+    vec2 dims = HOOKED_size;
+    vec2 scale = target_size / input_size;
+    float smin = min(scale.x, scale.y);
+    float sl = clamp(smin, ${glNumber(scale[0])}, ${glNumber(scale[1])});
+    float x = log(sl);
+    float force = 1.0 + (${glNumber(force.top)} - 1.0) * clamp(log(sl / ${glNumber(force.from)}) / log(${glNumber(force.to)} / ${glNumber(force.from)}), 0.0, 1.0);
+    float strength = clamp((smin - 1.0) / (${glNumber(MWSR_CONSTANTS.S_FULL)} - 1.0), 0.0, 1.0);
+    float kc = ${curve(curves.kc)};
+    float kg = (${curve(curves.kg)}) * force * strength;
+    float kr = ${curve(curves.kr)};
+#if MWSR_HDR
+    float kl = 0.0;
+#else
+    float kl = (${curve(curves.kl)}) * force;
+#endif
+    float ft = ${glNumber(ft)};
+    float kwc = ${glNumber(kwc)} * strength;
+    vec2 across = kr * texel;
+
+    vec2 uv = HOOKED_pos;
+    vec2 sp = uv * dims;
+    vec2 f0 = floor(sp - 0.5);
+    vec2 t = sp - 0.5 - f0;
+    vec2 s = 1.0 - t;
+    vec2 ku = kc * t * s;
+    vec2 w12 = 1.0 + ku;
+    vec2 p12 = (f0 + 0.5 + (t * t * (3.0 - 2.0 * t) + ku * s) / w12) * texel;
+    vec3 rM = mwsrS(p12);
+    // the slope per input texel along the texture's own axes, whichever way the target's rows run
+    vec2 dir = sign(vec2(dFdx(uv.x), dFdy(uv.y))) * scale;
+    vec2 gM;
+    bool isFlat;
+#if MWSR_CHROMA444
+    vec3 dx = MWSR_DX(rM) * dir.x;
+    vec3 dy = MWSR_DY(rM) * dir.y;
+    vec3 m = abs(dx) + abs(dy);
+    bool rg = m.g > m.r;
+    bool b = m.b > max(m.r, m.g);
+    gM = vec2(b ? dx.b : (rg ? dx.g : dx.r), b ? dy.b : (rg ? dy.g : dy.r));
+    isFlat = max(m.r, max(m.g, m.b)) < ft;
+#else
+    float lM = dot(rM, MWSR_LUMA);
+    gM = vec2(MWSR_DX(lM), MWSR_DY(lM)) * dir;
+    isFlat = abs(gM.x) + abs(gM.y) < ft;
+#endif
+    if (isFlat) {
+        return vec4(rM, 1.0);
+    }
+    vec2 p0 = (f0 - 0.5) * texel;
+    vec2 p3 = (f0 + 2.5) * texel;
+    vec3 rT = mwsrS(vec2(p12.x, p0.y));
+    vec3 rL = mwsrS(vec2(p0.x, p12.y));
+    vec3 rR = mwsrS(vec2(p3.x, p12.y));
+    vec3 rB = mwsrS(vec2(p12.x, p3.y));
+    vec2 dn = gM * inversesqrt(dot(gM, gM)) * across;
+    vec3 ra = mwsrS(uv - dn);
+    vec3 rb = mwsrS(uv + dn);
+    vec3 K = (w12.x * (w12.y * rM - ku.y * (s.y * rT + t.y * rB)) - w12.y * ku.x * (s.x * rL + t.x * rR)) / (1.0 - ku.x * ku.y);
+    vec3 D = K - 0.5 * (ra + rb);
+    vec3 R = K + kg * D + kwc * (D - vec3(dot(D, MWSR_LUMA)));
+    vec3 mn = min(rM, min(ra, rb));
+    vec3 mx = max(rM, max(ra, rb));
+    vec3 mg = (mx - mn) * kl;
+    return vec4(clamp(R, max(mn - mg, vec3(0.0)), mx + mg), 1.0);
+}
+`;
+}
+
+/**
+ * metal/mwsr-up.metal: the upscale in Metal Shading Language, its constants the
+ * 24 floats of cpp/mwsr.h's constants() at buffer(1).
+ * @returns {string}
+ */
+function mslText() {
+    const luma = MWSR_CONSTANTS.LUMA.map(glNumber).join(', ');
+    return `${header('the upscale, Metal Shading Language', 'generate.mjs or the tables of that module')}
+//
+// The kernel of hlsl/mwsr-up.hlsl line for line. The fragment function mwsr_up
+// reads the picture at texture(0) through a bilinear clamped sampler and its
+// constants, cpp/mwsr.h's constants(), at buffer(1). Its vertex stage hands it a
+// float4 position and a float2 texCoords, v down from the picture's top. Build
+// it with the preprocessor macro MWSR_CHROMA444 1 for a 4:4:4 stream.
+#include <metal_stdlib>
+using namespace metal;
+
+#ifndef MWSR_CHROMA444
+#define MWSR_CHROMA444 0
+#endif
+
+// What the vertex stage hands the fragment stage
+struct Vertex
+{
+    float4 position [[ position ]];
+    float2 texCoords;
+};
+
+// mwsr::Constants, 24 floats
+struct MwsrConstants
+{
+    float2 texel;
+    float2 scale;
+    float2 dims;
+    float2 across;
+    float kc;
+    float ft;
+    float kg;
+    float kwc;
+    float2 zc;
+    float2 zr;
+    float zring;
+    float zft;
+    float zkg;
+    float gaze;
+    float kl;
+    float zref;
+    float pad1;
+    float pad2;
+};
+
+constexpr sampler mwsrSampler(coord::normalized, address::clamp_to_edge, filter::linear);
+
+constant float3 MWSR_LUMA = float3(${luma});
+
+static float3 mwsrS(texture2d<float> tex, float2 uv)
+{
+    return tex.sample(mwsrSampler, uv, level(0.0)).rgb;
+}
+
+fragment float4 mwsr_up(Vertex v [[ stage_in ]],
+                        constant MwsrConstants &c [[ buffer(1) ]],
+                        texture2d<float> tex [[ texture(0) ]])
+{
+    float2 uv = v.texCoords;
+    float2 sp = uv * c.dims;
+    float2 f0 = floor(sp - 0.5);
+    float2 t = sp - 0.5 - f0;
+    float2 s = 1.0 - t;
+    float2 ku = c.kc * t * s;
+    float2 w12 = 1.0 + ku;
+    float2 p12 = (f0 + 0.5 + (t * t * (3.0 - 2.0 * t) + ku * s) / w12) * c.texel;
+    float3 rM = mwsrS(tex, p12);
+    // the slope per input texel along the texture's own axes, whichever way the target's rows run
+    float2 dir = sign(float2(dfdx(uv.x), dfdy(uv.y))) * c.scale;
+    float2 gM;
+    bool isFlat;
+#if MWSR_CHROMA444
+    float3 dx = dfdx(rM) * dir.x;
+    float3 dy = dfdy(rM) * dir.y;
+    float3 m = abs(dx) + abs(dy);
+    bool rg = m.g > m.r;
+    bool b = m.b > max(m.r, m.g);
+    gM = float2(b ? dx.b : (rg ? dx.g : dx.r), b ? dy.b : (rg ? dy.g : dy.r));
+    isFlat = max(m.r, max(m.g, m.b)) < c.ft;
+#else
+    float lM = dot(rM, MWSR_LUMA);
+    gM = float2(dfdx(lM), dfdy(lM)) * dir;
+    isFlat = abs(gM.x) + abs(gM.y) < c.ft;
+#endif
+    if (isFlat) {
+        return float4(rM, 1.0);
+    }
+    float2 p0 = (f0 - 0.5) * c.texel;
+    float2 p3 = (f0 + 2.5) * c.texel;
+    float3 rT = mwsrS(tex, float2(p12.x, p0.y));
+    float3 rL = mwsrS(tex, float2(p0.x, p12.y));
+    float3 rR = mwsrS(tex, float2(p3.x, p12.y));
+    float3 rB = mwsrS(tex, float2(p12.x, p3.y));
+    float2 dn = gM * rsqrt(dot(gM, gM)) * c.across;
+    float3 ra = mwsrS(tex, uv - dn);
+    float3 rb = mwsrS(tex, uv + dn);
+    float3 K = (w12.x * (w12.y * rM - ku.y * (s.y * rT + t.y * rB)) - w12.y * ku.x * (s.x * rL + t.x * rR)) / (1.0 - ku.x * ku.y);
+    float3 D = K - 0.5 * (ra + rb);
+    float3 R = K + c.kg * D + c.kwc * (D - float3(dot(D, MWSR_LUMA)));
+    float3 mn = min(rM, min(ra, rb));
+    float3 mx = max(rM, max(ra, rb));
+    float3 mg = (mx - mn) * c.kl;
+    return float4(clamp(R, max(mn - mg, float3(0.0)), mx + mg), 1.0);
+}
 `;
 }
 
@@ -311,7 +625,7 @@ export function mwsrDist() {
         'wgsl/mwsr-up.wgsl':
             header('the upscale (output larger than the input), WGSL') + '\n' + mwsrWgsl(),
         'wgsl/mwsr-up-f16.wgsl':
-            header("the upscale's edge path in f16 (needs 'shader-f16'), WGSL") +
+            header("the upscale's colour arithmetic in f16 (needs 'shader-f16'), WGSL") +
             '\n' +
             mwsrWgsl({ half: true }),
         'glsl/mwsr.vert': glsl(
@@ -322,8 +636,12 @@ export function mwsrDist() {
         'hlsl/mwsr-up.hlsl':
             header('the upscale, HLSL (Direct3D 11 with FXC, 12 with DXC)') + '\n' + mwsrHlsl(),
         'hlsl/mwsr-up-half.hlsl':
-            header("the upscale's edge path in min16float, HLSL") + '\n' + mwsrHlsl({ half: true }),
+            header("the upscale's colour arithmetic in min16float, HLSL") +
+            '\n' +
+            mwsrHlsl({ half: true }),
         'cpp/mwsr.h': cppHeader(),
+        'libplacebo/mwsr-up.hook': hookText(),
+        'metal/mwsr-up.metal': mslText(),
     };
     for (const taps of [1, 4, 9, 16]) {
         const k = Math.sqrt(taps);

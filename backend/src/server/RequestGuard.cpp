@@ -197,6 +197,34 @@ bool isTrustedHost(const QString& hostHeader, const QString& publicDomain)
     return !domain.isEmpty() && host == domain;
 }
 
+bool forwardedByProxy(const QMap<QString, QString>& headers)
+{
+    // One list for every caller: the ICE plan, the PIN proof and the access
+    // decision must agree on what a proxied request looks like.
+    static const char* const kProxyHeaders[] = {
+        "x-forwarded-for",
+        "x-forwarded-host",
+        "x-forwarded-proto",
+        "x-forwarded-server",
+        "forwarded",
+        "x-real-ip",
+        "via",
+        "cf-connecting-ip",
+        "cf-ray",
+        "cf-visitor",
+        "true-client-ip",
+        "x-client-ip",
+        "x-cluster-client-ip",
+        "fastly-client-ip",
+        "tailscale-funnel-request",
+        "x-original-url",
+        "x-arr-ssl",
+    };
+    for (const char* name : kProxyHeaders)
+        if (headers.contains(QLatin1String(name))) return true;
+    return false;
+}
+
 bool isBodyContentTypeAllowed(const QString& contentType, qsizetype bodySize)
 {
     if (bodySize <= 0) return true; // nothing to parse
@@ -262,6 +290,19 @@ Decision evaluate(const Request& req, const Context& ctx)
     }
     d.outcome = Outcome::Allow;
 
+    // The local channel is this machine by construction: a program of this
+    // install asked, through a door no address and no name opens. Nothing is
+    // read from Host here, and nothing from the peer; there is no admin key to
+    // show either, for a caller that is not a browser another page could drive.
+    // --noadmin still leaves nobody administering.
+    if (ctx.localChannel) {
+        d.hostTrusted = true;
+        d.localPrivilege = true;
+        d.hostMachine = true;
+        d.adminPrivilege = !ctx.adminLocked;
+        return d;
+    }
+
     // The Host must be a name we own. This is the one check a rebinding attack
     // cannot dodge: it makes the attacker's page same-origin with us (so the
     // cross-site test above passes, and the attacker can READ our responses),
@@ -275,7 +316,10 @@ Decision evaluate(const Request& req, const Context& ctx)
     // domain it could: a TLS-terminating tunnel runs here and forwards every
     // visitor from loopback, so the pair (local peer, our domain) describes the
     // whole internet just as well as it describes the host.
-    d.localPrivilege = ctx.peerLocal && isLocalHostName(hostHeader);
+    // Nor when a proxy forwarded the request: the local peer is then the proxy,
+    // and the caller is whoever reached it.
+    d.localPrivilege =
+        ctx.peerLocal && isLocalHostName(hostHeader) && !forwardedByProxy(req.headers);
 
     // Two ways to be the host machine: reach us from the machine itself, or
     // prove it with the host key over the public domain.
@@ -292,6 +336,38 @@ Decision evaluate(const Request& req, const Context& ctx)
         !ctx.adminLocked && (d.hostMachine || ctx.adminSession) && (!mutating || ctx.adminKeyOk);
 
     return d;
+}
+
+bool localChannelRoute(const QString& method, const QString& path)
+{
+    struct Route
+    {
+        const char* method;
+        const char* path;
+    };
+    // Exact paths, exact verbs: what main.cpp's command-line verbs, tray client
+    // and second launch call.
+    static const Route kRoutes[] = {
+        {"GET", "/api/health"},
+        {"GET", "/api/server/status"},
+        {"GET", "/api/server/remote-link"},
+        {"GET", "/api/server/stream-activity"},
+        {"GET", "/api/setup/status"},
+        {"GET", "/api/auth/status"},
+        {"GET", "/api/internet/status"},
+        {"GET", "/api/internet/upnp-probe"},
+        {"POST", "/api/internet/enable"},
+        {"GET", "/api/settings/streaming"},
+        {"POST", "/api/settings/streaming"},
+        {"POST", "/api/admin/pin/generate"},
+        {"POST", "/api/admin/password"},
+        {"POST", "/api/system/restart"},
+        {"POST", "/api/system/quit"},
+        {"POST", "/api/local/focus"},
+    };
+    for (const Route& route : kRoutes)
+        if (method == QLatin1String(route.method) && path == QLatin1String(route.path)) return true;
+    return false;
 }
 
 AdminTokenReply adminTokenReply(const Decision& decision, const Context& ctx, bool authenticated)
@@ -319,6 +395,12 @@ bool lockedByNoAdmin(const QString& method, const QString& path, bool shareAllow
         static const QStringList doors = {QStringLiteral("validate"),
                                           QStringLiteral("admin-unlock"),
                                           QStringLiteral("regenerate")};
+        // A device asking in by the QR code it shows, and the page's answer to
+        // it, are the PIN's door by another way (PhonePairing.h).
+        if (seg.size() >= 3 && seg[2] == QLatin1String("pair-request")) return true;
+        // The PIN proved without being sent (MW-PIN-v1) is the PIN login's other
+        // door: both of its rounds, and whatever comes under it later.
+        if (seg.size() >= 3 && seg[2] == QLatin1String("pin")) return true;
         return seg.size() == 3 && doors.contains(seg[2]);
     }
     if (area == QLatin1String("share")) {
@@ -342,6 +424,19 @@ bool tunnelKeyRefused(bool viaTunnel, const QByteArray& tunnelKey, const QByteAr
 {
     if (!viaTunnel && tunnelKey.isEmpty()) return false;
     return !boundKey.isEmpty() && boundKey != tunnelKey;
+}
+
+bool secretMatches(const QByteArray& given, const QByteArray& expected)
+{
+    if (expected.isEmpty()) return false;
+    const int n = qMax(given.size(), expected.size());
+    quint8 diff = given.size() == expected.size() ? 0 : 1;
+    for (int i = 0; i < n; ++i) {
+        const quint8 a = i < given.size() ? static_cast<quint8>(given[i]) : 0;
+        const quint8 b = i < expected.size() ? static_cast<quint8>(expected[i]) : 0;
+        diff |= static_cast<quint8>(a ^ b);
+    }
+    return diff == 0;
 }
 
 } // namespace RequestGuard

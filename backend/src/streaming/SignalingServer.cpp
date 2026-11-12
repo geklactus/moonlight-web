@@ -16,6 +16,7 @@
  */
 
 #include "SignalingServer.h"
+#include "common/LoopbackKey.h"
 #include "RelayBase.h"
 #include "DataChannelRelay.h"
 #include "MediaTrackRelay.h"
@@ -31,6 +32,7 @@ extern "C" {
 #include "common/Edition.h"
 #include "common/PairingCrypto.h"
 #include "network/RouterPortPools.h"
+#include "RelayStart.h"
 #include "server/NetClassify.h"
 
 #include <rtc/rtc.hpp>
@@ -50,17 +52,6 @@ extern "C" {
 #include <QMap>
 #include <memory>
 
-// Whether a UDP port can be bound right now. A pinned port libdatachannel
-// cannot bind leaves the session with no candidate at all, so the pin is only
-// taken when this succeeds.
-static bool udpPortFree(uint16_t port)
-{
-    QUdpSocket probe;
-    const bool ok = probe.bind(QHostAddress::AnyIPv4, port, QAbstractSocket::DontShareAddress);
-    probe.close();
-    return ok;
-}
-
 // The media block, as the packages' firewall rule and the log name it.
 static const QString kMediaBlock =
     QStringLiteral("%1-%2/udp")
@@ -76,10 +67,10 @@ static const QString kMediaBlock =
 // use. 0 when the whole block is held.
 static uint16_t freeMediaPort(uint16_t own)
 {
-    if (udpPortFree(own)) return own;
+    if (mw::relaystart::udpPortFree(own)) return own;
     for (int i = mw::routerports::kMediaPortCount - 1; i >= 0; --i) {
         const auto port = static_cast<uint16_t>(mw::routerports::kMediaBasePort + i);
-        if (port != own && udpPortFree(port)) return port;
+        if (port != own && mw::relaystart::udpPortFree(port)) return port;
     }
     return 0;
 }
@@ -316,19 +307,27 @@ void SignalingServer::onNewWsConnection()
 {
     qInfo() << "[SignalingServer] onNewWsConnection, existing client=" << (m_WsClient != nullptr);
 
-    if (m_WsClient) {
-        QWebSocket* rejected = m_WsServer->nextPendingConnection();
-        qWarning() << "[SignalingServer] Rejecting second client";
-        rejected->close(QWebSocketProtocol::CloseCodeNormal, "Single client only");
-        rejected->deleteLater();
-        return;
-    }
-
-    m_WsClient = m_WsServer->nextPendingConnection();
-    if (!m_WsClient) {
+    QWebSocket* incoming = m_WsServer->nextPendingConnection();
+    if (!incoming) {
         qWarning() << "[SignalingServer] nextPendingConnection returned null";
         return;
     }
+    // Before anything else: what is turned away here leaves the session as it was.
+    if (!mw::loopback::accepts(*incoming, mw::loopback::key())) {
+        qWarning()
+            << "[SignalingServer] Refusing a connection that did not come through the server";
+        incoming->close(QWebSocketProtocol::CloseCodePolicyViolated);
+        incoming->deleteLater();
+        return;
+    }
+    if (m_WsClient) {
+        qWarning() << "[SignalingServer] Rejecting second client";
+        incoming->close(QWebSocketProtocol::CloseCodeNormal, "Single client only");
+        incoming->deleteLater();
+        return;
+    }
+
+    m_WsClient = incoming;
     // Bounded: Qt takes a message of up to 2 GB by default, and buffers all of
     // it before anyone sees a byte. 16 MiB is far past anything this socket
     // legitimately carries.
@@ -393,7 +392,11 @@ void SignalingServer::onNewWsConnection()
     // Build ICE configuration: STUN + optionally UPnP-aware fixed port
     // m_ForceIceTcp controls whether ICE-TCP candidates are generated
     // (true = UDP + TCP, false = UDP only).
-    const bool mapped = !m_UpnpPublicIP.isEmpty() && m_UpnpExternalPort > 0;
+    const bool hasHole = !m_UpnpPublicIP.isEmpty() && m_UpnpExternalPort > 0;
+    const bool mapped = mw::relaystart::holeUsable(hasHole, m_MediaPort);
+    if (hasHole && !mapped)
+        qWarning() << "[SignalingServer] UDP media port" << m_MediaPort
+                   << "is taken — this stream does not use the router's hole";
     rtc::Configuration config =
         buildIceConfig(isInternet, mapped, m_MediaPort, lanOnly ? QString() : m_StunServerUrl,
                        m_ForceIceTcp, m_IceTcpPassive);
@@ -435,7 +438,18 @@ void SignalingServer::onNewWsConnection()
 
     // Prepare the PeerConnection + DataChannels
     // This will trigger signalingSdpReady with the SDP offer to send to browser
-    m_Relay->prepare(config, isInternet);
+    QString why;
+    if (!mw::relaystart::prepareCaught([&]() { m_Relay->prepare(config, isInternet); }, why)) {
+        // The port can still go between the check above and the bind. Ending the
+        // session lets the chain try the next transport, as an ICE timeout does.
+        qCritical().noquote() << "[SignalingServer] The connection could not start:" << why;
+        if (m_WsClient && m_WsClient->isValid()) {
+            m_WsClient->close(QWebSocketProtocol::CloseCodeBadOperation,
+                              QStringLiteral("connection could not start"));
+        }
+        emit sessionEnded();
+        return;
+    }
 
     qInfo() << "[SignalingServer] Client connected, waiting for SDP offer from libdatachannel";
     emit clientConnected();
@@ -589,6 +603,11 @@ void SignalingServer::onWsTextMessage(const QString& message)
         if (!m_AllowWsFallback) {
             qWarning() << "[SignalingServer] Auto mode: ignoring browser fallback-ws-request,"
                        << "letting auto chain decide next transport";
+            return;
+        }
+        // A paired browser has signed its answer by the time its ICE can fail.
+        if (!m_BrowserSpki.isEmpty() && !m_SignalingComplete) {
+            qWarning() << "[SignalingServer] Ignoring fallback-ws-request before a verified answer";
             return;
         }
         qWarning() << "[SignalingServer] Browser requested WS fallback (ICE disconnected/failed "

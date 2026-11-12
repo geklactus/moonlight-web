@@ -34,6 +34,8 @@ add_library(mw-native-host STATIC
     # The host's own mouse on a Windows host with no pointing device: its one
     # fixed descriptor and its reports. Pure, tested anywhere.
     src/input/SystemMouse.cpp
+    # Its own keyboard, on a Windows host with none: the same, and its rules.
+    src/input/SystemKeyboard.cpp
     src/input/HidPid.cpp
     # A wheel's force feedback as the game left it, replayed to the next page.
     src/input/HidFfbJournal.cpp
@@ -102,6 +104,7 @@ if(WIN32)
         src/encode/windows/d3d12/PyroWaveEncoder12.cpp
         src/encode/windows/d3d12/UltraEncoder12.cpp
         src/audio/windows/WasapiLoopback.cpp
+        src/audio/windows/AppAudioCapture.cpp
         src/audio/windows/HostMute.cpp
     )
 
@@ -144,7 +147,10 @@ if(WIN32)
     # dwmapi: the compositor's timing, read by the bench's click trace only.
     target_link_libraries(mw-native-host PRIVATE dxgi d3d11 d3d12 d3dcompiler user32 gdi32 setupapi
                                                  avrt ole32 oleaut32 runtimeobject mfuuid
-                                                 strmiids dwmapi wtsapi32 imm32)
+                                                 strmiids dwmapi wtsapi32 imm32
+                                                 # mmdevapi: ActivateAudioInterfaceAsync, the
+                                                 # focused-app loopback (AppAudioCapture).
+                                                 mmdevapi)
 elseif(APPLE)
     set(MW_NATIVE_PLATFORM "macos")
     # ScreenCaptureKit → VideoToolbox, with no conversion stage in between:
@@ -586,6 +592,7 @@ if(MW_BUILD_TESTS)
         tests/test_ds4_mapping.cpp
         tests/test_hid_descriptor.cpp
         tests/test_system_mouse.cpp
+        tests/test_system_keyboard.cpp
         tests/test_hid_passthrough.cpp
         tests/test_hid_pid.cpp
         tests/test_hid_evdev.cpp
@@ -623,10 +630,12 @@ if(MW_BUILD_TESTS)
         tests/test_intra_refresh_sweep.cpp
         tests/test_audio_pacer.cpp
         tests/test_audio_interleave.cpp
+        tests/test_audio_focus_target.cpp
         tests/test_cursor_blend.cpp
         tests/test_frame_fit.cpp
         tests/test_painted_pointer.cpp
         tests/test_output_match.cpp
+        tests/test_display_rotation.cpp
         tests/test_display_mode_hold.cpp
         tests/test_cursor_position_gate.cpp
         tests/test_pointer_presence.cpp

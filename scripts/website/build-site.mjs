@@ -235,7 +235,7 @@ const problems = [];
 
 const chromeEn = {};
 for (const page of PAGES) {
-  let html = fs.readFileSync(path.join(SITE, page.src), 'utf8');
+  let html = fs.readFileSync(path.join(SITE, page.src), 'utf8').replace(/\r\n/g, '\n');
   html = fillById(html, 'header', 'site-header', header('en', chromeEn, page));
   html = fillById(html, 'footer', 'site-footer', footer('en', chromeEn));
   html = stampAlternates(html, page);
@@ -275,7 +275,8 @@ for (const page of PAGES) {
 }
 
 /* sitemap.xml — each URL dated by the newest of its sources (the English page,
-   the header/footer above, its dictionary). An uncommitted source dates today. */
+   its dictionary): a change to this builder alone dates no page. An uncommitted
+   source dates today. */
 function lastChange(files) {
   const today = new Date().toISOString().slice(0, 10);
   let best = '';
@@ -288,20 +289,19 @@ function lastChange(files) {
   }
   return best || today;
 }
-const builder = fileURLToPath(import.meta.url);
 const urls = [];
 for (const page of PAGES) {
   const alts = [...LANGS.map((l) => [l.code, localUrl(l.code, page.url)]), ['x-default', page.url]]
     .map(([h, u]) => `    <xhtml:link rel="alternate" hreflang="${h}" href="${ORIGIN}${u}"/>`)
     .join('\n');
   for (const { code } of LANGS) {
-    const sources = [path.join(SITE, page.src), builder];
+    const sources = [path.join(SITE, page.src)];
     if (code !== 'en') sources.push(path.join(SITE, '_i18n', code, pageId(page) + '.json'), path.join(SITE, '_i18n', code, '_chrome.json'));
     urls.push(`  <url>\n    <loc>${ORIGIN}${localUrl(code, page.url)}</loc>\n    <lastmod>${lastChange(sources)}</lastmod>\n${alts}\n  </url>`);
   }
 }
 for (const page of ENGLISH_ONLY)
-  urls.push(`  <url>\n    <loc>${ORIGIN}${page.url}</loc>\n    <lastmod>${lastChange([path.join(SITE, page.src), builder])}</lastmod>\n  </url>`);
+  urls.push(`  <url>\n    <loc>${ORIGIN}${page.url}</loc>\n    <lastmod>${lastChange([path.join(SITE, page.src)])}</lastmod>\n  </url>`);
 outputs.set(
   path.join(SITE, 'sitemap.xml'),
   '<?xml version="1.0" encoding="UTF-8"?>\n' +
@@ -377,29 +377,6 @@ outputs.set(
   // MWSR itself (MIT) and NIS's filter banks, copied as they are.
   for (const f of ['MwsrShader.js', 'NisTables.js'])
     outputs.set(path.join(SITE, 'mwsr', f), read('frontend/js/stream/renderers/' + f));
-  // The native host's zone tree, for the page's MWSR zones (zones.js): the
-  // table of backend/native-host/src/convert/MwsrZoneTree.h, row for row.
-  const treeSrc = read('backend/native-host/src/convert/MwsrZoneTree.h');
-  const treeAt = treeSrc.indexOf('TreeNode kTree[');
-  if (treeAt < 0) throw new Error('kTree not found in MwsrZoneTree.h');
-  const treeLen = Number(treeSrc.slice(treeAt).match(/kTree\[(\d+)\]/)[1]);
-  const treeRows = [
-    ...treeSrc
-      .slice(treeAt, treeSrc.indexOf('};', treeAt))
-      .matchAll(/\{(-?\d+), ([-0-9.eE+]+), (-?\d+), (-?\d+), (-?\d+)\}/g),
-  ].map((m) => m.slice(1).map(Number));
-  if (treeRows.length !== treeLen) throw new Error(`kTree: ${treeRows.length} rows read of ${treeLen}`);
-  outputs.set(
-    path.join(SITE, 'mwsr', 'zonetree.js'),
-    '/*\n' +
-      ' * Written by scripts/website/build-site.mjs — do not edit by hand.\n' +
-      ' *\n' +
-      " * The native host's zone tree (backend/native-host/src/convert/MwsrZoneTree.h,\n" +
-      ' * GPL-3.0-or-later): [feature, threshold, left, right, code] per node, a leaf\n' +
-      ' * with feature -1. Walked by zones.js as MwsrZones.h walks it.\n' +
-      ' */\n' +
-      `export const ZONE_TREE = ${JSON.stringify(treeRows)};\n`,
-  );
 }
 
 /* ── Write or check ────────────────────────────────────────────────────── */

@@ -27,6 +27,7 @@
 #include <QString>
 #include <memory>
 
+class NvAddress;
 class NvPairingManager;
 
 /**
@@ -124,6 +125,7 @@ public:
     // of the transport so it can be exercised directly.
     void resolveCoopSessionId(const QByteArray& launchKey, BackendStringCallback cb) override;
     void endCoopSession(const QString& sessionId, BackendVoidCallback cb) override;
+    void stopCoopSession(const QString& sessionId, BackendVoidCallback cb) override;
 
 private:
     /// Resolve the PIN into Wolf once stage 1 is parked on it. Polls
@@ -141,6 +143,10 @@ private:
     /// Pair one identity: the default one when seatId is empty, otherwise the
     /// seat's own certificate. Idempotent.
     void pairIdentity(const QString& seatId, BackendVoidCallback cb);
+
+    /// The handshake itself, once it is settled that this address may be told
+    /// who is asking.
+    void startPairing(const QString& seatId, const NvAddress& addr, BackendVoidCallback cb);
 
     using PreparedLaunchCallback =
         std::function<void(bool ok, const BackendError& err, const LaunchRequest& req)>;

@@ -38,6 +38,13 @@ describe('the keyboard rows', () => {
         const next = rows.find((r) => r[0] === 'stream.scDesktopNext');
 
         expect(quit).toEqual(['stream.scQuit', 'Ctrl', 'Option', 'Cmd', 'Q']);
+        expect(rows.find((r) => r[0] === 'stream.scMic')).toEqual([
+            'stream.scMic',
+            'Ctrl',
+            'Option',
+            'Cmd',
+            'P',
+        ]);
         expect(prev).toEqual(['stream.scDesktopPrev', 'Ctrl', 'Option', 'Cmd', '←']);
         expect(next).toEqual(['stream.scDesktopNext', 'Ctrl', 'Option', 'Cmd', '→']);
     });
@@ -61,6 +68,15 @@ describe('the gesture rows', () => {
             expect(rows.map((r) => r[0])).toContain('stream.tcDesktop');
             // The 3-finger tap keeps its own row: the swipe did not replace it.
             expect(rows.map((r) => r[0])).toContain('stream.tcKeyboard');
+        }
+    });
+
+    it('names the on-screen controller only where four fingers bring it', () => {
+        for (const touchScreen of [false, true]) {
+            const row = (touchPad) =>
+                gestureRows(touchScreen, touchPad).find((r) => r[0] === 'stream.tcTouchPad');
+            expect(row(false)).toBeUndefined();
+            expect(row(true)[1]).toBe('stream.tcTouchPadVal');
         }
     });
 

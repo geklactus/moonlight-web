@@ -3037,3 +3037,321 @@ souhaiterai en profiter pour supprimer X2 pour la v0.4.1 ». A29, prévue pour l
 
 Aucun GPU réel n'a servi : le code retiré ne tournait pas aux valeurs par défaut, et les dorés le montrent au bit
 près. À l'œil de Bruno, comme avant, le ×2 (720p → 1440p) sur texte et sur jeu.
+
+## 2026-11-02 — J55, le réglage livré change : une loi mesurée en LPIPS, puis en VMAF NEG
+
+**La demande de Bruno (01/11).** Remplacer les défauts livrés par le meilleur réglage en LPIPS, puis en VMAF NEG, dans une
+tolérance de 5 % du gain LPIPS sur le livré, avec une loi par taille du stream et de l'écran, et non un point fixe. Le SSIM
+quitte le README et le comparateur. Le test à l'aveugle S/F/P est abandonné : Bruno juge à l'œil, sur le comparateur en ligne.
+
+**La mesure.**
+- 15 images de recherche (jeux récents, 0 A.D., interfaces, texte), chacune propre et passée par HEVC au débit d'un stream.
+  4 images de contrôle, jamais vues pendant les recherches. L'écran 2160 n'a que 4 images de recherche : il est moins sûr.
+- LPIPS AlexNet v0.1, sur la RTX pour la vitesse : même réseau qu'en processeur, écart de 3e-8 au plus sur 276 rendus.
+  VMAF NEG par `vmaf_v0.6.1neg`.
+- Recherches locales aux échelles ×1,15, ×1,333, ×1,5, ×2, ×2,5 et ×3 à l'écran 1440, et ×1,333 et ×2 aux écrans 1080 et 2160,
+  avec les zones de l'hôte natif et sans. Puis des grilles sur `racross`, `walong` et `sharp`, et la mesure de chaque loi candidate
+  dans le vrai shader, avec les échelles ×1,4 et ×2,25 tenues à part.
+
+**Ce que disent les mesures.**
+- `sharp` et `walong` s'échangent sur une crête : à ×2,5, `sharp` ≈ 1,25 + 2,5 `walong` tient le LPIPS. Une fois sur cette crête,
+  **`walong` 0 suffit partout**, sans zones comme avec, à condition de baisser `sharp` aux grandes échelles.
+- Le VMAF NEG du texte suit `racross` (à ×1,333 : 0,625 donne environ 57, 0,75 environ 59, 1,0 environ 64), mais le LPIPS moyen s'en
+  éloigne. À ×1,333, égaler le livré sur le texte coûte un tiers du gain LPIPS (`sharp` 0,875, `racross` 0,9375 : 67 % du gain,
+  62,45). À ×2, le compromis existe : 24,81 avec zones, 25,13 sans, contre 25,27.
+- La taille de l'écran ne donne pas d'effet qu'un terme linéaire puisse suivre : l'optimum de `sharp` reste à 1,125 à ×1,333 et ×2
+  sur les trois écrans, avec zones, et `racross` varie sans suivre l'écran. Les termes d'écran de l'essai précédent dégradaient
+  ces écrans (76 % du gain à ×1,333 sur 1080). Ils restent dans la forme, à zéro.
+
+**La loi.** `value = c0 + c1 x + c2 x² + c3 x³ + c4 x⁴ + c5 y + c6 x y`, x = ln(échelle) tenu dans ×1,15..×3, y = ln(h / 1440) tenu dans
+1080..2160. `sharp` et `racross` suivent x, deux tables (avec les zones et sans). `tau` 0,0025, `walong` 0, `ralong` 0, `fc` 0,5, et
+`wmin` constante, qui ne mord plus. Le x⁴ est là pour le creux de `racross` vers ×1,5 et la remontée à ×2, qu'un degré 3 ne suit pas
+(texte à ×2 : 20,89 au degré 3, 24,81 au degré 4). Les zones sont lues dès ×1,15, où elles gagnent encore.
+
+**Les chiffres**, écran 1440, images de recherche (LPIPS / VMAF NEG ; écart de VMAF NEG au livré ; part du gain LPIPS gardée) :
+
+| Échelle | Avec zones | Sans zones | Livré, zones | Livré, sans | FSR1 |
+|---|---|---|---|---|---|
+| ×1,15 | 0,02510 / 87,54 ; −0,06 ; 95 % | 0,02541 / 87,63 ; −0,16 ; 97 % | 0,03206 / 87,59 | 0,03145 / 87,79 | 0,02950 / 86,64 |
+| ×1,333 | 0,03937 / 83,87 ; +0,21 ; 95 % | 0,04083 / 84,20 ; +1,03 ; 96 % | 0,04808 / 83,65 | 0,05056 / 83,17 | 0,04590 / 84,52 |
+| ×1,4 (à part) | 0,04534 / 82,77 ; −0,10 | 0,04722 / 83,11 ; +0,73 | 0,05510 / 82,86 | 0,05716 / 82,37 | 0,05390 / 83,28 |
+| ×1,5 | 0,05227 / 81,19 ; −0,27 ; 100 % | 0,05464 / 81,74 ; +0,74 | 0,06464 / 81,47 | 0,06633 / 81,01 | 0,06200 / 81,68 |
+| ×2 | 0,10638 / 72,16 ; +0,67 ; 95 % | 0,11086 / 72,80 ; +2,42 ; 95 % | 0,12318 / 71,50 | 0,12993 / 70,38 | 0,12075 / 72,54 |
+| ×2,25 (à part) | 0,13256 / 67,97 ; +0,33 | 0,13951 / 68,13 ; +1,68 | 0,14371 / 67,63 | 0,15017 / 66,45 | 0,15026 / 67,86 |
+| ×2,5 | 0,15325 / 63,78 ; +0,20 ; 101 % | 0,16156 / 63,56 ; +1,15 | 0,16745 / 63,59 | 0,17309 / 62,41 | 0,18215 / 63,58 |
+| ×3 | 0,19283 / 56,30 ; +0,82 ; 96 % | 0,20221 / 54,80 ; +0,51 ; 94 % | 0,20853 / 55,47 | 0,21491 / 54,29 | 0,23548 / 55,13 |
+
+Le texte, en VMAF NEG (avec zones / sans ; livré ; FSR1) : ×1,15 72,27 / 70,92 ; 69,88 ; 64,86. ×1,333 57,52 / 58,87 ; 62,65 ; 57,31.
+×1,5 46,39 / 48,72 ; 53,21 ; 48,64. ×2 24,81 / 25,13 ; 25,27 ; 24,60. ×2,5 16,91 / 14,46 ; 13,42 ; 7,67. Son LPIPS bat le livré et FSR1
+à toutes ces échelles.
+
+**Hors de la règle, ou en perte.**
+- Avec zones, les écrans 1080 et 2160 gardent de 89 à 93 % du gain (1080 : ×1,333 91 %, ×2 90 % ; 2160 : ×1,333 93 %, ×2 89 %). Le
+  LPIPS y bat quand même le livré et FSR1. Sans zones à l'écran 1440, ×3 garde 94 %.
+- VMAF NEG moyen contre le livré, images de recherche : ×1,5 −0,27, ×1,4 −0,10 et ×1,15 −0,06 avec zones, ×1,15 −0,16 sans.
+- Images de contrôle : le LPIPS bat le livré et FSR1 partout. VMAF NEG contre le livré : ×1,15 −0,32 avec zones et −0,25 sans, ×2,5
+  −0,20 avec zones, partout ailleurs au moins à égalité. Contre FSR1, il reste le plus souvent derrière (89,75 contre 90,34 à
+  ×1,333, 81,24 contre 81,81 à ×2, sans zones).
+
+**Le coût.** Le seuil 0,0025 envoie 78 à 97 % d'une image de jeu sur le chemin de bord, contre 8 à 63 % au livré, et 39 à 47 % du
+texte, contre 26 à 35 %. Une première mesure sur la RTX, sur la version précédente de la loi au même seuil, donnait de −24 % à +35 %
+selon l'image, bruitée : la carte change d'horloge pendant la mesure (plancher bilinéaire à 0,032 ou 0,049 ms). Aucun téléphone n'a été
+mesuré. Les temps du README restent ceux du 28/10 jusqu'à l'optimisation, qui pourra retirer les lectures le long des bords :
+`walong` 0 et `ralong` 0 les rendent inutiles.
+
+**Un incident.** Une image de sortie a porté exactement un bit retourné (6,8 Mo, CRC du bloc faux, prouvé en la redessinant), et un
+autre PNG avait fait échouer ffmpeg la veille, relu sans erreur au deuxième essai. Aucune erreur matérielle ni disque au journal de
+Windows ; barrettes sans ECC, vitesse de base 5600, réglées à 6000. La mémoire vive est la piste principale, sans preuve. Une image
+corrompue fait échouer le calcul au lieu de fausser un score, et le balayage reprend depuis son cache.
+
+**Vérifié.**
+- dorés réécrits (`--golden`) puis relus (`--golden-check`) sur SwiftShader : OK ;
+- conformité des jumeaux WebGPU et WebGL2 (`--conformity`, les deux côtés) : OK, FLIP 0,000 sur le cas relevé ;
+- jumeau HLSL sur WARP contre WGSL sur SwiftShader, 5 cas : PSNR de 66 à 69 dB, moins de 0,001 % des pixels au-delà de 1/255, écart
+  maximal de 21/255 sur quelques pixels ;
+- `node mwsr/generate.mjs --check`, `node scripts/website/build-site.mjs --check`, 197 fichiers de tests et 2090 tests verts ;
+- `website/mwsr/lab-scores.json` : 75 cas (`cmp_lab.py`), figures du README par `mwsr_charts.py`, zooms redessinés sur la RTX.
+
+**Une relecture de ce changement** a trouvé un piège réel : avec `walong` 0, le mélange divise par 1 + 2 fois le poids en travers, et un `wmin` nommé à −0,5 avec une netteté de 1,67 ou plus annulait ce diviseur. La loi n'y va pas ; `mwsrUniforms()` et le C++ tiennent maintenant un `wmin` nommé au-dessus de −0,49 − `walong`. Les lignes `j11*` de `hdr-check.js` nomment aussi toutes les valeurs de J11, que la loi aurait remplacées, et le curseur τ du labo descend jusqu'à la valeur de la loi.
+
+**Non fait, à la décision de Bruno.** L'activation par défaut des zones (elles restent derrière la clé de labo), le coup d'œil sur le
+comparateur en ligne, l'optimisation du shader : zéro perte mesurée d'abord, puis les chiffres de ce que 2 % de perte apporteraient.
+
+## 2026-11-02 — J56, le shader allégé : zéro perte, puis une seule lecture sur le chemin plat
+
+**La demande de Bruno (02/11).** « Optimisation sans régression » : d'abord ce qui ne perd rien de mesurable, ensuite les chiffres de ce
+que 2 % de perte apporteraient. Mesures de temps sur la RTX du bus 3 et l'iGPU du 9900X, dans des créneaux donnés par 59 ; la qualité
+sur SwiftShader, 4 cœurs en priorité basse, LPIPS sur la RTX, contre la loi de J55.
+
+**Ce qui part sans perte (`efd72cbb`).** Avec `ralong` 0, les deux échantillons le long des bords sont sur le centre, avec un poids nul.
+Et la cohérence vaut S / (S + EPS), car max(|p + q|, |p − q|) = |p| + |q| : elle n'est plus qu'un garde. Les trois jumeaux perdent donc
+deux échantillons, deux produits scalaires et une division par pixel de bord. Le poids en travers et le diviseur du mélange deviennent
+des valeurs du bloc, calculées une fois par image (le bloc passe de 20 à 24 flottants) ; la zone du regard et les zones de l'hôte les
+recalculent par pixel. Le vote prend la dérivée de la luma seule hors `CHROMA444`, la taille de l'entrée vient du bloc, la réduction à
+un échantillon perd son `span`. Au passage, la borne suit l'empreinte exacte aux bords de l'image.
+
+Sur tout le corpus (19 images, 12 géométries, avec et sans zones) : LPIPS moyen de −0,000009 à +0,000006, VMAF NEG de −0,0015 à +0,0029 ;
+pire image +0,00005 et −0,0047. De 0,04 à 0,34 % des pixels changent, de 1/255, sauf quelques bascules du vote (7/255 au plus) et les bords
+de l'image (28/255 au plus). Aucune réduction ne change dans les dorés. WebGL2 et la f16 avaient un garde 100 fois plus grand, qui leur
+coûtait environ 1 % de LPIPS sur les écrans 1080 et 1440 : ils rejoignent la loi mesurée. En WebGPU contre la v0.4.1 : RTX −30 à −33 %,
+iGPU −37 % ; avec les zones −31 % et −35 %.
+
+**Essayé, puis écarté.**
+- `textureGather` : RTX −29 % contre −33 %, iGPU −39 % contre −37 % : aucun gain net.
+- `s12 = C` dans le cubique : +0,00009 de LPIPS à ×2 : pas zéro perte.
+- `DERING 0` : +35 % de LPIPS à ×1,333.
+- Une borne sans lecture de texel (`DERING 3`, `ridge` 2) : ×1,333 LPIPS −1,8 à −2,7 % mais VMAF NEG −0,37 à −0,52, ×2 LPIPS +1 à +2,1 % et
+  VMAF NEG −0,32 à −0,47 ; RTX −41 %, iGPU −36 %, soit rien de gagné sur l'iGPU, et des traits qui dépassent leurs texels.
+- Une sortie rapide du chemin plat (`FLAT_EARLY` 0,002 : une lecture du texel le plus proche, et C rendu s'il en est tout près) : qualité
+  tenue (LPIPS −0,000027 à +0,000013), iGPU −48 %, mais re9-street ne passe que de 2,14 à 2,01 ms.
+
+**Ce que cette sortie rapide a appris.** Un GPU exécute les pixels par paquets, et un paquet paie un chemin dès qu'un seul de ses pixels le
+prend (TexBench le mesure : écarter un pixel sur deux ne gagne rien). Éviter le cubique à la plupart des pixels gagne donc peu. Il faut
+retirer ses échantillons.
+
+**Le chemin plat à une lecture (`FLAT_TAPS 2`).** Ce que le cubique faisait d'utile : à ×2 exact, chaque quad est centré sur un texel, donc
+un trait d'un texel a une pente nulle et passe par le chemin plat, où le cubique garde sa profondeur. Une lecture y suffit, le texel n le
+plus proche du pixel :
+
+    R = C + k (n − C),    k = (1 − f) (1 − 1,5 f),    f = la plus grande distance par axe au centre de ce texel
+
+Sur un tel trait, à la distance f de son centre, le Catmull-Rom donne h(f) L, avec h(f) = 1,5 f³ − 2,5 f² + 1, là où C vaut (1 − f) L, et n
+vaut L : k = (h(f) − (1 − f)) / f. R reste entre C et le texel, donc rien ne sonne, et sur une cellule vraiment plate n vaut C. Un point
+isolé relevé sur le texte, vu en diagonale, sur fond blanc (texel 227 en rouge) : le cubique à cinq échantillons, sans ses coins, donne 254 ;
+celui-ci 239, près du Catmull-Rom complet (240).
+
+Sur tout le corpus, contre la loi : images de recherche, LPIPS moyen de −0,29 à +0,01 %, VMAF NEG de −0,0087 à +0,0026, pire image +0,00018
+(re9-street ×2 hevc) et −0,117 (texte ×2, écran 1080). À ×2 sur l'écran 1440, le LPIPS s'améliore : 0,10638 → 0,10610 avec zones, 0,11086 →
+0,11055 sans. Images de contrôle, de −0,09 à +0,07 %, VMAF NEG de −0,0038 à +0,0041, pire image +0,00058 (re9-grace ×2 hevc) et −0,011.
+Contre le chemin à cinq échantillons, sur 4 images, 0,6 à 3 % des pixels changent, presque tous de 1 ou 2 niveaux ; moins de 0,05 % bougent
+de 4 niveaux ou plus (33 au maximum), des points isolés et de petits détails de texte, qui se rapprochent du pixel source.
+
+**Les temps (créneau du 02/11, 09:19-09:24 ; 0 A.D., texte, re9-street ; 1080 et 720 vers 1440 ; même page, blocs entrelacés), contre la v0.4.1.**
+- WebGPU, RTX : −48,1 % (−26 à −62), contre −29,6 % au chemin à cinq échantillons ; iGPU : −57,1 % (−44 à −66), contre −37,2 %.
+- Avec les zones : −42,4 % et −54,3 %.
+- Face à FSR1 à sa meilleure précision : 4,82 fois plus rapide sur la RTX (3,5 à 6,5), 4,99 fois sur l'iGPU (4,3 à 5,9) ; avec zones 4,35 et
+  4,69 fois. Le chemin à cinq échantillons était à 3,64 et 3,58 fois, la v0.4.1 à 2,43 et 2,11.
+- WebGL2, la passe seule, v0.4.1 → cinq échantillons → une lecture : iGPU texte 1,590 → 1,124 → 0,483 ms, re9-street 1,501 → 1,263 → 0,768 ms ;
+  RTX re9-street 0,0596 → 0,0452 → 0,0252 ms ; RTX texte 0,0704 → 0,0445 ms puis trop de bruit pour conclure. Image finie sur l'iGPU : texte 4,28
+  → 3,83 → 3,44 ms, re9-street 3,71 → 3,46 → 2,82 ms.
+- La RTX reste bruitée (horloge bimodale, J51) ; l'iGPU stable (0,2 % entre passes).
+
+**Une erreur de banc, corrigée.** Le premier temps WebGL2 de ce chantier (créneau de 06:52, −16 à −44 %) était faux : les copies de labo
+gardaient le `WebGlRenderer.js` de la loi, qui ne pose pas les nouvelles valeurs du bloc, et le shader dessinait avec elles à 0 (0,47 et 13 dB
+contre la même image en WebGPU). WebGPU prend le bloc entier et n'est pas touché, ni les mesures de qualité. Avec le renderer du dépôt : 32 et 48 dB,
+au lieu de 25 et 36 dB pour le texte d'avant : l'écart de dérivées entre WebGL2 et WebGPU, déjà connu, se réduit.
+
+**Monter le seuil du vote, ou retirer aussi cette lecture.** Les chiffres des 2 %, contre −48,1 % et −57,1 % à `tau` 0,0025 :
+- `tau` 0,005 : RTX −50,5 %, iGPU −57,7 %, LPIPS au pire +0,32 % ;
+- `tau` 0,0075 : −51,7 %, −58,5 %, au pire +0,92 % ;
+- `tau` 0,015 : −54,7 %, −60,0 %, au pire +3,19 %, hors de la règle. Le gain vient surtout de re9-street (iGPU 1,42 → 1,16 ms), et 0 A.D. ralentit
+  (1,27 → 1,41 ms), sans doute parce que ses paquets paient alors les deux chemins.
+- Aucune lecture sur le chemin plat (`FLAT_TAPS 1`) : −54,5 % et −62,1 %, mais un trait d'un texel s'y affadit à ×2 ; pas mesuré sur tout le corpus.
+
+**Les décisions de Bruno (02/11).** Le chemin à une lecture par défaut, partout, téléphones et tablettes compris. Le seuil reste à 0,0025. Les
+chemins à 3, 5 et 9 échantillons et `fc` restent jusqu'à la lecture sur téléphone et 780M : le comparateur en a besoin pour comparer les temps. La
+f16 reste pour l'instant : sur l'iGPU elle ne gagne plus rien (−56,0 % contre −57,1 %), elle attend la 780M et l'iPhone.
+
+**Sa question sur la Mi TV.** Elle n'a pas d'adaptateur WebGPU (relevé le 06/10) : la f16 ne s'y teste pas. Son WebGL2 peut comparer le mélange en
+`mediump`, le jumeau de la f16, à `highp`, et les chemins entre eux, sur une puce où les écarts se voient : à faire sur un créneau de 59.
+
+**Vérifié.** Dorés réécrits puis relus, conformité des jumeaux WebGPU et WebGL2, jumeau HLSL sur WARP, cellules du labo, `node mwsr/generate.mjs --check`,
+`node scripts/website/build-site.mjs --check`, 200 fichiers de tests et 2211 tests verts. Le texte appliqué rend les mêmes pixels que la copie de labo mesurée, sur 6 cas, avec et sans zones. Aucune réduction ne change dans les dorés. Le contrôle HDR garde les cinq alertes de la loi commitée, aux mêmes valeurs à 0,005 près, et n'en ajoute aucune.
+
+**Les temps définitifs (02/11, 10:37-10:41, le texte de ce commit, même page).** RTX : 0 A.D., texte, re9-street et gta-city ; iGPU : les trois
+premiers. Contre la v0.4.1 : RTX −47,1 % (−37 à −59), iGPU −57,0 % (−45 à −66) ; avec les zones −40,2 % et −54,2 %. FSR1, à sa meilleure précision, coûte
+4,79 fois MWSR sur la RTX (4,3 à 5,1) et 4,98 fois sur l'iGPU (4,3 à 5,9) ; avec les zones 4,23 et 4,68 fois ; la v0.4.1 était à 2,54 et 2,11 fois. MWSR
+devient le plus rapide des quatre sur ces deux GPU. La RTX était à P0 d'un bout à l'autre, et la mesure confirme celle de 09:19.
+
+Le README, la page et le graphique prennent ces temps. La colonne de la Radeon 780M reste celle du 30/10 et est dite ancienne : l'UM790Pro sert au banc de
+sécurité. Les scores (`cmp_lab.py`, 75 cas) sont refaits sur ce texte, les figures par `mwsr_charts.py`, et la colonne MWSR des zooms est redessinée sur la RTX.
+
+**La Radeon 780M (02/11, 12:44-12:48, à la demande de Bruno).** Un Chrome lancé par SSH tourne en session 0 : il voit la carte, mais `requestAdapter` rend null,
+comme sur mw-arm le 22/10. Sur l'accord de Bruno, une tâche `Interactive` l'a lancé dans la session console de Minis, sans fenêtre, muet, sur un profil à part, et
+WebGPU y répond. Six images, deux passes de 3 tours de 6 lots de 100 dessins, `lab-time` identique au dépôt, 2,4 % d'écart entre passes au pire, aucun autre programme
+au-dessus de 2 % du moteur 3D. Contre la v0.4.1 : −20,3 % (−14,5 à −31,5), avec les zones −18,0 %. L'écart avec la RTX et l'iGPU vient du plancher : une bilinéaire seule
+y prend 0,21 à 0,32 ms, et ce que le shader ajoute au-dessus baisse de 72 % (60 à 90), contre 68 % et 66 %. FSR1 à sa meilleure précision 3,21 fois MWSR (2,65 à 3,54),
+SGSR1 1,21 fois (1,08 à 1,39), NIS 4,68 fois (4,03 à 5,06) : MWSR est le plus rapide des quatre sur les six images. Le chemin à une lecture contre celui à 5 : −6,4 %
+(−0,7 à −10,9). La f16 n'apporte rien : +1,0 % (−0,2 à +1,6). Chaque texte 16 bits est tenu à son texte 32 bits sur cette carte : MWSR à 1/255 au plus, FSR1 et SGSR1 à
+0,045 % de pixels au pire au-delà de 4/255. La colonne du 30/10 venait d'Ubuntu, et ses valeurs ne se comparent pas à celles-ci : la bilinéaire y valait 0,110 ms, contre
+0,322 ms ici. Le README, la page et le graphique prennent cette colonne, et la réserve sur la précision de cette carte disparaît.
+
+**Reste.** Les téléphones (Bruno lit le temps sur le comparateur en ligne, après le signal de 59), la Mi TV ; puis le retrait des anciens chemins et
+la décision sur la f16.
+
+## 2026-11-03 — J57, le noyau change : J, sa loi réglée à l'œil de Bruno
+
+**La décision de Bruno (03/11).** Après ses comparaisons de la journée, il adopte J, le noyau rapide des recherches de la nuit : un cubique lu en cinq échantillons bilinéaires, le détail mesuré en travers du bord, et une borne à marge sur la plage de la lecture du milieu et de la paire en travers. Ses repères : le niveau C à ×1,33 (force 1 de la loi), le niveau D à ×2 (force 1,35), tous deux sur `kg` et `kl`. À ×1,5, six images sur six en C (force 1,10), qui est exactement la droite en ln(ratio) entre les deux. Limite : cette page-là n'était pas à l'aveugle et C y était la valeur centrale de cinq forces ; cela soutient la courbe sans la prouver. L'essai à l'aveugle J contre FSR1 de la journée donne J 11, FSR1 0, aucune différence 1 sur 12 séries, J étant seul réglé à son œil et sur ces mêmes images.
+
+**Le texte.** Sept lectures sur un bord, une seule sur un quad plat. La loi (`MWSR_LAW`) est le polynôme de degré 2 en ln(ratio) de `kc`, `kg`, `kr`, `kl` ajusté de ×1,07 à ×4 sur les recherches de la nuit, la force par-dessus, `ft` 0,005 et `kwc` 0,1 constants. Plus de terme de surface, et aucune montée vers la 4K mesurée avec cette loi. Au-delà de ×2 la force reste à 1,35 : rien de plus haut n'a été vu. `DERING`, `FLAT_TAPS`, `FLAT_ZONE`, `fc`, `wmin`, `sharp`, `tau` et `racross` quittent le bloc : la borne et le chemin plat sont ceux de J. Le bloc reste de 24 flottants. La zone du regard suit : son `kg` au centre est un multiple de la loi (`boost` 1,5), une valeur que ni l'œil ni un score n'ont vue sur ce noyau, derrière sa clé de labo.
+
+**Vérifié, en logiciel (cœurs 16-21, priorité basse) :**
+- le texte du produit contre celui du labo jugé par Bruno, aux mêmes valeurs : 6 à 15 pixels sur 3,7 millions, 1/255 au plus, sur 9 cas ;
+- WebGL2 : conformité `--conformity` OK ;
+- HLSL sur WARP contre WGSL sur SwiftShader, 9 cas : 60 à 67 dB, 0,01 à 0,07 % de pixels au-delà de 1/255 (des quads près du seuil basculent) ; FXC et DXC compilent ; `mwsr.h` donne les flottants du module au bit près sur 6 tailles ;
+- dorés réécrits puis relus (`--golden-check`).
+
+**HDR.** La marge de la borne fabrique des hautes lumières : du texte à 1000 nits monte vers 1400, soit 1,08 à 1,36 fois le pic d'entrée, et le dE ITP sur le texte et le jeu à ×2 passe au-dessus de la simple copie (`hdr_check.py`). Limiter la marge au-dessous du blanc supprime le pic mais pas le dE. Sans marge (`kl` 0, option `hdr` de `mwsrUniforms`, posée par `WebGpuRenderer` sur le chemin `linear`), tous les contrôles passent. Bruno n'a pas vu J en HDR. Le chemin `tonemap` reste le noyau SDR, sa marge voulue : le contrôle des texels n'y est plus que rapporté.
+
+**Sous ×1 et à ×1.** Le noyau ne s'y applique pas : ×1 est une copie, et jusqu'à ×0,5 la réduction est un échantillon bilinéaire en lumière linéaire, sans netteté. FSR1 n'est pas fait pour réduire ; il tourne tel quel. Moyennes sur 148 cas, images à 2160 ou 1440 selon le ratio (LPIPS, VMAF NEG, PSNR), jeux après HEVC, MWSR puis FSR1 : ×0,5 .0075 92,32 43,17 ; .0210 93,20 39,24. ×0,67 .0077 92,73 44,44 ; .0231 93,75 40,69. ×0,75 .0171 89,00 40,05 ; .0234 91,19 38,06. ×1 (copie) .0133 95,77 41,53 ; .0254 93,10 38,30. MWSR gagne partout sauf en VMAF NEG sous ×1. Contrôle : 30 cellules redessinées, 0 écart.
+
+**La vitesse (`final_time.py`, créneau de 59, 03/11 16:39-16:53, bus 3 et iGPU, ms par image).** Sur la RTX, J 0,08 à 0,11, FSR1 0,29 à 0,39 (2,7 à 4 fois J). Sur l'iGPU en f16, J 1,34 à 2,01, FSR1 6,24 à 6,34 (3,2 à 4,7 fois). Le noyau d'avant J valait 0,063 et 1,29 sur 0 A.D. à ×1,33 ; J y vaut 0,085 et 2,01 : J coûte plus cher, c'est le prix de la netteté retenue.
+
+**L'optimisation, sans perte.** La forme du texte vient des recherches de la nuit (`fa=1;fc=1;fb=1`). Trois essais de plus :
+- la f16 hors NVIDIA reste : −14 à −15 % sur l'iGPU pour 2/255 au plus ;
+- le calcul du cubique écrit autrement : −1,5 à −2 % sur la RTX, −1 % sur l'iGPU en f32, mais +1,6 % en f16 : gardé tel quel ;
+- un seuil de vote plus haut : à 0,0075, 9 % de pixels en moins sur le chemin à sept lectures, mais une image perd jusqu'à 4,8 % de LPIPS : refusé.
+
+**Zones contre loi sur J final (60 cas par ratio).** À ×1,33 sur les jeux : LPIPS −3,3 %, NEG +0,31, PSNR +0,25 dB ; à ×2 : −7,7 %, +1,28, +0,58 dB. Sur les pages rien ne bouge (+0,03 % au plus). NEG et PSNR ne passent jamais sous la loi ; le pire LPIPS est +2,81 %. Après HEVC le gain moyen est plus faible (−1,6 % et −4,8 %). Tout vient du labo, images figées : l'arbre a été réglé sur le noyau d'avant, et le passage de sa baisse à J (`zf`, sur `kg` et `kwc`) est nouveau. Coût de la passe hôte sur la RTX : 45, 64 et 94 µs en rafale de 1080p à 4K ; 80, 215 et 1359 µs à 60 Hz sur un bureau calme. Les zones restent coupées, derrière leur clé de labo.
+
+**Reste.** La colonne de la Radeon 780M, le tableau du site et du README sur ce texte, l'essai en vrai stream, les téléphones.
+
+## 2026-11-03 — J58, la réduction devient nette : la Mixte, au choix de Bruno
+
+**La décision de Bruno.** Sous ×1, MWSR ne faisait qu'une moyenne en lumière linéaire. Trois tours de comparateur, sur pages privées hors dépôt, noms affichés, un seul observateur, écran M27Q. Premier tour, 18 images : l'actuelle n'est choisie sur aucune, une version nette sur 12, FSR1 sur 4, une stricte sur 2. Deuxième tour, 6 images : une version moyenne sur 5, la nette sur 1. Troisième tour, 11 images : la Mixte sur les 11 (58 vues relues sur le canevas, 0 pixel différent, 0 empreinte fausse), « J'ai refait le test, je préfère Mixte. »
+
+**Le texte.** Le vote des dérivées grossières de la luma, puis, où il voit du détail, une croix de 4 lectures à un pixel de sortie donne le détail et la borne. Le gain et la marge suivent l'étendue locale en racine carrée (`smoothstep(0.2, 0.5, ...)`) : plus doux sur un bord franc. `MWSR_DOWN_LAW` : à ×0,5, gain ,25 vers ,05, marge ,1 vers 0 ; de ×2/3 à ×0,93, gain ,45 vers ,2, marge ,25 vers ,1 ; une droite en ratio entre ×0,5 et ×2/3 ; le gain s'éteint de ×0,93 à 1:1 ; aucune netteté sous ×0,5 ; en HDR, gain 0 et les pixels d'avant. Soit 5 lectures à travers les vues sRGB, 8 avec la grille 2×2 de la lumière logicielle. Les grilles 3×3 et 4×4 ne changent pas. Les textes de l'agrandissement non plus : WGSL et HLSL au bit près, GLSL un commentaire.
+
+**Vérifié, en logiciel (cœurs 16-21, priorité basse) :**
+- le produit contre ce qu'il a vu : 0 pixel sur ses 11 images ; 0 d'écart de score à ×0,75, ×0,67, ×0,5, ×0,6, ×0,85 et ×0,9 ; à ×0,95, 0,01 au plus, l'arrondi du paramètre du labo ;
+- HLSL sur WARP contre WGSL sur SwiftShader, 9 images : 0,04 % de pixels au-delà de 1/255 au plus, 58/255 au plus sur du texte ; `mwsr.h` donne les flottants du module au bit près sur 13 tailles ;
+- WebGL2 : `--conformity` refusait la réduction (35/255 au plus, 0,6 % de `code`). Le vote retiré des deux textes, les deux images sont identiques au bit près sur les trois cas : l'écart est le seul vote, GLSL ES n'a pas de dérivée grossière. Le contrôle tient désormais ce couple par un plancher de 45 dB (51 dB au pire ce jour-là), et non plus par l'écart des bilinéaires ;
+- dorés réécrits puis relus : 12 différences avant réécriture, toutes des réductions de 2560×1440 à 1280×720 (`mwsr`, `mwsr:srgb=1`, `mwsr:ll=2`, `chain-mwsr`) ; `taps=9`, `tex-s1` et les agrandissements intacts.
+
+Sur carte, l'image relue contre SwiftShader, qui dessinait ce que Bruno a vu : RTX à travers les vues sRGB, 3 % de pixels au-delà de 1/255 et 0,19 % au-delà de 4/255 sur le texte à ×0,75 (17/255 au plus), 0,11 % et 48/255 au plus sur le jeu ; iGPU, 0,06 % au plus, 40/255 au plus. Personne ne l'a regardée à l'œil sur ces cartes.
+
+**Les scores, après HEVC, contre Lanczos-3 en lumière linéaire (LPIPS, VMAF NEG, dépassement en %) ; avant → Mixte (FSR1).**
+- ×0,75 jeux, 24 cas : ,0171 → ,0113 (,0234) ; 89,00 → 93,38 (91,19) ; 0 → 2,30 (4,84).
+- ×0,75 texte, 6 cas : ,0179 → ,0141 (,0290) ; 71,97 → 82,77 (72,96) ; 0 → 2,83 (2,12).
+- ×0,67 jeux, 11 cas : ,0077 → ,0104 (,0231) ; 92,73 → 94,48 (93,75) ; 0 → 1,56 (3,47).
+- ×0,67 texte, 3 cas : ,0108 → ,0093 (,0260) ; 69,71 → 87,97 (69,41) ; 0 → 2,00 (,15).
+- ×0,5 jeux, 11 cas : ,0075 → ,0058 (,0210) ; 92,32 → 94,49 (93,20) ; 0 → ,57 (3,58).
+- ×0,5 texte, 3 cas : ,0138 → ,0157 (,0266) ; 82,15 → 82,69 (71,06) ; 0 → ,11 (,10).
+
+La Mixte perd donc en LPIPS sur les jeux à ×0,67 (11 sur 11, +51,7 % au pire) et sur le texte à ×0,5 (3 sur 3, +15,9 % au pire) : c'est l'œil qui a tranché, et la référence favorise les filtres proches de Lanczos-3.
+
+Entre les ratios, valeurs jamais vues à l'œil, Bruno n'en demandant plus le contrôle : ×0,6 jeux ,0073 → ,0102, 92,29 → 93,88, texte ,0220 → ,0219, 70,72 → 74,67 ; ×0,85 jeux ,0203 → ,0098, 87,43 → 93,08, texte ,0186 → ,0137, 60,43 → 76,48 ; ×0,9 jeux ,0229 → ,0106, 87,16 → 93,15, texte ,0190 → ,0132, 59,54 → 77,53 ; ×0,95 jeux ,0255 → ,0137, 86,78 → 91,79, texte ,0204 → ,0153, 58,60 → 72,16 (FSR1 80,06 : il la dépasse là).
+
+**La lumière logicielle, jamais vue à l'œil.** C'est le chemin de WebGL2, donc d'Auto sur un ordinateur. Sa Mixte s'écarte de ce que Bruno a vu : jusqu'à 21 % de pixels au-delà de 1/255 et 18 % au-delà de 4/255 sur du texte à ×0,75, 89/255 au plus. En scores, après HEVC, avant → Mixte sur ce chemin : ×0,75 jeux ,0269 → ,0093, 87,60 → 92,91 ; texte ,0301 → ,0168, 78,59 → 82,32 ; ×0,67 jeux ,0128 → ,0046, 91,07 → 95,14 ; texte ,0220 → ,0119, 78,09 → 84,91 ; ×0,5 jeux ,0076 → ,0067, 92,35 → 93,06 ; texte ,0131 → ,0142, 85,46 → 82,24, moins bon. Le FLIP du texte y reste au-dessus du chemin sRGB : ,0519 contre ,0372 à ×0,75.
+
+**La vitesse (`time_final2.py`, créneau de 59, 03/11 23:42-23:48, bus 3 et iGPU ; 780M 23:50-23:53 ; ms par image, jeu/texte).**
+- RTX, vues sRGB : ×0,75 ,033/,023 ; ×0,67 ,063/,040 ; ×0,5 ,035/,024. Lumière logicielle : ,047/,036 ; ,086/,065 ; ,046/,033. FSR1 : ,149/,144 ; ,278/,264 ; ,152/,145.
+- iGPU, vues sRGB : 1,045/,648 ; 1,914/1,092 ; 1,073/,652. Lumière logicielle : 1,494/1,051 ; 2,683/1,809 ; 1,524/1,037. FSR1 en f16 : 3,561/3,525 ; 6,326/6,254 ; 3,572/3,546.
+- 780M, vues sRGB : ,255/,215 ; ,442/,371 ; ,347/,287. Lumière logicielle : ,260/,227 ; ,452/,386 ; ,355/,293. FSR1 en f16 : ,546/,518 ; ,919/,866 ; ,601/,537. Horloge non fixée : à lire en rapports.
+- WebGL2, GPU seul : RTX ,078/,068 ; ,185/,163 ; ,115/,103 (FSR1 ,162/,160 ; ,309/,300 ; ,199/,195). iGPU 1,675/1,232 ; 3,127/2,251 ; 2,177/1,636 (FSR1 4,870/4,788 ; 8,792/8,580 ; 5,394/5,194).
+
+La copie simple reste plus rapide (RTX ,016 à ,029, iGPU ,258 à ,523). Une forme moins chère de l'étendue (`sqrt(dot(mx, LUMA)) - sqrt(dot(mn, LUMA))`) gagne 2 à 3,5 % sur la RTX et 3,4 à 6 % sur l'iGPU, mais change des pixels (25/255 au plus, 0,02 % au-delà de 2/255) : refusée, Bruno a choisi les autres.
+
+**Zones contre loi sur J final, plage centrée (0,64 à 1,15 fois la loi), après HEVC.** Jeux à ×1,33 : LPIPS -1,46 %, pire +7,0 %, NEG -0,26, PSNR -0,20 dB, dépassement 2,47 → 3,08. Jeux à ×2 : -1,72 %, pire +5,5 %, NEG +0,07, PSNR +0,04. Pages : -2,92 % et -3,30 %, NEG +0,32 et +0,27. Une plage plus large (force de 0,87 à 1,55) va plus mal à ×1,33 : +3,01 %, pire +55,2 %, NEG -1,71. Bruno, à l'œil : à ×1,33 la loi sur 3 images, la plage large sur 3, la centrée sur aucune ; à ×2 la loi sur 6 images sur 6. Les seuils fixés d'avance ne sont pas tenus : pas de section au site, aucune activation, pas de code de plus. Le code actuel reste dans le produit, coupé. Le coût côté client, le pompage et le vrai stream n'ont pas été mesurés pour cette plage.
+
+**Limites.** Le choix de la Mixte est une préférence d'un observateur sur des images fixes, noms affichés. Les ratios intermédiaires, le HDR à gain nul et la lumière logicielle n'ont pas été vus à l'œil. Les téléphones ne sont pas mesurés.
+
+**La page et le README, sur ce texte.** Quatre tableaux à ×1,33 et ×2, jeu et texte, six scores, dépassement et trois GPU, en `mwsr/README.md` et dans « Measured on three GPUs ». La page calcule désormais ses six scores dans l'onglet, chacun dès qu'il est prêt, sans serveur : LPIPS sur le GPU de la page (9,9 Mo de poids chargés par elle), VMAF NEG, PSNR, SSIM, MS-SSIM et FLIP en JavaScript. Coût mesuré : LPIPS 0,34 à 0,40 s par image sur la RTX, 6,1 à 7,3 s sur l'iGPU, 0,85 à 0,95 s sur la 780M ; VMAF NEG 0,6 à 0,9 s ; PSNR, SSIM et MS-SSIM 0,8 s ; FLIP 0,85 s. Écart au labo : LPIPS moins de 4e-8 sur la RTX et l'iGPU sur 6 images, 3,4e-8 sur la 780M sur 6 images ; VMAF NEG 1e-4 au plus sur 6 ; FLIP 2e-7 au plus sur 9. Sur SwiftShader, de bout en bout, la page rend les valeurs de `lab-scores.json` à leur précision d'affichage sur les cas contrôlés (×1,33 texte, ×0,75 0 A.D., ×0,5 Junk Shop), et l'HDR ne garde que le dépassement. `lab-scores.json` passe à côté de `cmp_lab.py` : il ne sert plus qu'au README et au contrôle. Plus de plan de mesure au choix : 3 tours de 6 lots de 100 images. Refaits les 75 cas : hors réduction de MWSR, aucun score ne bouge. La FAQ disait « sans halo » dans les quatre langues : « peu de halo », puisqu'un petit dépassement est laissé exprès. La figure de zoom et la carte de partage sont redessinées, la colonne de MWSR sur la RTX du bus 3.
+
+**Reste.** Les téléphones, le test mémoire de DualRTX, puis le redémarrage prévu.
+
+**La réduction à une lecture sur WebKit (04/11).** Sur un iPhone 13 Pro (iOS 26.5, Safari et Chrome), les réductions WebGPU par `mwsr-down-1` ne dessinaient rien : 0 ms de GPU. WebKit refuse un pipeline à qui l'on donne une constante que son texte ne lit pas (« Fragment library could not be created »). Ce texte ne lit plus `R_DOWN` depuis `efd72cbb` (02/11), et le renderer, le moteur de la page et le labo la passaient encore.
+
+Essais sur Safari. Refusés : le texte à une lecture avec `R_DOWN`, sur une cible avec ou sans `-srgb`, et l'ancien texte réduit à son retour. Acceptés : le texte à une lecture sans `R_DOWN`, ou avec `_ = R_DOWN;` dans son corps. Les textes à 4, 9 et 16 lectures et le noyau en f16 compilent. WebGL2 n'est pas touché : ses constantes sont écrites dans le GLSL.
+
+Rien ne prenait le relais : `submit` et `onSubmittedWorkDone` réussissent, `failed` reste faux. D'après le code, l'image restait noire ou figée ; personne ne l'a vu en stream. Un iPhone en Auto y passait dès qu'un hôte 1440p ou 4K se réduisait à son écran. La v0.4.1 n'a pas ce défaut.
+
+`mwsrDownConstants(reg)` rend les constantes que le texte lit, et un test refuse le couple. Aucun texte de shader ne change, et le contrôle doré passe sur SwiftShader. Sur l'iPhone, Safari et Chrome dessinent désormais l'image, vue à l'œil dans les deux, sans erreur, avec du travail GPU sur chaque réduction essayée.
+
+**La Radeon 780M à horloge tenue (04/11, 06:06-06:13).** Les temps du 03/11 tournaient à l'horloge libre et ne valaient que comme rapports. Cette fois `ID3D12Device::SetStablePowerState` tient l'horloge ; il demande le mode développeur de Windows, posé par Bruno pour la mesure, retiré ensuite et vérifié absent. Relevé ADL : 135 lectures sur 135 à 938 MHz pour le cœur, 2800 pour la mémoire, 1028 pour le SoC, charge jusqu'à 98 %, 35 W au plus. Laissée à elle-même, la puce va de 800 à 2800 MHz : 938 MHz n'est pas la fréquence d'usage.
+
+En ms par image, 0 A.D. et texte, MWSR f32/f16 puis FSR1 f32/f16 : ×1,33 jeu ,610/,656/2,18/1,99 ; ×1,33 texte ,418/,449/2,16/1,97 ; ×2 jeu ,594/,647/2,16/1,98 ; ×2 texte ,408/,443/2,16/1,97. Réductions par vues sRGB, MWSR/FSR1 f16 : ×0,75 jeu ,314/1,14 ; ×0,75 texte ,251/1,14 ; ×0,67 jeu ,558/1,99 ; ×0,67 texte ,432/1,98 ; ×0,5 jeu ,371/1,16 ; ×0,5 texte ,303/1,16.
+
+Cellules seules, 1080p vers 1440p, horloge tenue contre libre, jeu : `tex-s1` ×1,01, `tex-s2` ×1,01, `tex-s5` ×1,45, `tex-s9` ×2,26, MWSR ×1,83, MWSR f16 ×1,91, FSR1 ×2,23, FSR1 f16 ×2,20. Texte : MWSR ×1,47, FSR1 ×2,31. Le plancher bilinéaire ne suit donc pas le cœur et ne bouge pas quand les lectures doublent ; il varie avec l'image et l'entrée (,19 à ,42 ms), alors que FSR1 reste à 2,16 ms. La mémoire est à 2800 MHz dans les deux cas : la circulation en mémoire est l'explication probable, déduite, la mémoire n'ayant pas varié. L'iGPU du 9900X reste à son horloge : à lire en rapports.
+
+À cette horloge le texte f32 de MWSR est 7 à 9 % plus rapide que le f16 ; à l'horloge libre ils sont égaux à 2,3 % près. FSR1 f16 gagne environ 9 %. Le produit garde le f16 hors NVIDIA : rien n'a changé, la question reste à trancher.
+
+**Les téléphones (04/11, une passe par cas, horloges libres).** Temps de `draw` jusqu'à la fin du GPU, sans filtre/MWSR/FSR1, en ms.
+
+iPhone 13 Pro, moyennes sur une minuterie à 1 ms, page non isolée, WebGPU. Agrandissements, relevés avant le correctif, qui ne les touche pas : Chrome écran ×2 texte 2,04/3,00/5,63 ; ×2 jeu 2,27/3,19/5,77 ; ×1,33 2,46/3,00/6,90. Safari écran ×2 texte 2,06/2,75/4,85 ; ×2 jeu 2,08/3,02/6,56 ; ×1,33 2,37/2,85/6,37 ; 720p vers 1440p texte 2,46/3,40/6,71, jeu 2,52/3,37/6,08 ; 1080p vers 1440p 2,35/3,48/5,75.
+
+Réductions, avec le correctif. Safari : écran ×0,67 2,90/4,48/6,50 ; à 60 i/s 3,06/5,17/8,42 ; 4K vers 1440p 3,48/4,77/6,92 ; 1440p vers l'écran 2,60/3,83/7,48 ; témoin écran ×2 2,48/3,62/6,02. Chrome : à 60 i/s 4,71/5,29/9,56 ; 4K vers 1440p 3,23/4,63/7,15 ; 1440p vers l'écran 2,90/4,10/6,85 ; témoin 2,48/4,10/6,48.
+
+Écartée : Chrome à écran ×0,67, 3,08/2,90/6,83. MWSR y passe sous « sans filtre », ce qui ne peut pas être vrai, et son temps GPU lit 2,50 ms contre 4,12 sur la passe suivante de la même image, Safari lisant 3,94 sur les deux. La cause de cet écart n'est pas établie : une passe, téléphone en charge, horloge inconnue, et la page n'a gardé que les moyennes.
+
+Realme RMX3933 (Mali-G57 MP1, Android 14, Chrome 156, page isolée, médianes, 18 pages sans erreur, 47 à 45 % de batterie, 19,9 à 22,6 °C), WebGPU puis WebGL2 : écran ×2 texte 14,6/19,3/43,4, 17,9/21,7/44,1 ; écran ×2 jeu 14,3/19,3/43,9, 17,7/21,7/44,3 ; ×1,33 15,5/20,1/42,7, 19,3/23,0/46,5 ; ×0,67 15,5/23,0/45,8, 35,2/41,1/62,0 ; 720p vers 1440p texte 22,3/35,7/108,0, 23,1/35,3/114,6 ; 1080p vers 1440p 22,5/36,3/111,4, 32,3/44,6/122,1 ; 4K vers 1440p 29,2/47,3/124,2, 88,5/103,7/180,6. MWSR n'y est pas plus lourd qu'en octobre (37,3 et 36,4 ms) et n'y tient pas 60 i/s ; Auto n'y met aucun filtre (`isEntryMaliGpu`). « Assez léger pour un téléphone » n'était donc vrai que d'un iPhone : le README et la FAQ donnent désormais les deux.
+
+**Reste.** Le test mémoire de DualRTX, puis le redémarrage prévu.
+
+**La défense contre un pipeline refusé (04/11, pour la v0.4.2).** Le défaut de la réduction n'a pris aucun relais : un pipeline refusé ne fait échouer ni `submit` ni `onSubmittedWorkDone`. Chaque création de pipeline passe maintenant dans une portée d'erreurs, et le refus est gardé. Si la passe d'une image utilise un pipeline refusé, le renderer abandonne (`failed`) et la page passe sur le jumeau WebGL2. Un pipeline refusé qu'aucune image n'utilise ne déclenche rien, et sans refus rien ne change. La portée retire l'erreur des `uncapturederror` : le renderer l'écrit en console et le labo la relit dans ses erreurs. Le correctif a d'abord été confirmé sur iPhone sans cette défense, qui ne le remplace pas. Dans Chrome sur SwiftShader, avec un pipeline que Dawn refuse vraiment (constante inconnue sur les réductions) : un agrandissement continue sans abandon, une réduction abandonne, et le jumeau WebGL2 dessine l'image. Elle n'a pas été essayée sur WebKit.
+
+**La page de comparaison : tout au bouton, et ce qu'elle envoie (04/11, décisions de Bruno).** Au chargement, la page dessine l'image et rien d'autre : le tableau reste en tirets, aucun fichier de score n'est chargé, ni les 9,9 Mo de LPIPS. Elle s'ouvre sur Junk Shop, ×1,33, 4:2:0, côte à côte, Native et MWSR, zoom 1×, centre (1610, 629). Un lien qui porte un état garde son ancien sens : sans `chroma`, c'est 4:4:4, sans `view`, c'est « All ».
+
+« Measure » lance les scores qui manquent, puis le temps GPU. Stop garde ce qui est connu et n'envoie rien, et un nouvel appui reprend. « Measure again » refait le temps GPU seul. Un changement de menu arrête tout et vide le tableau. Le badge couvre les chiffres, jamais les titres, tant que le tableau est vide ; dès qu'une valeur s'affiche, c'est une ligne sous le bouton.
+
+Ce que l'œil attend passe d'abord. Le tableau ne travaille que sur une page chargée et visible, après 500 ms sans dessin ni défilement. Un lot touché par un dessin est jeté et refait, à chaud, et l'envoi le compte. Un lot lent est coupé en tranches d'environ 100 ms de GPU. Les scores ont leur worker, terminé avec le cas, et LPIPS attend entre deux soumissions. La page ne voit que son propre usage du GPU : ce qu'un autre onglet ou programme lui demande reste dans les chiffres.
+
+L'envoi est un POST à `/v1/mwsr` à la fin de la mesure : familles et versions majeures du navigateur et du système, fabricant et architecture du GPU, le cas, les scores, les temps, et l'échec s'il y en a un (`draw`, `score`, `warmup`, `batch`). Au plus 3 par 5 minutes, comptés en mémoire, sans nouvel essai, sans cookie ni référent. Pour une image du visiteur, ni son nom ni ses tailles. Pas de bouton de consentement, une note sous le bouton : choix de Bruno, sans avis de juriste.
+
+Rien ne bouge pendant une mesure : la place des chiffres est réservée dans les légendes, la largeur des colonnes dans les cellules, et le bouton garde une taille pour ses trois libellés. Avant cela, à 390 px, le bouton descendait de 60 px quand les légendes se remplissaient. Les noms de lignes restent figés sur tous les tableaux de la page.
+
+Sur l'iPhone de Bruno, au clic, le libellé du bouton changeait mais son dégradé n'était pas peint, puis le bouton revenait après un Stop. Ce n'est pas un cache : le nouveau libellé s'affichait, dans sa couleur. La cause n'est pas établie, et le rendu n'a pas pu être reproduit ici. Le bouton a maintenant une taille fixe, une couleur sous le dégradé et plus de transition sur toutes ses propriétés, ce qui n'a pas encore été revu sur un iPhone.
+
+Essayé sur SwiftShader seulement, avec une image de 320×180 pour les mesures entières : rien au chargement (0 soumission en 3 s, aucun POST), mesure entière (0 dessin de vignette, 0 lot jeté, pourcentage sans recul), Stop et reprise, changement de menu, limite d'envois, échecs provoqués dans les scores et le temps GPU, image en entrée, début d'une mesure HDR, bouton et tableau au même pixel de 390 à 1400 px. Vue de départ comparée à la capture de Bruno à densité 2× : corrélation 0,9991, au plus 1 pixel d'écart. Pas essayé : iPhone, vraie carte, vrai serveur, mesure entière sur une image du site, branche `uncapturederror` sur un vrai refus.
+
+**MWSR en f32 partout, son f16 masqué sur la page (04/11, décision de Bruno).** Le produit ne demande plus `shader-f16` et le noyau tourne sur son texte f32, sur tous les GPU et en HDR. Le f16 ne servait en production que là où WebGPU porte MWSR : iPhone, iPad et le HDR. Le texte `half` reste dans le module, au labo, dans `mwsr/` et sur la page. Le `mediump` de la saveur WebGL2 n'a pas changé. Revenir en arrière tient à quelques lignes de `WebGpuRenderer.js`.
+
+Ce que disent les mesures, f16 contre f32 (ms par image, ×1,33 et ×2, jeu et texte) : la Radeon du 9900X prend 11 à 15 % de temps en moins en f16 (2,01 contre 2,35 ; 1,34 contre 1,52 ; 2,00 contre 2,36 ; 1,36 contre 1,53), la 780M à horloge tenue 7 à 9 % de plus, et à horloge libre elles sont égales à 2,3 % près. Sur Mali, avec l'ancien noyau, `half` gagnait 10 %. Sur le texte d'aujourd'hui, ni iPhone ni Mac ne sont mesurés dans les deux précisions : l'iPhone est pourtant l'appareil le plus concerné. Le f32 n'est donc pas « le plus rapide » partout, il est le choix d'attente de Bruno, et les envois de la page trancheront.
+
+**La page.** Le tableau et les légendes donnent le f32 de MWSR, sans étiquette, même si son f16 est refusé par la vérification d'image. FSR1 et SGSR1 gardent la plus rapide de leurs deux précisions. Le f16 de l'agrandissement de MWSR reste vérifié et chronométré à chaque mesure, et part dans la ligne `half: true` de l'envoi, déjà acceptée par le serveur : aucune valeur n'en est affichée, et le texte de la page le dit. Un f16 refusé ne donne pas de ligne : `f16: true` sans ligne `half` de MWSR, en agrandissement, veut dire refusé.
+
+**Les chiffres publiés.** Les temps MWSR de la Radeon du 9900X passent en f32 dans `index.html`, le README et `speed-*.svg` : 2.35, 1.52, 2.36, 1.53 ms. Ce sont les cellules `mwsr` de `final-time-igpu.json` (03/11), le même passage que les cellules `mwsr:half=1` publiées avant, avec une seule série par cas sur cette carte. L'écart à FSR1 y devient « 2.7 to 4.1 », un rapport calculé comme le précédent (`min(fsr1, fsr1h) / mwsr`).
+
+**Deux passes sur la Radeon intégrée, créneaux de 59, ni l'une ni l'autre ne donne le tableau.** La première, dans un Chrome normal : 122 s, allée au bout, aucun événement du pilote, mais mon script a planté avant d'écrire le tableau et l'envoi. La seconde, avec `--disable-gpu-compositing` ajouté pour réduire le débord ci-dessous : à 53 s, pendant LPIPS, `DXGI_ERROR_DEVICE_HUNG`, puis `LiveKernelEvent` 141 (deux) et a1000001 (trois) dans le journal de Windows, les seuls en 30 heures. Le LPIPS du 03/11 sur cette carte, sans ce drapeau, n'en a laissé aucun. Cause non établie : une passe de chaque côté, le dump n'a pas pu être lu. **Ce drapeau ne va plus sur un vrai GPU.** Un visiteur dont Chrome compose en logiciel pourrait se trouver dans ce cas : ni vérifié, ni écarté. Sous SwiftShader, avec ce même drapeau, les volets de la page sortent noirs dans une capture d'écran : à regarder aussi, si ce mode compte.
+
+Prouvé sur la vraie carte : le texte f16 de MWSR, FSR1 et SGSR1 compile et passe sa vérification, l'envoi porte les tailles d'une image du site, et la branche d'échec marche sur une vraie perte de device (`fail.step: 'score'`). Pas prouvé : un temps f16 réel, et l'affichage du tableau avec de vraies valeurs. Cette logique est essayée sous SwiftShader, qui n'a pas `shader-f16` : le service de test lui dit qu'il l'a, dessine le texte 32 bits et divise le temps 16 bits par deux, pour qu'une confusion se voie. MWSR montre son f32, FSR1 et SGSR1 leur f16 étiqueté, un refus forcé se voit sur FSR1 et pas sur MWSR, et « Measure again » suit la même règle.
+
+**Le bon repère pour le débord de Chrome.** Depuis le dernier redémarrage, le bus 1 est l'adaptateur 0,86442, le bus 3 le 0,91721, la Radeon le 0,96679. Un Chrome de labo sans fenêtre pose du temps 3D sur le bus 1 même en SwiftShader : 46,6 ms en 35 s, 170 ms en 125 s. Il suit la durée et pas WebGPU : c'est sans doute le compositeur. Sous SwiftShader, `--disable-gpu-compositing` le ramène à 5 ms en 33 s. Essais de la page : scénarios habituels de `page_check.py` avec ce drapeau, sur les fichiers de ces commits. L'image du wiki est dessinée sans lui ; son volet « Native » est la source au pixel près.
+
+**Les mesures de Bruno sur ses appareils (04/11, page d'essai, Junk Shop, ×1,33, 4:2:0, une passe par appareil).** MWSR, temps GPU par dessin en f32 et en f16 : RTX 5060 Ti 0,076 et 0,081 ms ; Apple M3 0,390 et 0,367 ; iPhone 0,816 et 0,749. Le f16 prend donc 6,6 % de plus sur le RTX, 5,9 % de moins sur le M3 et 8,2 % de moins sur l'iPhone. Sur l'iPhone, le gain est de 0,067 ms par image. Deux mesures du f32 sur le M3 ont donné 0,368 puis 0,390 ms : cet écart entre deux passes vaut celui entre les précisions, même si, dans une passe, les lots sont entrelacés. Ces passes donnent aussi le premier affichage réel du tableau, sur iPhone, M3 et RTX : MWSR montre son f32 sans libellé, et le vrai texte f16 y compile, passe sa vérification d'image et se chronomètre. L'envoi au vrai serveur reste à essayer.
+
+SGSR1, à sa meilleure précision, n'est pas derrière MWSR partout sur cette image : M3 0,354 ms contre 0,390, iPhone 0,749 contre 0,816, RTX 0,077 contre 0,076. La phrase du README, « the fastest of the four on these GPUs », reste vraie de ses trois GPU sur 0 A.D. et le texte, en f32 compris : elle ne s'étend ni aux appareils Apple ni à cette image.
+
+Le tableau de la page : les barres partent d'un même point, la précision se lit sous le nom (« Half precision », « Half ≈ full », « Half refused »), toutes les lignes ont une hauteur, et « port » quitte la ligne de NIS, puisque la section « The ports » le dit. Reste la note de son volet, « MoonlightWeb's per-fragment port ».
+
+**Bruno confirme le f32 partout (04/11), au vu de ces mesures.** La question reste fermée jusqu'à ce que les envois de la page la rouvrent, l'iPhone et le Mac d'abord. Dans le tableau de la page, deux scores qui se lisent de la même façon sont tous les deux en gras, ce que les tableaux fixes faisaient déjà : la comparaison se fait sur la valeur arrondie, et non plus sur la valeur brute.

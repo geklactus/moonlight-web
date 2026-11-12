@@ -75,6 +75,17 @@ bool SessionPool::anyOtherLiveOnHost(int index, const QString& hostUuid) const
     return false;
 }
 
+QVector<int> SessionPool::slotsOnHost(const QString& hostUuid, int firstSlots) const
+{
+    QVector<int> found;
+    const int n = qMin(firstSlots, int(m_Slots.size()));
+    for (int i = 0; i < n; ++i) {
+        const Slot& s = m_Slots[i];
+        if (s.hostUuid == hostUuid || (s.hostUuid.isEmpty() && !s.worker.isNull())) found.append(i);
+    }
+    return found;
+}
+
 // A slot counts as taken while it has a live worker OR still carries the
 // identity of a session being set up — the worker is attached slightly after
 // the slot is claimed, and handing the same index out twice in that window
@@ -132,4 +143,70 @@ int SessionPool::indexOfSessionToken(const QString& sessionToken) const
     for (int i = 0; i < m_Slots.size(); ++i)
         if (m_Slots[i].sessionToken == sessionToken) return i;
     return -1;
+}
+
+bool SessionPool::streamOf(int index, const QString& sessionToken) const
+{
+    if (!isValid(index)) return false;
+    const QString& owner = m_Slots[index].sessionToken;
+    return sessionToken.isEmpty() || owner.isEmpty() || owner == sessionToken;
+}
+
+int SessionPool::ownerSlotFor(const QString& sessionToken, const QString& wantedHost,
+                              int ownerSlots) const
+{
+    const int n = qMin(ownerSlots, m_Slots.size());
+    auto streams = [&](int i) {
+        return !m_Slots[i].worker.isNull() && !m_Slots[i].hostUuid.isEmpty() &&
+               (wantedHost.isEmpty() || m_Slots[i].hostUuid == wantedHost);
+    };
+    for (int i = 0; i < n; ++i)
+        if (streams(i) && streamOf(i, sessionToken)) return i;
+    for (int i = 0; i < n; ++i)
+        if (streams(i)) return i;
+    return -1;
+}
+
+bool SessionPool::hostHeldByAnother(const QString& hostUuid, const QString& sessionToken,
+                                    const QString& clientUniqueId, int ownerSlots) const
+{
+    const int n = qMin(ownerSlots, m_Slots.size());
+    for (int i = 0; i < n; ++i) {
+        const Slot& s = m_Slots[i];
+        if (s.worker.isNull() || s.hostUuid != hostUuid) continue;
+        const bool otherSession = !streamOf(i, sessionToken);
+        const bool otherDevice = !clientUniqueId.isEmpty() && !s.clientUniqueId.isEmpty() &&
+                                 s.clientUniqueId != clientUniqueId;
+        if (otherSession || otherDevice) return true;
+    }
+    return false;
+}
+
+bool SessionPool::quitReachesAppSlot(int index, const QString& hostUuid,
+                                     const QString& clientUniqueId, const QString& sessionToken,
+                                     int namedSlot) const
+{
+    if (index < 0 || index >= m_Slots.size()) return false;
+    const Slot& s = m_Slots[index];
+    if (s.worker.isNull() || s.hostUuid != hostUuid) return false;
+    if (namedSlot >= 0 && namedSlot != index) return false;
+    if (!sessionToken.isEmpty() && !s.sessionToken.isEmpty() && sessionToken != s.sessionToken)
+        return false;
+    if (!clientUniqueId.isEmpty() && s.clientUniqueId == clientUniqueId) return true;
+    // The authenticated session is the stronger proof: a browser picks its
+    // own uniqueid. It needs the slot named, and a token on both sides.
+    return namedSlot == index && !sessionToken.isEmpty() && s.sessionToken == sessionToken;
+}
+
+QVector<int> SessionPool::slotsOfSession(
+    const std::function<bool(const QString& sessionToken)>& isThatSession) const
+{
+    QVector<int> found;
+    if (!isThatSession) return found;
+    for (int i = 0; i < m_Slots.size(); ++i) {
+        const Slot& s = m_Slots[i];
+        if (!s.worker.isNull() && !s.sessionToken.isEmpty() && isThatSession(s.sessionToken))
+            found.append(i);
+    }
+    return found;
 }

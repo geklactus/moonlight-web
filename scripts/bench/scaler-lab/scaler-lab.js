@@ -90,9 +90,8 @@ const CELL_SETS = {
   // it, and the picture.
   glchain: ["chain-gl-off", "chain-gl-sgsr", "chain-gl-nis", "chain-gl-fsr1", "chain-gl-mwsr"],
   // The mwsr kernel (plan §3.2, §4.3): `mwsr[:key=val;key=val…]` sets its
-  // overrides (show, walong, wacross, ralong, racross, sfull, wmin, dering,
-  // c444, rdown, ll, flat, fc, gz, fz: MWSR_KEYS), the uniforms (tau,
-  // sharp), half=1 (the f16
+  // overrides (show, c444, rdown, ll, gz: MWSR_KEYS),
+  // the uniforms (kc, ft, kg, kr, kwc, kl, sfull: MWSR_LAW_KEYS), half=1 (the f16
   // module; the page needs f16=1), mode=up|down (default: by the scale),
   // taps=1|4|9|16 (the reduction's grid) and srgb=1 (SDR only: the input
   // read and the output written through `-srgb` views, the sampler decoding
@@ -101,7 +100,7 @@ const CELL_SETS = {
   // dpdyFine in the vote: the quad's other row, J18); `ext-mwsr` reads the
   // external texture (no pass 0), `blit+mwsr` pays the pass 0 first;
   // `tex-s1-srgb` is the bilinear floor through the same views.
-  mwsr: ["mwsr", "mwsr:dering=0", "mwsr:half=1", "blit+mwsr"],
+  mwsr: ["mwsr", "mwsr:half=1", "blit+mwsr"],
   // P3: the reduction grids and lights (the mode follows the scale), 4:4:4.
   p3: ["mwsr", "mwsr:srgb=1", "mwsr:taps=9", "mwsr:ll=2", "mwsr:c444=1", "smooth2d"],
   // Plan B (upscaler-mwsr-b.md §3): MWSR on the planes of a YUV frame.
@@ -1627,21 +1626,13 @@ async function runLabInner(p, log) {
   // (pipeline constants) and uniforms. The override defaults are the text's.
   const MWSR_KEYS = {
     show: "SHOW",
-    walong: "W_ALONG",
-    wacross: "W_ACROSS",
-    ralong: "R_ALONG",
-    racross: "R_ACROSS",
-    sfull: "S_FULL",
-    wmin: "W_MIN",
-    dering: "DERING",
     c444: "CHROMA444",
     rdown: "R_DOWN",
     ll: "LINEAR_LIGHT",
-    flat: "FLAT_TAPS",
-    fc: "FLAT_C",
     gz: "GAZE",
-    fz: "FLAT_ZONE",
   };
+  // The law's values, the uniform block's (mwsrUniforms() takes them by name).
+  const MWSR_LAW_KEYS = ["kc", "ft", "kg", "kr", "kwc", "kl", "sfull"];
   // The gaze zone's uniforms (MwsrShader's MWSR_ZONE): a cell naming one of
   // them, or gaze=, takes the GAZE text unless gz= says otherwise.
   const ZONE_KEYS = {
@@ -1650,8 +1641,8 @@ async function runLabInner(p, log) {
     zrx: "rx",
     zry: "ry",
     zring: "ring",
-    ztau: "tau",
-    zsharp: "sharp",
+    zft: "ft",
+    zboost: "boost",
   };
   const regimes = {
     soft: mwsrRegime(inW, inH, outW, outH),
@@ -1788,7 +1779,7 @@ async function runLabInner(p, log) {
       over.LINEAR_LIGHT = reg.linearLight;
     }
     for (const [k, v] of Object.entries(opts)) {
-      if (k === "tau" || k === "sharp") uni[k] = Number(v);
+      if (MWSR_LAW_KEYS.includes(k)) uni[k] = Number(v);
       else if (["map", "mapv", "ana", "cells", "q", "nb", "rot", "tree", "via"].includes(k)) continue; // mwsr-map.js
       else if (k === "gaze") {
         uni.gaze = Number(v);
@@ -1807,6 +1798,8 @@ async function runLabInner(p, log) {
     }
     if (half && !device.features.has("shader-f16"))
       throw new Error(name + ": the device has no shader-f16 (f16=1 asks for it)");
+    // the one-read text reads no R_DOWN (MwsrShader's mwsrDownConstants)
+    if (mode === "down" && taps === 1) delete over.R_DOWN;
     if (srgb) {
       if (!srgbViews || feed === "ext" || srcView !== inView)
         throw new Error(name + ": srgb=1 reads the SDR input texture only");
@@ -1965,7 +1958,7 @@ async function runLabInner(p, log) {
       let half = false;
       for (const [k, val] of Object.entries(opts)) {
         if (k === "v" || k === "c" || k === "bits") continue;
-        if (k === "tau" || k === "sharp") uni[k] = Number(val);
+        if (MWSR_LAW_KEYS.includes(k)) uni[k] = Number(val);
         else if (k === "half") half = val === "1";
         else if (k in MWSR_KEYS) over[MWSR_KEYS[k]] = Number(val);
         else throw new Error(name + ": option " + k + "?");
@@ -2195,6 +2188,10 @@ async function runLabInner(p, log) {
       passSeq.push(np);
     }
     if (flip) r.setOutputSize(outW, outH);
+    // A pipeline the renderer's device refused goes to the renderer, not to
+    // uncapturederror (WebGpuRenderer._watchPipeline): the run still lists it.
+    for (const m of r._refused ? r._refused.values() : [])
+      if (!HOOK.productErrors.includes(m)) HOOK.productErrors.push(m);
     // No frame reached its canvas: every way in refused the last one (its
     // path ends in `+lost`), or the renderer gave up (WebGpuRenderer.failed;
     // the page would move the picture to another renderer). Nothing to time

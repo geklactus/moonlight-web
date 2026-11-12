@@ -66,6 +66,13 @@ public:
     // Helpers for address iteration during polling
     QVector<NvAddress> uniqueAddresses() const;
 
+    // Whether an answer from this address may change this host only once the
+    // machine there has shown the certificate it was paired with. The address in
+    // use needs no proof. A host never paired has nothing to compare, and moves
+    // freely, unless it holds a backend's secrets: then it has no proof to offer
+    // and stays.
+    bool movesOnlyWithProof(const NvAddress& address) const;
+
     // True when this host resolves to the machine MoonlightWeb runs on (loopback
     // or one of our own interface addresses). Surfaced in toJson() so the
     // frontend can warn about streaming your own PC ("Inception" loop).
@@ -142,6 +149,9 @@ public:
 
     // — Pairing state (persisted) —
     QByteArray serverCertPem;
+    // The last HTTPS answer came from a machine without that certificate. Not
+    // persisted: the next check of the pairing says again.
+    bool certificateChanged = false;
     quint16 activeHttpsPort = 0;
 
     // — Stream backend (persisted) —

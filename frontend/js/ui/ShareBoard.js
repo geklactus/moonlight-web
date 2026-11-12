@@ -40,6 +40,7 @@
  */
 import { BackendClient } from '../api/BackendClient.js';
 import { t } from '../i18n/i18n.js';
+import { sortApps } from '../models/App.js';
 import { escapeHtml } from '../util/escapeHtml.js';
 import { Icons } from './icons.js';
 
@@ -186,7 +187,11 @@ export class ShareBoard {
             try {
                 const data = await BackendClient.getAppList(this.ctx.hostUuid);
                 this.apps = Array.isArray(data?.apps) ? data.apps : [];
+                // Preselected: the host's first app (its primary display), as
+                // before. Only the list's order follows the hosts page, so an
+                // invitation never changes target without the owner choosing.
                 if (this.appId < 0 && this.apps.length) this.appId = this.apps[0].id;
+                sortApps(this.apps);
             } catch (err) {
                 // No list is survivable: the owner cannot pick, so the board
                 // says why rather than offering an OPEN that would 404.
@@ -271,6 +276,14 @@ export class ShareBoard {
         // Every live row shows its link and PIN, so every live row needs them.
         // Only ones we have never read: they do not change under us, and asking
         // again on each poll would hand out a credential every five seconds.
+        // Unless the row was opened again since (from another of the owner's
+        // devices, between two polls): the pair we hold is then a dead one.
+        for (const s of this.slots) {
+            const held = this._secrets.get(s.slot);
+            if (held && s.opening && held.opening && held.opening !== s.opening) {
+                this._secrets.delete(s.slot);
+            }
+        }
         await Promise.all(
             this.slots
                 .filter((s) => s.state !== 'off' && !this._secrets.has(s.slot))
@@ -1092,16 +1105,17 @@ export class ShareBoard {
             const chosen = local ? this._chosenTtl(local) : TTL_CHOICES[2];
             this._pendingTtl.delete(slot);
             const target = { ttl_secs: chosen };
-            if (!this.ctx.streaming) {
-                target.host_uuid = this.ctx.hostUuid;
-                target.app_id = this.appId;
-            }
+            // The host this board is about, always: with a stream running the
+            // invitation binds to this device's stream of it.
+            if (this.ctx.hostUuid) target.host_uuid = this.ctx.hostUuid;
+            if (!this.ctx.streaming) target.app_id = this.appId;
             const data = await this._write(() => BackendClient.shareActivate(slot, target));
             this._secrets.set(slot, {
                 available: true,
                 url: data.url,
                 pin: data.pin,
                 local_only: data.local_only,
+                opening: data.opening,
             });
             this._error = '';
         } catch (err) {

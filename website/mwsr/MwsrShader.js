@@ -39,23 +39,24 @@
  *
  * Two modes (plan §4.3), chosen per frame by mwsrRegime():
  *
- * `up` — the kernel, per output pixel (plan §3.2):
- *   1. one bilinear sample C at the pixel's position in the input, its luma;
+ * `up` — the kernel, per output pixel:
+ *   1. one bilinear read at the position that gives a cubic's middle pair (the
+ *      texels around the pixel, by weights that sharpen with kc) and its luma;
  *   2. the vote: the screen derivatives of that luma, scaled to luma per input
  *      texel, decide per 2×2 quad whether the pixel sits on an edge; a flat
- *      quad returns C — one sample, a dozen operations;
- *   3. on an edge, four more bilinear samples, laid along and across the edge
- *      the derivatives measure: the along pair smooths the staircase, the
- *      across pair sharpens the ramp;
- *   4. a coherence term (a step or a ridge across, against all the variation
- *      around) doses both, so that grain, texture and compression blocks are
- *      left alone; the whole fades to C near 1:1;
- *   5. the result is bounded by the four input texels around the pixel
- *      (DERING 2, the default since J37: a line one texel wide keeps its
- *      depth, J35), or by the five samples first, then the texels (DERING 1).
- *   With CHROMA444 (4:4:4 streams, plan §4.2) the vote, the coherence and the
- *   weights are taken per channel, so that a border between two colours of one
- *   luma is seen and sharpened too.
+ *      quad keeps that one read;
+ *   3. on an edge, four more reads, the cubic's outer lobes, complete the
+ *      cubic K; two more, laid across the edge the derivatives measure, give
+ *      the detail D = K - their mean, which sharpens by kg, and its colour by
+ *      kwc: seven reads in all;
+ *   4. the result stays within the range of the middle read and the pair
+ *      across the edge, widened by kl of that range: a little overshoot, on
+ *      purpose (Bruno's eye chose it over a hard bound), and no colour below
+ *      zero on a float target. On an HDR feed kl is 0 (mwsrUniforms' `hdr`):
+ *      the margin would make highlights.
+ *   With CHROMA444 (4:4:4 streams, plan §4.2) the vote and the edge's direction
+ *   are taken from the channel with the steepest ramp, so that a border between
+ *   two colours of one luma is seen and sharpened too.
  *
  * `down` — the surface filter: a k×k grid of bilinear samples spread over the
  *   output pixel's footprint in the input (k by the scale, the grid's span
@@ -71,21 +72,31 @@
  *   LINEAR_LIGHT 1 decodes each sample by a square (2: exact sRGB, three times
  *   the cost on the AMD iGPU) and the 2×2 grid serves between ×0.5 and 1:1
  *   (J12).
- *   No vote, no sharpening: a reduction sharpens by itself.
+ *   From ×0.5 to 1:1 a light sharpening follows, which Bruno's eye took on 11
+ *   pictures of 11 (MWSR_DOWN_LAW): coarse derivatives of the read's luma vote,
+ *   a flat quad keeps the read; elsewhere a cross of 4 reads, one output pixel
+ *   away, gives the detail (the read against their mean) and the bound (their
+ *   range, widened by a margin), in linear light, the gain and the margin
+ *   falling on a strong edge by that range. Below ×0.5, and on an HDR feed
+ *   (the gain is 0: mwsrUniforms' `hdr`), no sharpening.
  *
  * HDR (plan §4.1): the renderer's `linear` feed is sRGB-encoded past 1.0
  * (1.0 = reference white); both modes are per channel, bounded by their own
- * samples and clamp nothing to 1.0, so they run on it unchanged. For a
+ * samples and clamp nothing to 1.0, so they run on it, the kernel without its
+ * margin (with it, 1000-nit text reached about 1400 nits and the colour error
+ * on text passed the plain copy's; without it every check of the lab's
+ * hdr_check.py holds, 03/11/2026; not yet seen by Bruno's eye). For a
  * reduction, though, the renderer's HDR pass 0 writes the linear light itself
  * (LINEAR_LIGHT 3): the sampler then mixes linear light, as through the sRGB
  * views of SDR, and the grids are those views' (Bruno, 26/10/2026: a filter
  * mixing the encoded values took fine contrast down by 8 to 28 %, journal J45).
  *
  * Written from scratch (plan §10.2). Ideas taken, and credited: bilinear taps
- * instead of gathers (Atyuwen's mobile EASU, Jimenez, MJP); the early out on
- * an edge vote (SGSR1, NEDI); the local min/max bound against ringing (EASU,
- * SGSR1); sharpening held by the local range (CAS, RCAS). The vote by screen
- * derivatives and the taps laid along the measured edge are this project's.
+ * instead of gathers (Atyuwen's mobile EASU, Jimenez, MJP); a cubic read as
+ * bilinear taps (Sigg and Hadwiger, GPU Gems 2); the early out on an edge vote
+ * (SGSR1, NEDI); the local min/max bound against ringing (EASU, SGSR1);
+ * sharpening held by the local range (CAS, RCAS). The vote by screen
+ * derivatives and the taps laid across the measured edge are this project's.
  * No line, polynomial or constant of FSR1, SGSR1, NIS or the gist is
  * reproduced; the constants come from the laboratory
  * (scripts/bench/scaler-lab/journal.md), the test file checks the forbidden
@@ -101,31 +112,10 @@
 export const MWSR_OVERRIDE_SPEC = Object.freeze({
     /** 1: paint the vote (white = edge quad, black = flat) instead of the picture. */
     SHOW: ['u32', 0],
-    /** Weight of each tap along the edge, at full coherence and strength. */
-    W_ALONG: ['f32', 0.15],
-    /** Weight of each tap across the edge, negated and × sharpness. */
-    W_ACROSS: ['f32', 0.3],
-    /** Distance of the along taps, input texels. */
-    R_ALONG: ['f32', 0.5],
-    /** Distance of the across taps, input texels. */
-    R_ACROSS: ['f32', 1.0],
-    /** The scale (output / input) from which the kernel is at full strength; 0 at 1:1. */
-    S_FULL: ['f32', 1.5],
-    /** The most negative weight of an across tap: the blend's divisor stays >= 1 + 2 W_MIN
-     *  (0.3 × 1.67 at sharpness 1.67; at the default sharpness 1 the cap is never reached). */
-    W_MIN: ['f32', -0.5],
-    /** The edge path's bound (the flat path keeps its taps' range): 0 the five samples of the blend; 1 the five samples, then the four input texels around the pixel (four loads); 2 the four texels alone, so that a line's pixel may pass its bilinear mix, as far as the texel (J35; the default since 23/10/2026, J37). */
-    DERING: ['u32', 2],
-    /** 1: the vote, the coherence and the weights per channel (4:4:4 streams); 0: from the luma, shared by the channels. */
+    /** 1: the vote and the edge's direction from the channel with the steepest ramp (4:4:4 streams); 0: from the luma. */
     CHROMA444: ['u32', 0],
-    /** The flat path's reconstruction: 1 the bilinear sample itself; 5 or 9 bilinear taps of a cubic (Mitchell-Netravali, B 0, C FLAT_C) over the 4×4 texels around, the four corners dropped at 5 (J33); 3 the interpolating quadratic of Dodgson over the 3×3 texels around, its corner dropped (J34). 5 is the product's default on a computer, 3 on a phone or a tablet (mwsrClassOverrides; Bruno, 24/10/2026, journal J36-J38). */
-    FLAT_TAPS: ['u32', 5],
-    /** The cubic's C, the depth of its negative lobe: 0.5 is Catmull-Rom; higher is steeper, with more ringing (bounded by the taps). */
-    FLAT_C: ['f32', 0.5],
-    /** 1: the gaze zone (plan §15.2): the vote threshold and the sharpness slide from the table's values to MWSR_ZONE's at the centre of the picture, by the pixel's place and the stream's motion (the uniform `gaze`); 0: the text has no zone. */
+    /** 1: the gaze zone (plan §15.2): the vote threshold and the sharpness slide from the law's values to MWSR_ZONE's at the centre of the picture, by the pixel's place and the stream's motion (the uniform `gaze`); 0: the text has no zone. */
     GAZE: ['u32', 0],
-    /** With GAZE 1: 1 the flat path's cubic or quadratic (FLAT_TAPS) inside the zone only, blended by its weight, the periphery keeping the bilinear sample; 0 everywhere. */
-    FLAT_ZONE: ['u32', 0],
     /** Reduction: the span of the tap grid, as a fraction of the pixel's footprint in the input (mwsrRegime() sets it by the grid). */
     R_DOWN: ['f32', 1.0],
     /** Reduction: 0 average the encoded values; 1 in gamma-2 light (square, square root); 2 in sRGB linear light (≤ 0.35 dB better, 15 pow per pixel); 3 the feed is linear light already (the HDR pass 0 wrote it), averaged as it comes and encoded by the sRGB transfer once, at the output. */
@@ -139,77 +129,134 @@ export const MWSR_OVERRIDES = Object.freeze(
 
 /**
  * The constants the product lays over the defaults by device class, under
- * the laboratory's own overrides (Bruno's decisions of 24/10/2026, journal
- * J36-J38): a computer keeps the defaults, the flat path's Catmull-Rom of
- * five taps; a phone or a tablet takes the quadratic of three (FLAT_TAPS 3),
- * 9 to 13 % faster there (iPhone 13 Pro, realme Note 60) for a hundredth of
- * SSIM. The renderers call it once, with BrowserDetect's IS_HANDHELD.
+ * the laboratory's own overrides. None: one kernel on every device (Bruno,
+ * 03/11/2026). The renderers call it once, with BrowserDetect's IS_HANDHELD.
  * @param {{handheld: boolean}} device a phone or a tablet, not a TV
- * @returns {Object<string, number>} name → value, empty on a computer
+ * @returns {Object<string, number>} name → value
  */
-export function mwsrClassOverrides({ handheld }) {
-    return handheld ? { FLAT_TAPS: 3 } : {};
+export function mwsrClassOverrides(device) {
+    return {};
 }
 
 /** Constants shared by the WGSL text and, later, its GLSL twin. */
 export const MWSR_CONSTANTS = Object.freeze({
     /** Luma weights: Rec. 709 rounded to powers of two, two multiply-adds. */
     LUMA: [0.25, 0.625, 0.125],
-    /** Guards the divisions by a variation of luma. */
-    EPS: 1e-5,
+    /** The scale (output / input) from which the kernel's sharpening is whole; none at 1:1. The law's first measured scale. */
+    S_FULL: 1.07,
 });
 
-/** The per-draw values of the uniform block: the vote threshold (luma per
- *  input texel) and the sharpness (× W_ACROSS; 1.85 for every device since
- *  24/10/2026, Bruno's eye on his iPhone at ×1.33, J37: text near FSR1's,
- *  no overshoot; 2.0 before, from the lab's J31). That value holds up to
- *  ×1.33: mwsrUniforms() takes mwsrSharpness(scale) by default, which keeps
- *  the across weight of ×1.33 from there up (Bruno's yes, 24/10/2026, J40),
- *  then ramps to MWSR_SHARP_X2 at ×2 (his choice of 29/10/2026). */
-export const MWSR_UNIFORMS = Object.freeze({ tau: 0.05, sharp: 1.85 });
+// mwsr-law: the coefficients, written by the lab's fit (begin)
+const MWSR_LAW_CURVES = {
+    kc: [0.6353583202388096, 0.021845681633595574, 0.12781268100437676],
+    kg: [-0.1288413863403059, 2.5844683855070816, -1.260092021482419],
+    kr: [1.0071546009267338, -1.0209066704914191, 0.5699605831985769],
+    kl: [0.33416994543071277, -0.2962022126856069, 0.08628272130287401],
+};
+// mwsr-law: the coefficients, written by the lab's fit (end)
 
-/** The scale whose across weight the sharpness law holds from there up:
- *  ×1.33, the 1080p → 1440p step Bruno's eye set the sharpness at (J37). */
-export const MWSR_SHARP_REF_SCALE = 4 / 3;
-
-/** The sharpness from ×2 up, and the scale its ramp starts from: Bruno's
- *  choice of 29/10/2026 (plan B §8). At ×2 holding the across weight of
- *  ×1.33 alone gives 1.23, and 1.5 takes text +0.35 point of SSIM for 0 A.D.
- *  −0.08 and the étalon −0.41, the games' edges as sharp as FSR1's; at ×1.5
- *  and ×1.75 every picture wants 1.23 or less, hence a ramp from ×1.75. */
-export const MWSR_SHARP_X2 = Object.freeze({ sharp: 1.5, from: 1.75 });
+// What the native host's zones count their drops against: the sharpness they
+// were tuned under, a curve in ln(s) from ×1.15 to ×3 (the `map` text's zref).
+const MWSR_ZONE_REF = [-0.2384, 10.3176, -26.8143, 28.681, -10.6546];
 
 /**
- * The sharpness law by the scale (plan §12, journals J39 and J40), the
- * product's since Bruno's yes of 24/10/2026 (mwsrUniforms() takes it when no
- * sharpness is named; the comparator starts from it): the kernel's strength ramps from
- * 0 at 1:1 to 1 at S_FULL, so the across weight sharp × strength that the
- * eye validated at ×1.33 (1.85 × 2/3 = 1.23) grows to 1.85 at ×1.5 and
- * stays there at ×2, where the same picture pins to the texels and smears
- * (J39: at ×2 the sharpness 1.25 takes the étalon's centre from 28.8 to
- * 31.0 dB and its FLIP from 0.067 to 0.056, text's FLIP to FSR1's). The law
- * holds that weight from the reference scale up: 1.85 up to ×1.33, 1.542 at
- * ×1.4, 1.23 from ×1.5. From MWSR_SHARP_X2.from it ramps to MWSR_SHARP_X2's
- * sharpness at ×2 and holds it above (1.23 at ×1.75, 1.37 at ×1.875, 1.5
- * from ×2), where 1.23 cost text 0.66 point of SSIM (plan B §8).
- * @param {number} scale output / input, the smaller axis
- * @param {{sharp?: number, ref?: number, x2?: {sharp: number, from: number} | null}} [opts]
- *   the sharpness up to the reference scale (MWSR_UNIFORMS.sharp), that
- *   scale (MWSR_SHARP_REF_SCALE) and the ×2 end (MWSR_SHARP_X2; null: none);
- *   the result is never above sharp
- * @returns {number} the per-draw sharpness at that scale
+ * The law of the kernel's per-draw values (Bruno, 03/11/2026), a curve over
+ * the size of the stream on the size of the surface it is drawn on,
+ *
+ *     value = c0 + c1 x + c2 x²     x = ln(s)     s: the scale, output / input, the smaller axis
+ *
+ * fitted on the lab's searches, from ×1.07 to ×4, and measured back: LPIPS first,
+ * then VMAF NEG, on a cubic's kc, the sharpness kg, the across reads' distance
+ * kr and the bound's margin kl. Bruno's eye then set the sharpness (kg and kl)
+ * above that: the force, 1 up to ×1.33, 1.35 from ×2 (two comparisons of six
+ * pictures each), a straight line in ln(s) between them, which his eye took at
+ * ×1.5 on six pictures of six. Beyond ×2 it stays there: nothing higher was seen.
+ * Outside the measured range, s is held at its ends.
  */
-export function mwsrSharpness(
-    scale,
-    { sharp = MWSR_UNIFORMS.sharp, ref = MWSR_SHARP_REF_SCALE, x2 = MWSR_SHARP_X2 } = {},
-) {
-    const strength = (s) => Math.min(Math.max((s - 1) / (MWSR_OVERRIDES.S_FULL - 1), 0), 1);
-    const at = strength(scale);
-    if (at <= 0) return sharp;
-    const held = sharp * Math.min(1, strength(ref) / at);
-    if (!x2) return held;
-    const t = Math.min(Math.max((scale - x2.from) / (2 - x2.from), 0), 1);
-    return Math.min(sharp, held + t * (x2.sharp - held));
+export const MWSR_LAW = Object.freeze({
+    /** The scales measured: the law holds its ends beyond. */
+    scale: Object.freeze([1.07, 4]),
+    /** The force of the sharpness, from the scale `from` (force 1) to `to` (force `top`). */
+    force: Object.freeze({ from: 4 / 3, to: 2, top: 1.35 }),
+    /** The vote's threshold, in luma per input texel, and the colour's sharpness, at every scale. */
+    ft: 0.005,
+    kwc: 0.1,
+    curves: Object.freeze(MWSR_LAW_CURVES),
+});
+
+/**
+ * The law's values for an input of inW×inH drawn at outW×outH.
+ * @param {number} inW
+ * @param {number} inH
+ * @param {number} outW
+ * @param {number} outH
+ * @returns {{kc: number, ft: number, kg: number, kr: number, kwc: number, kl: number}}
+ */
+export function mwsrLaw(inW, inH, outW, outH) {
+    const [lo, hi] = MWSR_LAW.scale;
+    const s = Math.min(Math.max(Math.min(outW / inW, outH / inH), lo), hi);
+    const x = Math.log(s);
+    const value = ([c0, c1, c2]) => c0 + x * (c1 + x * c2);
+    const { from, to, top } = MWSR_LAW.force;
+    const force =
+        1 + (top - 1) * Math.min(Math.max(Math.log(s / from) / Math.log(to / from), 0), 1);
+    const { kc, kg, kr, kl } = MWSR_LAW.curves;
+    return {
+        kc: value(kc),
+        ft: MWSR_LAW.ft,
+        kg: value(kg) * force,
+        kr: value(kr),
+        kwc: MWSR_LAW.kwc,
+        kl: value(kl) * force,
+    };
+}
+
+/**
+ * The reduction's sharpening (Bruno, 03/11/2026): the setting his eye took on
+ * 11 pictures of 11, at ×0.75, ×2/3 and ×0.5, over a sharper one, a stronger
+ * one and FSR1. A straight line in s joins ×0.5 to ×2/3, held above; the gain
+ * falls to none between `fade` and 1:1, which the renderer copies. His eye saw
+ * those three scales through the sRGB views, not the values in between.
+ *
+ *     t = smoothstep(range[0], range[1], the cross's range of square-root luma)
+ *     R = c + mix(gain, edgeGain, t) (c - the cross's mean)
+ *     R is held within the range of the read and the cross, widened by mix(margin, edgeMargin, t) of it
+ *
+ * Each pair: at ×0.5, then at ×2/3 and above.
+ */
+export const MWSR_DOWN_LAW = Object.freeze({
+    /** The scales of each pair; below the first, no sharpening. */
+    scale: Object.freeze([0.5, 2 / 3]),
+    gain: Object.freeze([0.25, 0.45]),
+    edgeGain: Object.freeze([0.05, 0.2]),
+    margin: Object.freeze([0.1, 0.25]),
+    edgeMargin: Object.freeze([0, 0.1]),
+    /** From this scale to 1:1, both gains fall to none. */
+    fade: 0.93,
+    /** The vote's threshold, in square-root luma per output pixel. */
+    ft: 0.003,
+    /** Where a local range of square-root luma is a strong edge: from none to whole. */
+    range: Object.freeze([0.2, 0.5]),
+});
+
+/**
+ * The reduction's values for an input of inW×inH drawn at outW×outH, under the
+ * names of the uniform block's places that hold them: ft, kg the gain, kwc the
+ * gain at a strong edge, kl the margin, zref the margin at a strong edge.
+ * @param {number} inW
+ * @param {number} inH
+ * @param {number} outW
+ * @param {number} outH
+ * @returns {{ft: number, kg: number, kwc: number, kl: number, zref: number}}
+ */
+export function mwsrDownLaw(inW, inH, outW, outH) {
+    const { scale, gain, edgeGain, margin, edgeMargin, fade, ft } = MWSR_DOWN_LAW;
+    const s = Math.min(outW / inW, outH / inH);
+    if (s < scale[0]) return { ft, kg: 0, kwc: 0, kl: 0, zref: 0 };
+    const t = Math.min((s - scale[0]) / (scale[1] - scale[0]), 1);
+    const at = ([a, b]) => a + (b - a) * t;
+    const f = Math.min(Math.max((1 - s) / (1 - fade), 0), 1);
+    return { ft, kg: at(gain) * f, kwc: at(edgeGain) * f, kl: at(margin), zref: at(edgeMargin) };
 }
 
 /**
@@ -218,12 +265,12 @@ export function mwsrSharpness(
  * orange ring around it at about 70 % of the width, the rest left readable):
  * the centre and the half-axes of the green ellipse as fractions of the
  * picture, the orange ring's width as a fraction of those half-axes (the
- * weight falls by a smoothstep from the ellipse to 1 + ring times it), and
- * the vote threshold and the sharpness at the centre, where the eye is — the
- * table's values (MWSR_UNIFORMS) stay the border's. Read by the `up` text when
- * its GAZE constant is 1, weighted per draw by the stream's motion (the
- * uniform `gaze`, 0 on a still picture: one quality everywhere). Values of
- * the lab, before Bruno's eye on his iPhone.
+ * weight falls by a smoothstep from the ellipse to 1 + ring times it), the
+ * vote threshold at the centre and its sharpness as a multiple of the law's,
+ * whose values stay the border's. Read by the `up` text when its GAZE constant
+ * is 1, weighted per draw by the stream's motion (the uniform `gaze`, 0 on a
+ * still picture: one quality everywhere). Off by default, a lab key: these
+ * values were never seen on this kernel, by an eye or by a score.
  */
 export const MWSR_ZONE = Object.freeze({
     cx: 0.5,
@@ -231,13 +278,16 @@ export const MWSR_ZONE = Object.freeze({
     rx: 0.2,
     ry: 0.45,
     ring: 0.75,
-    tau: 0.02,
-    sharp: 2.5,
+    ft: 0.005,
+    boost: 1.5,
 });
 
-/** Number of f32 in the uniform block: texel.xy, scale.xy, tau, sharp, gaze,
- *  pad, then the zone: centre.xy, half-axes.xy, ring, tau, sharp, pad. */
-export const MWSR_UNIFORM_FLOATS = 16;
+/** Number of f32 in the uniform block: texel.xy, scale.xy, dims.xy (the input's
+ *  size), across.xy (the across reads' distance, as a share of the input), kc,
+ *  ft, kg, kwc, what the gaze zone reads (centre.xy, half-axes.xy, ring, its
+ *  threshold, its kg, its weight), kl, what the host's zones count against, and
+ *  a pad to the block's size. */
+export const MWSR_UNIFORM_FLOATS = 24;
 
 /**
  * The reduction's tap grids when the light is software's (LINEAR_LIGHT 1 or
@@ -289,13 +339,28 @@ export const MWSR_DOWN_TAPS_SRGB = Object.freeze([
 export function mwsrRegime(inW, inH, outW, outH, { srgb = false, linear = false } = {}) {
     if (inW === outW && inH === outH) return { mode: 'copy', taps: 0, rDown: 0, linearLight: 0 };
     const s = Math.min(outW / inW, outH / inH);
-    if (s >= 1) return { mode: 'up', taps: 5, rDown: 0, linearLight: 0 };
+    if (s >= 1) return { mode: 'up', taps: 0, rDown: 0, linearLight: 0 };
     const table = srgb || linear ? MWSR_DOWN_TAPS_SRGB : MWSR_DOWN_TAPS;
     const linearLight = srgb ? 0 : linear ? 3 : 1;
     for (const [min, taps, rDown] of table)
         if (s >= min) return { mode: 'down', taps, rDown, linearLight };
     const [, taps, rDown] = table[table.length - 1];
     return { mode: 'down', taps, rDown, linearLight };
+}
+
+/**
+ * The pipeline constants of a reduction's regime (mwsrRegime), for
+ * `fragment.constants`. The one-read text has no grid, so it reads no R_DOWN,
+ * and it must not be given one: WebKit refuses a pipeline a constant of which
+ * its text does not read ("Fragment library could not be created", iOS 26.5,
+ * 04/11/2026), and the frame then never reaches the canvas.
+ * @param {{taps: number, rDown: number, linearLight: number}} reg
+ * @returns {{R_DOWN?: number, LINEAR_LIGHT: number}}
+ */
+export function mwsrDownConstants(reg) {
+    return reg.taps === 1
+        ? { LINEAR_LIGHT: reg.linearLight }
+        : { R_DOWN: reg.rDown, LINEAR_LIGHT: reg.linearLight };
 }
 
 /**
@@ -313,7 +378,7 @@ export function mwsrRegimes({ srgb = false, linear = false } = {}) {
     const table = srgb ? MWSR_DOWN_TAPS_SRGB : MWSR_DOWN_TAPS;
     const linearLight = srgb ? 0 : 1;
     return [
-        { mode: 'up', taps: 5, rDown: 0, linearLight: 0 },
+        { mode: 'up', taps: 0, rDown: 0, linearLight: 0 },
         ...table.map(([, taps, rDown]) => ({ mode: 'down', taps, rDown, linearLight })),
         ...(linear && !srgb
             ? MWSR_DOWN_TAPS_SRGB.map(([, taps, rDown]) => ({
@@ -337,42 +402,69 @@ export function mwsrRegimeKey(reg) {
     return reg.mode === 'up' ? 'up' : 'down' + reg.taps + (reg.linearLight === 3 ? 'lin' : '');
 }
 
+function zoneRef(sx, sy) {
+    const x = Math.log(Math.min(Math.max(Math.min(sx, sy), 1.15), 3));
+    const [c0, c1, c2, c3, c4] = MWSR_ZONE_REF;
+    return Math.max(c0 + x * (c1 + x * (c2 + x * (c3 + x * c4))), 1e-3);
+}
+
 /**
  * The uniform block for an input of inW×inH drawn at outW×outH.
  * @param {number} inW
  * @param {number} inH
  * @param {number} outW
  * @param {number} outH
- * @param {{tau?: number, sharp?: number, gaze?: number, zone?: Object}} [u]
- *   `sharp`: mwsrSharpness at this scale when absent (J40);
- *   `gaze`: the gaze zone's weight, 0 (none, the default) to 1, read by a
- *   text built with GAZE 1 only; `zone`: its values over MWSR_ZONE's.
+ * @param {{kc?: number, ft?: number, kg?: number, kr?: number, kwc?: number, kl?: number,
+ *           sfull?: number, gaze?: number, zone?: Object, zones?: boolean,
+ *           hdr?: boolean}} [u]
+ *   a value not named comes from mwsrLaw at these sizes, from mwsrDownLaw for
+ *   a reduction, whose values take the same places; `sfull`: over
+ *   MWSR_CONSTANTS.S_FULL; `gaze`: the gaze zone's weight, 0 (none, the default)
+ *   to 1, read by a text built with GAZE 1 only; `zone`: its values over
+ *   MWSR_ZONE's; `zones`: the frame is read with the host's zones; `hdr`: the
+ *   feed holds values past 1.0, the bound takes no margin and a reduction does
+ *   not sharpen.
  * @returns {Float32Array}
  */
 export function mwsrUniforms(inW, inH, outW, outH, u = {}) {
-    const tau = u.tau ?? MWSR_UNIFORMS.tau;
-    // the sharpness law by the scale unless the caller names one (J40)
-    const sharp = u.sharp ?? mwsrSharpness(Math.min(outW / inW, outH / inH));
+    const law = mwsrLaw(inW, inH, outW, outH);
     const gaze = Math.min(Math.max(u.gaze ?? 0, 0), 1);
     const z = { ...MWSR_ZONE, ...(u.zone || {}) };
     // a ring of no width would put the smoothstep's two edges together
     z.ring = Math.max(z.ring, 1e-3);
+    const kr = u.kr ?? law.kr;
+    // the sharpening's strength: none at 1:1 (the renderer copies the frame there), whole from S_FULL on
+    const sfull = u.sfull ?? MWSR_CONSTANTS.S_FULL;
+    const s = Math.min(outW / inW, outH / inH);
+    const strength = Math.min(Math.max((s - 1) / (sfull - 1), 0), 1);
+    // a reduction's own values, in the same places: its text reads them under these names
+    const down = s < 1 ? mwsrDownLaw(inW, inH, outW, outH) : null;
+    const kg = down ? (u.kg ?? (u.hdr ? 0 : down.kg)) : (u.kg ?? law.kg) * strength;
     return new Float32Array([
         1 / inW,
         1 / inH,
         outW / inW,
         outH / inH,
-        tau,
-        sharp,
-        gaze,
-        0,
+        inW,
+        inH,
+        kr / inW,
+        kr / inH,
+        u.kc ?? law.kc,
+        // the edge's direction divides by the slope's length: a vote of 0 would let a slope of 0 through
+        Math.max(u.ft ?? (down ? down.ft : law.ft), 1e-6),
+        kg,
+        down ? (u.kwc ?? (u.hdr ? 0 : down.kwc)) : (u.kwc ?? law.kwc) * strength,
         z.cx,
         z.cy,
         z.rx,
         z.ry,
         z.ring,
-        z.tau,
-        z.sharp,
+        Math.max(z.ft, 1e-6),
+        kg * z.boost,
+        gaze,
+        u.kl ?? (down ? down.kl : u.hdr ? 0 : law.kl),
+        u.zones ? zoneRef(outW / inW, outH / inH) : down ? down.zref : 1,
+        0,
         0,
     ]);
 }
@@ -388,18 +480,12 @@ const FEEDS = {
         decl: '@group(0) @binding(1) var tex : texture_2d<f32>;',
         sample: `fn S(uv : vec2f) -> vec3f {
     return textureSampleLevel(tex, samp, uv, 0.0).rgb;
-}
-fn L(c : vec2i) -> vec3f {
-    return textureLoad(tex, c, 0).rgb;
 }`,
     },
     ext: {
         decl: '@group(0) @binding(1) var tex : texture_external;',
         sample: `fn S(uv : vec2f) -> vec3f {
     return textureSampleBaseClampToEdge(tex, samp, uv).rgb;
-}
-fn L(c : vec2i) -> vec3f {
-    return textureLoad(tex, c).rgb;
 }`,
     },
 };
@@ -418,8 +504,8 @@ function preamble(feed, half, map = false) {
     if (!f) throw new Error('mwsr: feed ' + feed + '?');
     const prelude = half ? 'enable f16;\n\n' : '';
     const aliases = half
-        ? 'alias hf = f16;\nalias h3 = vec3<f16>;\nconst EPS_H : hf = 0.001h;'
-        : 'alias hf = f32;\nalias h3 = vec3<f32>;\nconst EPS_H : hf = 0.00001;';
+        ? 'alias hf = f16;\nalias h3 = vec3<f16>;'
+        : 'alias hf = f32;\nalias h3 = vec3<f32>;';
     const overrides = Object.entries(MWSR_OVERRIDE_SPEC)
         .map(([k, [t, v]]) => `override ${k} : ${t} = ${wgslNumber(t, v)};`)
         .join('\n');
@@ -441,15 +527,21 @@ fn vs(@builtin(vertex_index) vid : u32) -> VSOut {
 struct U {
     texel : vec2f,
     scale : vec2f,
-    tau : f32,
-    sharp : f32,
-    gaze : f32,
-    pad : f32,
+    dims : vec2f,
+    across : vec2f,
+    kc : f32,
+    ft : f32,
+    kg : f32,
+    kwc : f32,
     zc : vec2f,
     zr : vec2f,
     zring : f32,
-    ztau : f32,
-    zsharp : f32,
+    zft : f32,
+    zkg : f32,
+    gaze : f32,
+    kl : f32,
+    zref : f32,
+    pad1 : f32,
     pad2 : f32,
 };
 
@@ -464,49 +556,15 @@ ${aliases}
 ${overrides}
 
 const LUMA : vec3f = vec3f(${wgslNumber('f32', lr)}, ${wgslNumber('f32', lg)}, ${wgslNumber('f32', lb)});
-
-fn luma(c : vec3f) -> f32 {
-    return dot(c, LUMA);
-}
-
-fn lumah(c : h3) -> hf {
-    return dot(c, h3(LUMA));
-}
 `;
 }
 
-// The `up` fragment stage: the kernel of plan §3.2.
+// The `up` fragment stage: the kernel of the file's head.
 const UP_FS = `
-// Five samples blended in the frame of an edge: the centre, a pair along it
-// (weight wT each, smoothing) and a pair across it (weight wX each, negative:
-// sharpening), per channel, the result bounded by the five (DERING 0, 1).
-fn blend(C : h3, T1 : h3, T2 : h3, X1 : h3, X2 : h3, wT : h3, wX : h3) -> h3 {
-    let R = (C + wT * (T1 + T2) + wX * (X1 + X2)) / (1.0 + 2.0 * (wT + wX));
-    if (DERING == 2u) {
-        // The texels alone bound it (below): on a line one texel wide, the
-        // centre sample is the extremum of the five, and this bound would pin
-        // the pixel at its bilinear mix, paler than the line.
-        return R;
-    }
-    let lo = min(min(C, T1), min(T2, min(X1, X2)));
-    let hi = max(max(C, T1), max(T2, max(X1, X2)));
-    return clamp(R, lo, hi);
-}
-
-// A step (|X2 - X1|) or a ridge (|X1 + X2 - 2C|) across the edge, against
-// all the variation around: 1 on a clean edge or line, near 0 on texture,
-// grain and compression blocks.
-fn coherence(c : hf, t1 : hf, t2 : hf, x1 : hf, x2 : hf) -> hf {
-    let step = abs(x2 - x1);
-    let ridge = abs(x1 + x2 - 2.0 * c);
-    let variation = abs(x2 - c) + abs(c - x1) + abs(t2 - c) + abs(c - t1) + EPS_H;
-    return max(step, ridge) / variation;
-}
-
 // The gaze zone's weight at a pixel (GAZE 1, plan §15.2): 1 inside the
 // ellipse of centre u.zc and half-axes u.zr, falling by a smoothstep over the
 // ring to 0 outside, times the stream's motion u.gaze — 0 on a still
-// picture, where the table rules the whole screen.
+// picture, where the law rules the whole screen.
 fn gazeWeight(uv : vec2f) -> f32 {
     if (GAZE != 1u) {
         return 0.0;
@@ -515,179 +573,98 @@ fn gazeWeight(uv : vec2f) -> f32 {
     return (1.0 - smoothstep(1.0, 1.0 + u.zring, d)) * u.gaze;
 }
 
-// The flat path's picture: the bilinear sample C, or (FLAT_TAPS 5 or 9) the
-// cubic of Mitchell and Netravali with B 0 and C FLAT_C (0.5: Catmull-Rom)
-// over the 4×4 texels around the position, read as the bilinear samples the
-// GPU weighs for free: on each axis the middle two texels by one sample at
-// their weighted midpoint, the outer two by one sample each — nine samples,
-// or five without the four corners, whose weights are the smallest, the
-// rest renormalised. Or (FLAT_TAPS 3) the interpolating quadratic of Dodgson
-// (1997) over the 3×3 texels around: on each axis the nearest texel and its
-// neighbour on the sample's side by one sample at their weighted midpoint,
-// the far one, of negative weight, by one sample — three samples without
-// the corner (J34). Bounded by the samples themselves, as the edge path is.
-// Inside the gaze zone only when FLAT_ZONE asks, blended by its weight zg.
-fn flatPath(uv : vec2f, C : vec3f, zg : f32) -> vec3f {
-    if (FLAT_TAPS != 3u && FLAT_TAPS != 5u && FLAT_TAPS != 9u) {
-        return C;
-    }
-    if (GAZE == 1u && FLAT_ZONE == 1u && zg <= 0.0) {
-        return C;
-    }
-    let sp = uv / u.texel;
-    var R : vec3f;
-    if (FLAT_TAPS == 3u) {
-        let tn = floor(sp) + 0.5;
-        let h = sp - tn;
-        let s = select(vec2f(-1.0), vec2f(1.0), h >= vec2f(0.0));
-        let ah = abs(h);
-        let wf = ah * ah - 0.5 * ah;
-        let wm = 1.0 - wf;
-        let wn = ah * ah + 0.5 * ah;
-        let pm = (tn + s * wn / wm) * u.texel;
-        let pf = (tn - s) * u.texel;
-        let sm = S(pm);
-        let sfx = S(vec2f(pf.x, pm.y));
-        let sfy = S(vec2f(pm.x, pf.y));
-        let acc = sm * (wm.x * wm.y) + sfx * (wf.x * wm.y) + sfy * (wm.x * wf.y);
-        let norm = wm.x * wm.y + wf.x * wm.y + wm.x * wf.y;
-        let lo = min(sm, min(sfx, sfy));
-        let hi = max(sm, max(sfx, sfy));
-        R = clamp(acc / norm, lo, hi);
-    } else {
-        let tc = floor(sp - 0.5) + 0.5;
-        let f = sp - tc;
-        let c = FLAT_C;
-        let w0 = -c * f * (1.0 - f) * (1.0 - f);
-        let w1 = (2.0 - c) * f * f * f - (3.0 - c) * f * f + 1.0;
-        let w3 = -c * (1.0 - f) * f * f;
-        let w2 = 1.0 - w0 - w1 - w3;
-        let w12 = w1 + w2;
-        let p0 = (tc - 1.0) * u.texel;
-        let p12 = (tc + w2 / w12) * u.texel;
-        let p3 = (tc + 2.0) * u.texel;
-        let s12 = S(p12);
-        let s02 = S(vec2f(p0.x, p12.y));
-        let s32 = S(vec2f(p3.x, p12.y));
-        let s20 = S(vec2f(p12.x, p0.y));
-        let s23 = S(vec2f(p12.x, p3.y));
-        var acc = s12 * (w12.x * w12.y) + s02 * (w0.x * w12.y) + s32 * (w3.x * w12.y)
-            + s20 * (w12.x * w0.y) + s23 * (w12.x * w3.y);
-        var norm = w12.x * w12.y + w0.x * w12.y + w3.x * w12.y + w12.x * w0.y + w12.x * w3.y;
-        var lo = min(min(s12, s02), min(s32, min(s20, s23)));
-        var hi = max(max(s12, s02), max(s32, max(s20, s23)));
-        if (FLAT_TAPS == 9u) {
-            let s00 = S(p0);
-            let s30 = S(vec2f(p3.x, p0.y));
-            let s03 = S(vec2f(p0.x, p3.y));
-            let s33 = S(p3);
-            acc += s00 * (w0.x * w0.y) + s30 * (w3.x * w0.y) + s03 * (w0.x * w3.y) + s33 * (w3.x * w3.y);
-            norm += w0.x * w0.y + w3.x * w0.y + w0.x * w3.y + w3.x * w3.y;
-            lo = min(lo, min(min(s00, s30), min(s03, s33)));
-            hi = max(hi, max(max(s00, s30), max(s03, s33)));
-        }
-        R = clamp(acc / norm, lo, hi);
-    }
-    if (GAZE == 1u && FLAT_ZONE == 1u) {
-        return mix(C, R, zg);
-    }
-    return R;
-}
-
-// The exact bound: the four input texels around the pixel, the footprint of
-// its bilinear sample (DERING 1 and 2).
-fn texelBound(uv : vec2f, R : vec3f) -> vec3f {
-    let dims = vec2i(textureDimensions(tex));
-    let pt = uv * vec2f(dims) - 0.5;
-    let i0 = clamp(vec2i(floor(pt)), vec2i(0), dims - vec2i(1));
-    let i1 = min(i0 + vec2i(1), dims - vec2i(1));
-    let q00 = L(i0);
-    let q10 = L(vec2i(i1.x, i0.y));
-    let q01 = L(vec2i(i0.x, i1.y));
-    let q11 = L(i1);
-    return clamp(R, min(min(q00, q10), min(q01, q11)), max(max(q00, q10), max(q01, q11)));
-}
-
 @fragment
 fn fs(in : VSOut) -> @location(0) vec4f {
     let uv = in.uv;
-    let C = S(uv);
-    let lC = luma(C);
-    // The gaze zone's weight, 0 without one: the vote threshold and, on the
-    // edge path, the sharpness slide from the table's values to the centre's.
+    // The cubic of kc around the pixel, its middle pair on each axis read as one
+    // bilinear sample: the four texels around, by one read.
+    let sp = uv * u.dims;
+    let f0 = floor(sp - 0.5);
+    let t = sp - 0.5 - f0;
+    let s = 1.0 - t;
+    let ku = u.kc * t * s;
+    let w12 = 1.0 + ku;
+    let p12 = (f0 + 0.5 + (t * t * (3.0 - 2.0 * t) + ku * s) / w12) * u.texel;
+    let rM = S(p12);
+    // The gaze zone's weight, 0 without one: the vote threshold and, on an
+    // edge, the sharpness slide from the law's values to the centre's.
     let zg = gazeWeight(uv);
-    let tau = mix(u.tau, u.ztau, zg);
-    // The vote: the screen derivatives of the bilinear sample, scaled to a
-    // change per input texel; coarse, so the whole quad takes the same branch.
-    // From the luma, or (CHROMA444) from the channel with the steepest ramp,
-    // so that a border between two colours of one luma is an edge too.
-    let dx = dpdxCoarse(C) * u.scale.x;
-    let dy = dpdyCoarse(C) * u.scale.y;
-    let m = abs(dx) + abs(dy);
-    let rg = m.g > m.r;
-    let b = m.b > max(m.r, m.g);
-    let c444 = CHROMA444 == 1u;
-    let gx = select(dot(dx, LUMA), select(select(dx.r, dx.g, rg), dx.b, b), c444);
-    let gy = select(dot(dy, LUMA), select(select(dy.r, dy.g, rg), dy.b, b), c444);
-    let flat = select(abs(gx) + abs(gy), max(m.r, max(m.g, m.b)), c444) < tau;
+    var ft = u.ft;
+    if (GAZE == 1u) {
+        ft = mix(u.ft, u.zft, zg);
+    }
+    // The vote: the screen derivatives of that read, scaled to a change per
+    // input texel; coarse, so the whole quad takes the same branch. From the
+    // luma, or (CHROMA444) from the channel with the steepest ramp, so that a
+    // border between two colours of one luma is an edge too.
+    var gM : vec2f;
+    var flat : bool;
+    if (CHROMA444 == 1u) {
+        let dx = dpdxCoarse(rM) * u.scale.x;
+        let dy = dpdyCoarse(rM) * u.scale.y;
+        let m = abs(dx) + abs(dy);
+        let rg = m.g > m.r;
+        let b = m.b > max(m.r, m.g);
+        gM = vec2f(select(select(dx.r, dx.g, rg), dx.b, b), select(select(dy.r, dy.g, rg), dy.b, b));
+        flat = max(m.r, max(m.g, m.b)) < ft;
+    } else {
+        let lM = dot(rM, LUMA);
+        gM = vec2f(dpdxCoarse(lM), dpdyCoarse(lM)) * u.scale;
+        flat = abs(gM.x) + abs(gM.y) < ft;
+    }
     if (SHOW == 1u) {
         return vec4f(vec3f(select(1.0, 0.0, flat)), 1.0);
     }
     if (SHOW == 2u) {
         return vec4f(vec3f(zg), 1.0);
     }
-    // Strength: none at 1:1 (the renderer copies the frame there), full from
-    // S_FULL on.
-    let smin = min(u.scale.x, u.scale.y);
-    let strength = clamp((smin - 1.0) / (S_FULL - 1.0), 0.0, 1.0);
     if (flat) {
-        return vec4f(flatPath(uv, C, zg), 1.0);
+        return vec4f(rM, 1.0);
     }
-    // The normal of the edge the derivatives measure, and the taps along and
-    // across it.
-    let n = vec2f(gx, gy) * inverseSqrt(max(gx * gx + gy * gy, 1e-12));
-    let dt = vec2f(-n.y, n.x) * u.texel * R_ALONG;
-    let dn = n * u.texel * R_ACROSS;
+    // On an edge: the cubic's outer lobes, one read per side.
+    let p0 = (f0 - 0.5) * u.texel;
+    let p3 = (f0 + 2.5) * u.texel;
+    let rT = S(vec2f(p12.x, p0.y));
+    let rL = S(vec2f(p0.x, p12.y));
+    let rR = S(vec2f(p3.x, p12.y));
+    let rB = S(vec2f(p12.x, p3.y));
+    // The two reads across the edge, along the normal the derivatives measure.
+    let dn = gM * inverseSqrt(dot(gM, gM)) * u.across;
+    let ra = S(uv - dn);
+    let rb = S(uv + dn);
+    var kg = u.kg;
+    if (GAZE == 1u) {
+        kg = mix(u.kg, u.zkg, zg);
+    }
+    var kw = u.kwc;
     // From here the arithmetic is hf (f32, or f16 when the module says so).
-    let Ch = h3(C);
-    let T1 = h3(S(uv - dt));
-    let T2 = h3(S(uv + dt));
-    let X1 = h3(S(uv - dn));
-    let X2 = h3(S(uv + dn));
-    let lCh = hf(lC);
-    let lT1 = lumah(T1);
-    let lT2 = lumah(T2);
-    let lX1 = lumah(X1);
-    let lX2 = lumah(X2);
-    var a : h3;
-    if (CHROMA444 == 1u) {
-        a = h3(coherence(Ch.r, T1.r, T2.r, X1.r, X2.r),
-               coherence(Ch.g, T1.g, T2.g, X1.g, X2.g),
-               coherence(Ch.b, T1.b, T2.b, X1.b, X2.b)) * hf(strength);
-    } else {
-        a = h3(coherence(lCh, lT1, lT2, lX1, lX2) * hf(strength));
-    }
-    let wT = hf(W_ALONG) * a;
-    let sharp = mix(u.sharp, u.zsharp, zg);
-    let wX = max(-hf(W_ACROSS) * hf(sharp) * a, h3(hf(W_MIN)));
-    var R = vec3f(blend(Ch, T1, T2, X1, X2, wT, wX));
-    if (DERING != 0u) {
-        R = texelBound(uv, R);
-    }
-    return vec4f(R, 1.0);
+    let hM = h3(rM);
+    let hA = h3(ra);
+    let hB = h3(rb);
+    let hu = vec2<hf>(ku);
+    let hs = vec2<hf>(s);
+    let ht = vec2<hf>(t);
+    let h12 = vec2<hf>(w12);
+    let K = (h12.x * (h12.y * hM - hu.y * (hs.y * h3(rT) + ht.y * h3(rB))) - h12.y * hu.x * (hs.x * h3(rL) + ht.x * h3(rR))) / (hf(1.0) - hu.x * hu.y);
+    let D = K - hf(0.5) * (hA + hB);
+    let R = K + hf(kg) * D + hf(kw) * (D - h3(dot(D, h3(LUMA))));
+    let mn = min(hM, min(hA, hB));
+    let mx = max(hM, max(hA, hB));
+    let mg = (mx - mn) * hf(u.kl);
+    // A float target keeps what falls below zero: the feed holds none.
+    return vec4f(vec3f(clamp(R, max(mn - mg, h3(hf(0.0))), mx + mg)), 1.0);
 }
 `;
 
-// The `up` text that reads the zones (`map`): on the edge path the sharpness
-// is the law's, less the zone's drop over the kernel's strength, the drop
-// being one of the across weight (sharpness × strength), the bench's unit
-// (plan B §12 c). A drop is never negative: the law stays the ceiling. The
-// renderer reads the zones from ×1.3 up only, a strength of 0.6 or more; the
-// guard keeps any other draw finite.
-const SHARP_LAW = '    let sharp = mix(u.sharp, u.zsharp, zg);';
-const SHARP_MAP = `    let sharp = mix(u.sharp, u.zsharp, zg)
-        - textureSampleLevel(zoneMap, samp, uv, 0.0).r / max(strength, 0.01);`;
-const UP_FS_MAP = UP_FS.replace(SHARP_LAW, SHARP_MAP);
+// The `up` text that reads the zones (`map`): the sharpness on an edge is the
+// law's times what the zone's drop leaves of it, which never exceeds the law
+// (plan B §12 c). The renderer reads the zones from ×1.15 up only.
+const ZONE_LAW = '    // From here the arithmetic is hf (f32, or f16 when the module says so).\n';
+const ZONE_MAP = `    let zf = saturate(1.0 - textureSampleLevel(zoneMap, samp, uv, 0.0).r / u.zref);
+    kg *= zf;
+    kw *= zf;
+${ZONE_LAW}`;
+const UP_FS_MAP = UP_FS.replace(ZONE_LAW, ZONE_MAP);
 
 // The k×k grid of the reduction, as offsets in the pixel's footprint (the
 // span): the centres of k×k equal cells, row by row. Both twins unroll it.
@@ -700,6 +677,32 @@ function downOffsets(taps) {
     const grid = [];
     for (const oy of offs) for (const ox of offs) grid.push([ox, oy]);
     return grid;
+}
+
+// The reduction's sharpening, in the block's places (MWSR_DOWN_LAW): after the
+// read `c`, in linear light; the grids below ×0.5 (9 and 16 samples) have none.
+// The derivatives come before the branch, in uniform control flow, as WGSL
+// requires; the 4 more reads are made past the vote only.
+function downSharpenWgsl() {
+    const [r0, r1] = MWSR_DOWN_LAW.range.map((v) => wgslNumber('f32', v));
+    return `    let l = dot(sqrt(max(c, vec3f(0.0))), LUMA);
+    let g = vec2f(dpdxCoarse(l), dpdyCoarse(l));
+    if (u.kg == 0.0 || abs(g.x) + abs(g.y) < u.ft) {
+        return vec4f(enc(c), 1.0);
+    }
+    let px = u.texel / u.scale;
+    let a = dec(S(uv - vec2f(px.x, 0.0)));
+    let b = dec(S(uv + vec2f(px.x, 0.0)));
+    let d = dec(S(uv - vec2f(0.0, px.y)));
+    let e = dec(S(uv + vec2f(0.0, px.y)));
+    let mean = 0.25 * (a + b + d + e);
+    let mn = min(c, min(a, min(b, min(d, e))));
+    let mx = max(c, max(a, max(b, max(d, e))));
+    // kwc and zref: the gain and the margin at a strong edge
+    let t = smoothstep(${r0}, ${r1}, dot(sqrt(max(mx, vec3f(0.0))) - sqrt(max(mn, vec3f(0.0))), LUMA));
+    let R = c + mix(u.kg, u.kwc, t) * (c - mean);
+    let mg = (mx - mn) * mix(u.kl, u.zref, t);
+    return vec4f(enc(clamp(R, max(mn - mg, vec3f(0.0)), mx + mg)), 1.0);`;
 }
 
 // The `down` fragment stage: a k×k grid of bilinear samples over the pixel's
@@ -749,12 +752,23 @@ fn enc(c : vec3f) -> vec3f {
 @fragment
 fn fs(in : VSOut) -> @location(0) vec4f {
     let uv = in.uv;
-    // The pixel's footprint in the input, 1 / scale texels per axis, spanned
+${
+    taps === 1
+        ? `    // One sample at the pixel's centre is the whole filter.
+    let c = dec(S(uv));
+${downSharpenWgsl()}`
+        : `    // The pixel's footprint in the input, 1 / scale texels per axis, spanned
     // by the grid (R_DOWN 1); ${k}×${k} samples at its ${k}×${k} centres.
     let span = u.texel / u.scale * R_DOWN;
     var acc = vec3f(0.0);
 ${lines.join('\n')}
-    return vec4f(enc(acc * ${wgslNumber('f32', 1 / taps)}), 1.0);
+${
+    taps === 4
+        ? `    let c = acc * ${wgslNumber('f32', 1 / taps)};
+${downSharpenWgsl()}`
+        : `    return vec4f(enc(acc * ${wgslNumber('f32', 1 / taps)}), 1.0);`
+}`
+}
 }
 `;
 }
@@ -770,11 +784,11 @@ ${lines.join('\n')}
  *   'tex' reads a texture_2d<f32>: the product's path, after its pass 0 (the
  *   external texture's two planes per sample made 'ext' lose to pass 0 +
  *   kernel on the RTX, the AMD iGPU and the M1 alike, P2.3; 'ext' stays for
- *   the lab). `half` runs the up mode's edge path in f16 (`enable f16`: the
- *   device must have 'shader-f16'; worth 9-10 % on the AMD iGPU, nothing on
- *   NVIDIA); the vote, the frame, the bound and the down mode stay in f32.
+ *   the lab). `half` runs the up mode's colour arithmetic in f16 (`enable
+ *   f16`: the device must have 'shader-f16'); the coordinates, the vote and the
+ *   down mode stay in f32.
  *   `mode` 'down' is the reduction with `taps` samples (1, 4, 9 or 16; see
- *   mwsrRegime()). `map`, the up mode only: the second text, which reads the
+ *   mwsrRegime()), which sharpens with 1 or 4 (MWSR_DOWN_LAW). `map`, the up mode only: the second text, which reads the
  *   native host's zones from binding 3 (a texture_2d<f32>, see UP_FS_MAP);
  *   without it the text is the same as before the zones, to the byte.
  * @returns {string}
@@ -799,138 +813,52 @@ export function mwsrWgsl({
 }
 
 // The `up` fragment stage in GLSL: the kernel of the WGSL text above, line for
-// line. The colours and weights of the edge path are mediump — f16 where the
-// GPU has it, the twin of the `half` module — the coordinates, the
-// derivatives, the bound and the result highp.
+// line. The colour's arithmetic is mediump — f16 where the GPU has it, the twin
+// of the `half` module — the coordinates, the derivatives and the result highp.
 const UP_GLSL = `
-mediump vec3 blend(mediump vec3 C, mediump vec3 T1, mediump vec3 T2, mediump vec3 X1, mediump vec3 X2,
-                   mediump vec3 wT, mediump vec3 wX) {
-    mediump vec3 R = (C + wT * (T1 + T2) + wX * (X1 + X2)) / (1.0 + 2.0 * (wT + wX));
-    if (DERING == 2u) {
-        return R;
-    }
-    mediump vec3 lo = min(min(C, T1), min(T2, min(X1, X2)));
-    mediump vec3 hi = max(max(C, T1), max(T2, max(X1, X2)));
-    return clamp(R, lo, hi);
-}
-
-mediump float coherence(mediump float c, mediump float t1, mediump float t2, mediump float x1,
-                        mediump float x2) {
-    mediump float jump = abs(x2 - x1);
-    mediump float ridge = abs(x1 + x2 - 2.0 * c);
-    mediump float variation = abs(x2 - c) + abs(c - x1) + abs(t2 - c) + abs(c - t1) + EPS_H;
-    return max(jump, ridge) / variation;
-}
-
 // The gaze zone's weight, the WGSL text's gazeWeight line for line.
 float gazeWeight(vec2 uv) {
     if (GAZE != 1u) {
         return 0.0;
     }
     float d = length((uv - uZone.xy) / uZone.zw);
-    return (1.0 - smoothstep(1.0, 1.0 + uZoneBonus.x, d)) * uTauSharp.z;
-}
-
-// The flat path's picture, the WGSL text's flatPath line for line.
-vec3 flatPath(vec2 uv, vec3 C, float zg) {
-    if (FLAT_TAPS != 3u && FLAT_TAPS != 5u && FLAT_TAPS != 9u) {
-        return C;
-    }
-    if (GAZE == 1u && FLAT_ZONE == 1u && zg <= 0.0) {
-        return C;
-    }
-    vec2 texel = uTexelScale.xy;
-    vec2 sp = uv / texel;
-    vec3 R;
-    if (FLAT_TAPS == 3u) {
-        vec2 tn = floor(sp) + 0.5;
-        vec2 h = sp - tn;
-        vec2 s = mix(vec2(-1.0), vec2(1.0), greaterThanEqual(h, vec2(0.0)));
-        vec2 ah = abs(h);
-        vec2 wf = ah * ah - 0.5 * ah;
-        vec2 wm = 1.0 - wf;
-        vec2 wn = ah * ah + 0.5 * ah;
-        vec2 pm = (tn + s * wn / wm) * texel;
-        vec2 pf = (tn - s) * texel;
-        vec3 sm = S(pm);
-        vec3 sfx = S(vec2(pf.x, pm.y));
-        vec3 sfy = S(vec2(pm.x, pf.y));
-        vec3 acc = sm * (wm.x * wm.y) + sfx * (wf.x * wm.y) + sfy * (wm.x * wf.y);
-        float norm = wm.x * wm.y + wf.x * wm.y + wm.x * wf.y;
-        vec3 lo = min(sm, min(sfx, sfy));
-        vec3 hi = max(sm, max(sfx, sfy));
-        R = clamp(acc / norm, lo, hi);
-    } else {
-        vec2 tc = floor(sp - 0.5) + 0.5;
-        vec2 f = sp - tc;
-        float c = FLAT_C;
-        vec2 w0 = -c * f * (1.0 - f) * (1.0 - f);
-        vec2 w1 = (2.0 - c) * f * f * f - (3.0 - c) * f * f + 1.0;
-        vec2 w3 = -c * (1.0 - f) * f * f;
-        vec2 w2 = 1.0 - w0 - w1 - w3;
-        vec2 w12 = w1 + w2;
-        vec2 p0 = (tc - 1.0) * texel;
-        vec2 p12 = (tc + w2 / w12) * texel;
-        vec2 p3 = (tc + 2.0) * texel;
-        vec3 s12 = S(p12);
-        vec3 s02 = S(vec2(p0.x, p12.y));
-        vec3 s32 = S(vec2(p3.x, p12.y));
-        vec3 s20 = S(vec2(p12.x, p0.y));
-        vec3 s23 = S(vec2(p12.x, p3.y));
-        vec3 acc = s12 * (w12.x * w12.y) + s02 * (w0.x * w12.y) + s32 * (w3.x * w12.y)
-            + s20 * (w12.x * w0.y) + s23 * (w12.x * w3.y);
-        float norm = w12.x * w12.y + w0.x * w12.y + w3.x * w12.y + w12.x * w0.y + w12.x * w3.y;
-        vec3 lo = min(min(s12, s02), min(s32, min(s20, s23)));
-        vec3 hi = max(max(s12, s02), max(s32, max(s20, s23)));
-        if (FLAT_TAPS == 9u) {
-            vec3 s00 = S(p0);
-            vec3 s30 = S(vec2(p3.x, p0.y));
-            vec3 s03 = S(vec2(p0.x, p3.y));
-            vec3 s33 = S(p3);
-            acc += s00 * (w0.x * w0.y) + s30 * (w3.x * w0.y) + s03 * (w0.x * w3.y) + s33 * (w3.x * w3.y);
-            norm += w0.x * w0.y + w3.x * w0.y + w0.x * w3.y + w3.x * w3.y;
-            lo = min(lo, min(min(s00, s30), min(s03, s33)));
-            hi = max(hi, max(max(s00, s30), max(s03, s33)));
-        }
-        R = clamp(acc / norm, lo, hi);
-    }
-    if (GAZE == 1u && FLAT_ZONE == 1u) {
-        return mix(C, R, zg);
-    }
-    return R;
-}
-
-// The exact bound, the WGSL text's texelBound line for line.
-vec3 texelBound(vec2 uv, vec3 R) {
-    ivec2 dims = textureSize(uTex, 0);
-    vec2 pt = uv * vec2(dims) - 0.5;
-    ivec2 i0 = clamp(ivec2(floor(pt)), ivec2(0), dims - 1);
-    ivec2 i1 = min(i0 + 1, dims - 1);
-    vec3 q00 = L(i0);
-    vec3 q10 = L(ivec2(i1.x, i0.y));
-    vec3 q01 = L(ivec2(i0.x, i1.y));
-    vec3 q11 = L(i1);
-    return clamp(R, min(min(q00, q10), min(q01, q11)), max(max(q00, q10), max(q01, q11)));
+    return (1.0 - smoothstep(1.0, 1.0 + uZoneBonus.x, d)) * uZoneBonus.w;
 }
 
 void main() {
     vec2 uv = vUv;
-    vec3 C = S(uv);
-    float lC = luma(C);
+    vec2 texel = uTexelScale.xy;
+    vec2 sp = uv * uDimsAcross.xy;
+    vec2 f0 = floor(sp - 0.5);
+    vec2 t = sp - 0.5 - f0;
+    vec2 s = 1.0 - t;
+    vec2 ku = uKernel.x * t * s;
+    vec2 w12 = 1.0 + ku;
+    vec2 p12 = (f0 + 0.5 + (t * t * (3.0 - 2.0 * t) + ku * s) / w12) * texel;
+    vec3 rM = S(p12);
     float zg = gazeWeight(uv);
-    float tau = mix(uTauSharp.x, uZoneBonus.y, zg);
+    float ft = uKernel.y;
+    if (GAZE == 1u) {
+        ft = mix(uKernel.y, uZoneBonus.y, zg);
+    }
     // GL's window y runs up, WebGPU's framebuffer y runs down: dFdy is the
     // WGSL text's dpdy negated, or the edge normal comes out mirrored and the
-    // along and across taps swap on every diagonal (the first conformity run).
-    vec3 dx = dFdx(C) * uTexelScale.z;
-    vec3 dy = -dFdy(C) * uTexelScale.w;
-    vec3 m = abs(dx) + abs(dy);
-    bool rg = m.g > m.r;
-    bool b = m.b > max(m.r, m.g);
-    bool c444 = CHROMA444 == 1u;
-    float gx = c444 ? (b ? dx.b : (rg ? dx.g : dx.r)) : dot(dx, LUMA);
-    float gy = c444 ? (b ? dy.b : (rg ? dy.g : dy.r)) : dot(dy, LUMA);
-    bool isFlat = (c444 ? max(m.r, max(m.g, m.b)) : abs(gx) + abs(gy)) < tau;
+    // across taps fall along the edge on every diagonal (the first conformity run).
+    vec2 gM;
+    bool isFlat;
+    if (CHROMA444 == 1u) {
+        vec3 dx = dFdx(rM) * uTexelScale.z;
+        vec3 dy = -dFdy(rM) * uTexelScale.w;
+        vec3 m = abs(dx) + abs(dy);
+        bool rg = m.g > m.r;
+        bool b = m.b > max(m.r, m.g);
+        gM = vec2(b ? dx.b : (rg ? dx.g : dx.r), b ? dy.b : (rg ? dy.g : dy.r));
+        isFlat = max(m.r, max(m.g, m.b)) < ft;
+    } else {
+        float lM = dot(rM, LUMA);
+        gM = vec2(dFdx(lM) * uTexelScale.z, -dFdy(lM) * uTexelScale.w);
+        isFlat = abs(gM.x) + abs(gM.y) < ft;
+    }
     if (SHOW == 1u) {
         oColor = vec4(vec3(isFlat ? 0.0 : 1.0), 1.0);
         return;
@@ -939,43 +867,70 @@ void main() {
         oColor = vec4(vec3(zg), 1.0);
         return;
     }
-    float smin = min(uTexelScale.z, uTexelScale.w);
-    float strength = clamp((smin - 1.0) / (S_FULL - 1.0), 0.0, 1.0);
     if (isFlat) {
-        oColor = vec4(flatPath(uv, C, zg), 1.0);
+        oColor = vec4(rM, 1.0);
         return;
     }
-    vec2 n = vec2(gx, gy) * inversesqrt(max(gx * gx + gy * gy, 1e-12));
-    vec2 dt = vec2(-n.y, n.x) * uTexelScale.xy * R_ALONG;
-    vec2 dn = n * uTexelScale.xy * R_ACROSS;
-    mediump vec3 Ch = C;
-    mediump vec3 T1 = S(uv - dt);
-    mediump vec3 T2 = S(uv + dt);
-    mediump vec3 X1 = S(uv - dn);
-    mediump vec3 X2 = S(uv + dn);
-    mediump float lCh = lC;
-    mediump float lT1 = lumah(T1);
-    mediump float lT2 = lumah(T2);
-    mediump float lX1 = lumah(X1);
-    mediump float lX2 = lumah(X2);
-    mediump vec3 a;
-    if (CHROMA444 == 1u) {
-        a = vec3(coherence(Ch.r, T1.r, T2.r, X1.r, X2.r),
-                 coherence(Ch.g, T1.g, T2.g, X1.g, X2.g),
-                 coherence(Ch.b, T1.b, T2.b, X1.b, X2.b)) * strength;
-    } else {
-        a = vec3(coherence(lCh, lT1, lT2, lX1, lX2) * strength);
+    vec2 p0 = (f0 - 0.5) * texel;
+    vec2 p3 = (f0 + 2.5) * texel;
+    vec3 rT = S(vec2(p12.x, p0.y));
+    vec3 rL = S(vec2(p0.x, p12.y));
+    vec3 rR = S(vec2(p3.x, p12.y));
+    vec3 rB = S(vec2(p12.x, p3.y));
+    vec2 dn = gM * inversesqrt(dot(gM, gM)) * uDimsAcross.zw;
+    vec3 ra = S(uv - dn);
+    vec3 rb = S(uv + dn);
+    float kg = uKernel.z;
+    if (GAZE == 1u) {
+        kg = mix(uKernel.z, uZoneBonus.z, zg);
     }
-    mediump vec3 wT = W_ALONG * a;
-    float sharp = mix(uTauSharp.y, uZoneBonus.z, zg);
-    mediump vec3 wX = max(-W_ACROSS * sharp * a, vec3(W_MIN));
-    vec3 R = blend(Ch, T1, T2, X1, X2, wT, wX);
-    if (DERING != 0u) {
-        R = texelBound(uv, R);
-    }
-    oColor = vec4(R, 1.0);
+    mediump vec3 hM = rM;
+    mediump vec3 hA = ra;
+    mediump vec3 hB = rb;
+    mediump vec3 hTop = rT;
+    mediump vec3 hLeft = rL;
+    mediump vec3 hRight = rR;
+    mediump vec3 hBottom = rB;
+    mediump vec2 hu = ku;
+    mediump vec2 hs = s;
+    mediump vec2 ht = t;
+    mediump vec2 h12 = w12;
+    mediump vec3 K = (h12.x * (h12.y * hM - hu.y * (hs.y * hTop + ht.y * hBottom)) - h12.y * hu.x * (hs.x * hLeft + ht.x * hRight)) / (1.0 - hu.x * hu.y);
+    mediump vec3 D = K - 0.5 * (hA + hB);
+    mediump float hg = kg;
+    mediump float hw = uKernel.w;
+    mediump vec3 R = K + hg * D + hw * (D - vec3(dot(D, LUMA)));
+    mediump vec3 mn = min(hM, min(hA, hB));
+    mediump vec3 mx = max(hM, max(hA, hB));
+    mediump float hl = uBound.x;
+    mediump vec3 mg = (mx - mn) * hl;
+    oColor = vec4(clamp(R, max(mn - mg, vec3(0.0)), mx + mg), 1.0);
 }
 `;
+
+// The reduction's sharpening in GLSL, the WGSL text's line for line: kg in
+// uKernel.z, its value at a strong edge in .w; the margin and its own in uBound.
+function downSharpenGlsl() {
+    const [r0, r1] = MWSR_DOWN_LAW.range.map((v) => wgslNumber('f32', v));
+    return `    float l = dot(sqrt(max(c, vec3(0.0))), LUMA);
+    vec2 g = vec2(dFdx(l), dFdy(l));
+    if (uKernel.z == 0.0 || abs(g.x) + abs(g.y) < uKernel.y) {
+        oColor = vec4(enc(c), 1.0);
+        return;
+    }
+    vec2 px = uTexelScale.xy / uTexelScale.zw;
+    vec3 a = dec(S(uv - vec2(px.x, 0.0)));
+    vec3 b = dec(S(uv + vec2(px.x, 0.0)));
+    vec3 d = dec(S(uv - vec2(0.0, px.y)));
+    vec3 e = dec(S(uv + vec2(0.0, px.y)));
+    vec3 mean = 0.25 * (a + b + d + e);
+    vec3 mn = min(c, min(a, min(b, min(d, e))));
+    vec3 mx = max(c, max(a, max(b, max(d, e))));
+    float t = smoothstep(${r0}, ${r1}, dot(sqrt(max(mx, vec3(0.0))) - sqrt(max(mn, vec3(0.0))), LUMA));
+    vec3 R = c + mix(uKernel.z, uKernel.w, t) * (c - mean);
+    vec3 mg = (mx - mn) * mix(uBound.x, uBound.y, t);
+    oColor = vec4(enc(clamp(R, max(mn - mg, vec3(0.0)), mx + mg)), 1.0);`;
+}
 
 // The `down` fragment stage in GLSL: the same grid, from the same offsets.
 function downGlsl(taps) {
@@ -1018,16 +973,26 @@ vec3 enc(vec3 c) {
 
 void main() {
     vec2 uv = vUv;
-    vec2 span = uTexelScale.xy / uTexelScale.zw * R_DOWN;
+${
+    taps === 1
+        ? `    vec3 c = dec(S(uv));
+${downSharpenGlsl()}`
+        : `    vec2 span = uTexelScale.xy / uTexelScale.zw * R_DOWN;
     vec3 acc = vec3(0.0);
 ${lines.join('\n')}
-    oColor = vec4(enc(acc * ${wgslNumber('f32', 1 / taps)}), 1.0);
+${
+    taps === 4
+        ? `    vec3 c = acc * ${wgslNumber('f32', 1 / taps)};
+${downSharpenGlsl()}`
+        : `    oColor = vec4(enc(acc * ${wgslNumber('f32', 1 / taps)}), 1.0);`
+}`
+}
 }
 `;
 }
 
 // The part every GLSL text shares: the uniforms (the block of mwsrUniforms()
-// in two vec4), the varying and the output of WebGlRenderer's full-screen
+// in six vec4), the varying and the output of WebGlRenderer's full-screen
 // triangle, the feed, the overrides as constants and the luma.
 function glslPreamble(overrides) {
     for (const k of Object.keys(overrides))
@@ -1044,32 +1009,21 @@ precision highp float;
 precision highp int;
 uniform sampler2D uTex;
 uniform vec4 uTexelScale; // texel.xy, scale.xy: the first four of mwsrUniforms()
-uniform vec4 uTauSharp; // tau, sharp, the gaze zone's weight, 0: the next four
+uniform vec4 uDimsAcross; // the input's size, the across taps' distance
+uniform vec4 uKernel; // kc, ft, kg, kwc
 uniform vec4 uZone; // the gaze zone's centre.xy and half-axes.xy (GAZE 1)
-uniform vec4 uZoneBonus; // its ring, and its tau and sharpness at the centre, 0
+uniform vec4 uZoneBonus; // its ring, its threshold and kg at the centre, its weight
+uniform vec4 uBound; // kl, zref, then the block's pad
 in vec2 vUv;
 out vec4 oColor;
 
 vec3 S(vec2 uv) {
     return textureLod(uTex, uv, 0.0).rgb;
 }
-vec3 L(ivec2 c) {
-    return texelFetch(uTex, c, 0).rgb;
-}
-
-const mediump float EPS_H = 0.001;
 
 ${consts}
 
 const vec3 LUMA = vec3(${wgslNumber('f32', lr)}, ${wgslNumber('f32', lg)}, ${wgslNumber('f32', lb)});
-
-float luma(vec3 c) {
-    return dot(c, LUMA);
-}
-
-mediump float lumah(mediump vec3 c) {
-    return dot(c, LUMA);
-}
 `;
 }
 
@@ -1078,9 +1032,9 @@ mediump float lumah(mediump vec3 c) {
  * constants as mwsrWgsl(), from the same tables, for WebGlRenderer's
  * full-screen triangle (`vUv` in, `oColor` out). WebGL2 has no pipeline
  * constants, so the overrides are baked into the text (`overrides`, by name;
- * the rest at their defaults); two vec4 uniforms carry the block of
- * mwsrUniforms(). The edge path's colours and weights are mediump: f16 on the
- * GPUs that have it, the twin of the `half` module, and highp on the others.
+ * the rest at their defaults); six vec4 uniforms carry the block of
+ * mwsrUniforms(). The colour's arithmetic is mediump: f16 on the GPUs that have
+ * it, the twin of the `half` module, and highp on the others.
  * No sRGB views on a WebGL2 drawing buffer: the reduction takes the software
  * light (MWSR_DOWN_TAPS, LINEAR_LIGHT 1). LINEAR_LIGHT 3 has no twin here:
  * WebGL2 draws no HDR feed.
@@ -1094,7 +1048,7 @@ export function mwsrGlsl({ mode = 'up', taps = 4, overrides = {} } = {}) {
 }
 
 // The part every HLSL text shares: the vertex stage, the constant buffer (the
-// block of mwsrUniforms(), the same 16 floats in the same order), the feed,
+// block of mwsrUniforms(), the same 24 floats in the same order), the feed,
 // the constants and the luma. Each constant is a define of its name prefixed
 // MWSR_, at its default unless the compiler is handed another (D3DCompile's
 // D3D_SHADER_MACRO, DXC's -D), the way the WGSL text takes pipeline constants;
@@ -1109,8 +1063,8 @@ function hlslPreamble(half) {
         .join('\n');
     const [lr, lg, lb] = MWSR_CONSTANTS.LUMA;
     const types = half
-        ? 'typedef min16float hf;\ntypedef min16float3 h3;\nstatic const hf EPS_H = 0.001;'
-        : 'typedef float hf;\ntypedef float3 h3;\nstatic const hf EPS_H = 0.00001;';
+        ? 'typedef min16float hf;\ntypedef min16float3 h3;'
+        : 'typedef float hf;\ntypedef float3 h3;';
     return `#ifndef MWSR_CB_REGISTER
 #define MWSR_CB_REGISTER b0
 #endif
@@ -1137,15 +1091,21 @@ VSOut MwsrVS(uint vid : SV_VertexID) {
 cbuffer MwsrConstants : register(MWSR_CB_REGISTER) {
     float2 texel;
     float2 scale;
-    float tau;
-    float sharp;
-    float gaze;
-    float pad;
+    float2 dims;
+    float2 across;
+    float kc;
+    float ft;
+    float kg;
+    float kwc;
     float2 zc;
     float2 zr;
     float zring;
-    float ztau;
-    float zsharp;
+    float zft;
+    float zkg;
+    float gaze;
+    float kl;
+    float zref;
+    float pad1;
     float pad2;
 };
 
@@ -1155,48 +1115,20 @@ SamplerState samp : register(MWSR_SAMPLER_REGISTER);
 float3 S(float2 uv) {
     return tex.SampleLevel(samp, uv, 0.0).rgb;
 }
-float3 L(int2 c) {
-    return tex.Load(int3(c, 0)).rgb;
-}
 
 ${types}
 
 ${consts}
 
 static const float3 LUMA = float3(${wgslNumber('f32', lr)}, ${wgslNumber('f32', lg)}, ${wgslNumber('f32', lb)});
-
-float luma(float3 c) {
-    return dot(c, LUMA);
-}
-
-hf lumah(h3 c) {
-    return dot(c, (h3)LUMA);
-}
 `;
 }
 
 // The `up` pixel stage in HLSL: the kernel of the WGSL text, line for line.
 // Direct3D's screen y runs down as WebGPU's does: the derivatives keep their
-// sign. The edge path's colours and weights are hf, min16float in the `half`
-// text, the twin of the WGSL f16 module.
+// sign. The colour's arithmetic is hf, min16float in the `half` text, the twin
+// of the WGSL f16 module.
 const UP_HLSL = `
-h3 blend(h3 C, h3 T1, h3 T2, h3 X1, h3 X2, h3 wT, h3 wX) {
-    h3 R = (C + wT * (T1 + T2) + wX * (X1 + X2)) / (1.0 + 2.0 * (wT + wX));
-    if (DERING == 2u) {
-        return R;
-    }
-    h3 lo = min(min(C, T1), min(T2, min(X1, X2)));
-    h3 hi = max(max(C, T1), max(T2, max(X1, X2)));
-    return clamp(R, lo, hi);
-}
-
-hf coherence(hf c, hf t1, hf t2, hf x1, hf x2) {
-    hf jump = abs(x2 - x1);
-    hf ridge = abs(x1 + x2 - 2.0 * c);
-    hf variation = abs(x2 - c) + abs(c - x1) + abs(t2 - c) + abs(c - t1) + EPS_H;
-    return max(jump, ridge) / variation;
-}
-
 // The gaze zone's weight, the WGSL text's gazeWeight line for line.
 float gazeWeight(float2 uv) {
     if (GAZE != 1u) {
@@ -1206,146 +1138,96 @@ float gazeWeight(float2 uv) {
     return (1.0 - smoothstep(1.0, 1.0 + zring, d)) * gaze;
 }
 
-// The flat path's picture, the WGSL text's flatPath line for line.
-float3 flatPath(float2 uv, float3 C, float zg) {
-    if (FLAT_TAPS != 3u && FLAT_TAPS != 5u && FLAT_TAPS != 9u) {
-        return C;
-    }
-    if (GAZE == 1u && FLAT_ZONE == 1u && zg <= 0.0) {
-        return C;
-    }
-    float2 sp = uv / texel;
-    float3 R;
-    if (FLAT_TAPS == 3u) {
-        float2 tn = floor(sp) + 0.5;
-        float2 h = sp - tn;
-        float2 s = float2(h.x >= 0.0 ? 1.0 : -1.0, h.y >= 0.0 ? 1.0 : -1.0);
-        float2 ah = abs(h);
-        float2 wf = ah * ah - 0.5 * ah;
-        float2 wm = 1.0 - wf;
-        float2 wn = ah * ah + 0.5 * ah;
-        float2 pm = (tn + s * wn / wm) * texel;
-        float2 pf = (tn - s) * texel;
-        float3 sm = S(pm);
-        float3 sfx = S(float2(pf.x, pm.y));
-        float3 sfy = S(float2(pm.x, pf.y));
-        float3 acc = sm * (wm.x * wm.y) + sfx * (wf.x * wm.y) + sfy * (wm.x * wf.y);
-        float norm = wm.x * wm.y + wf.x * wm.y + wm.x * wf.y;
-        float3 lo = min(sm, min(sfx, sfy));
-        float3 hi = max(sm, max(sfx, sfy));
-        R = clamp(acc / norm, lo, hi);
-    } else {
-        float2 tc = floor(sp - 0.5) + 0.5;
-        float2 f = sp - tc;
-        float c = FLAT_C;
-        float2 w0 = -c * f * (1.0 - f) * (1.0 - f);
-        float2 w1 = (2.0 - c) * f * f * f - (3.0 - c) * f * f + 1.0;
-        float2 w3 = -c * (1.0 - f) * f * f;
-        float2 w2 = 1.0 - w0 - w1 - w3;
-        float2 w12 = w1 + w2;
-        float2 p0 = (tc - 1.0) * texel;
-        float2 p12 = (tc + w2 / w12) * texel;
-        float2 p3 = (tc + 2.0) * texel;
-        float3 s12 = S(p12);
-        float3 s02 = S(float2(p0.x, p12.y));
-        float3 s32 = S(float2(p3.x, p12.y));
-        float3 s20 = S(float2(p12.x, p0.y));
-        float3 s23 = S(float2(p12.x, p3.y));
-        float3 acc = s12 * (w12.x * w12.y) + s02 * (w0.x * w12.y) + s32 * (w3.x * w12.y)
-            + s20 * (w12.x * w0.y) + s23 * (w12.x * w3.y);
-        float norm = w12.x * w12.y + w0.x * w12.y + w3.x * w12.y + w12.x * w0.y + w12.x * w3.y;
-        float3 lo = min(min(s12, s02), min(s32, min(s20, s23)));
-        float3 hi = max(max(s12, s02), max(s32, max(s20, s23)));
-        if (FLAT_TAPS == 9u) {
-            float3 s00 = S(p0);
-            float3 s30 = S(float2(p3.x, p0.y));
-            float3 s03 = S(float2(p0.x, p3.y));
-            float3 s33 = S(p3);
-            acc += s00 * (w0.x * w0.y) + s30 * (w3.x * w0.y) + s03 * (w0.x * w3.y) + s33 * (w3.x * w3.y);
-            norm += w0.x * w0.y + w3.x * w0.y + w0.x * w3.y + w3.x * w3.y;
-            lo = min(lo, min(min(s00, s30), min(s03, s33)));
-            hi = max(hi, max(max(s00, s30), max(s03, s33)));
-        }
-        R = clamp(acc / norm, lo, hi);
-    }
-    if (GAZE == 1u && FLAT_ZONE == 1u) {
-        return lerp(C, R, zg);
-    }
-    return R;
-}
-
-// The exact bound, the WGSL text's texelBound line for line.
-float3 texelBound(float2 uv, float3 R) {
-    uint w, h;
-    tex.GetDimensions(w, h);
-    int2 dims = int2(w, h);
-    float2 pt = uv * float2(dims) - 0.5;
-    int2 i0 = clamp(int2(floor(pt)), int2(0, 0), dims - 1);
-    int2 i1 = min(i0 + 1, dims - 1);
-    float3 q00 = L(i0);
-    float3 q10 = L(int2(i1.x, i0.y));
-    float3 q01 = L(int2(i0.x, i1.y));
-    float3 q11 = L(i1);
-    return clamp(R, min(min(q00, q10), min(q01, q11)), max(max(q00, q10), max(q01, q11)));
-}
-
 float4 MwsrPS(VSOut i) : SV_Target {
     float2 uv = i.uv;
-    float3 C = S(uv);
-    float lC = luma(C);
+    float2 sp = uv * dims;
+    float2 f0 = floor(sp - 0.5);
+    float2 t = sp - 0.5 - f0;
+    float2 s = 1.0 - t;
+    float2 ku = kc * t * s;
+    float2 w12 = 1.0 + ku;
+    float2 p12 = (f0 + 0.5 + (t * t * (3.0 - 2.0 * t) + ku * s) / w12) * texel;
+    float3 rM = S(p12);
     float zg = gazeWeight(uv);
-    float t = lerp(tau, ztau, zg);
-    float3 dx = ddx_coarse(C) * scale.x;
-    float3 dy = ddy_coarse(C) * scale.y;
-    float3 m = abs(dx) + abs(dy);
-    bool rg = m.g > m.r;
-    bool b = m.b > max(m.r, m.g);
-    bool c444 = CHROMA444 == 1u;
-    float gx = c444 ? (b ? dx.b : (rg ? dx.g : dx.r)) : dot(dx, LUMA);
-    float gy = c444 ? (b ? dy.b : (rg ? dy.g : dy.r)) : dot(dy, LUMA);
-    bool isFlat = (c444 ? max(m.r, max(m.g, m.b)) : abs(gx) + abs(gy)) < t;
+    float vote = ft;
+    if (GAZE == 1u) {
+        vote = lerp(ft, zft, zg);
+    }
+    float2 gM;
+    bool isFlat;
+    if (CHROMA444 == 1u) {
+        float3 dx = ddx_coarse(rM) * scale.x;
+        float3 dy = ddy_coarse(rM) * scale.y;
+        float3 m = abs(dx) + abs(dy);
+        bool rg = m.g > m.r;
+        bool b = m.b > max(m.r, m.g);
+        gM = float2(b ? dx.b : (rg ? dx.g : dx.r), b ? dy.b : (rg ? dy.g : dy.r));
+        isFlat = max(m.r, max(m.g, m.b)) < vote;
+    } else {
+        float lM = dot(rM, LUMA);
+        gM = float2(ddx_coarse(lM), ddy_coarse(lM)) * scale;
+        isFlat = abs(gM.x) + abs(gM.y) < vote;
+    }
     if (SHOW == 1u) {
         return float4((isFlat ? 0.0 : 1.0).xxx, 1.0);
     }
     if (SHOW == 2u) {
         return float4(zg.xxx, 1.0);
     }
-    float smin = min(scale.x, scale.y);
-    float strength = clamp((smin - 1.0) / (S_FULL - 1.0), 0.0, 1.0);
     if (isFlat) {
-        return float4(flatPath(uv, C, zg), 1.0);
+        return float4(rM, 1.0);
     }
-    float2 n = float2(gx, gy) * rsqrt(max(gx * gx + gy * gy, 1e-12));
-    float2 dt = float2(-n.y, n.x) * texel * R_ALONG;
-    float2 dn = n * texel * R_ACROSS;
-    h3 Ch = (h3)C;
-    h3 T1 = (h3)S(uv - dt);
-    h3 T2 = (h3)S(uv + dt);
-    h3 X1 = (h3)S(uv - dn);
-    h3 X2 = (h3)S(uv + dn);
-    hf lCh = (hf)lC;
-    hf lT1 = lumah(T1);
-    hf lT2 = lumah(T2);
-    hf lX1 = lumah(X1);
-    hf lX2 = lumah(X2);
-    h3 a;
-    if (CHROMA444 == 1u) {
-        a = h3(coherence(Ch.r, T1.r, T2.r, X1.r, X2.r),
-               coherence(Ch.g, T1.g, T2.g, X1.g, X2.g),
-               coherence(Ch.b, T1.b, T2.b, X1.b, X2.b)) * (hf)strength;
-    } else {
-        a = (coherence(lCh, lT1, lT2, lX1, lX2) * (hf)strength).xxx;
+    float2 p0 = (f0 - 0.5) * texel;
+    float2 p3 = (f0 + 2.5) * texel;
+    float3 rT = S(float2(p12.x, p0.y));
+    float3 rL = S(float2(p0.x, p12.y));
+    float3 rR = S(float2(p3.x, p12.y));
+    float3 rB = S(float2(p12.x, p3.y));
+    float2 dn = gM * rsqrt(dot(gM, gM)) * across;
+    float3 ra = S(uv - dn);
+    float3 rb = S(uv + dn);
+    float sharp = kg;
+    if (GAZE == 1u) {
+        sharp = lerp(kg, zkg, zg);
     }
-    h3 wT = (hf)W_ALONG * a;
-    float sh = lerp(sharp, zsharp, zg);
-    h3 wX = max(-(hf)W_ACROSS * (hf)sh * a, ((hf)W_MIN).xxx);
-    float3 R = (float3)blend(Ch, T1, T2, X1, X2, wT, wX);
-    if (DERING != 0u) {
-        R = texelBound(uv, R);
-    }
-    return float4(R, 1.0);
+    h3 hM = (h3)rM;
+    h3 hA = (h3)ra;
+    h3 hB = (h3)rb;
+    hf hux = (hf)ku.x;
+    hf huy = (hf)ku.y;
+    hf h12x = (hf)w12.x;
+    hf h12y = (hf)w12.y;
+    h3 K = (h12x * (h12y * hM - huy * ((hf)s.y * (h3)rT + (hf)t.y * (h3)rB)) - h12y * hux * ((hf)s.x * (h3)rL + (hf)t.x * (h3)rR)) / ((hf)1.0 - hux * huy);
+    h3 D = K - (hf)0.5 * (hA + hB);
+    h3 R = K + (hf)sharp * D + (hf)kwc * (D - (h3)dot(D, (h3)LUMA));
+    h3 mn = min(hM, min(hA, hB));
+    h3 mx = max(hM, max(hA, hB));
+    h3 mg = (mx - mn) * (hf)kl;
+    return float4((float3)clamp(R, max(mn - mg, (h3)(hf)0.0), mx + mg), 1.0);
 }
 `;
+
+// The reduction's sharpening in HLSL, the WGSL text's line for line.
+function downSharpenHlsl() {
+    const [r0, r1] = MWSR_DOWN_LAW.range.map((v) => wgslNumber('f32', v));
+    return `    float l = dot(sqrt(max(c, 0.0)), LUMA);
+    float2 g = float2(ddx_coarse(l), ddy_coarse(l));
+    if (kg == 0.0 || abs(g.x) + abs(g.y) < ft) {
+        return float4(enc(c), 1.0);
+    }
+    float2 px = texel / scale;
+    float3 a = dec(S(uv - float2(px.x, 0.0)));
+    float3 b = dec(S(uv + float2(px.x, 0.0)));
+    float3 d = dec(S(uv - float2(0.0, px.y)));
+    float3 e = dec(S(uv + float2(0.0, px.y)));
+    float3 mean = 0.25 * (a + b + d + e);
+    float3 mn = min(c, min(a, min(b, min(d, e))));
+    float3 mx = max(c, max(a, max(b, max(d, e))));
+    float t = smoothstep(${r0}, ${r1}, dot(sqrt(max(mx, 0.0)) - sqrt(max(mn, 0.0)), LUMA));
+    float3 R = c + lerp(kg, kwc, t) * (c - mean);
+    float3 mg = (mx - mn) * lerp(kl, zref, t);
+    return float4(enc(clamp(R, max(mn - mg, 0.0), mx + mg)), 1.0);`;
+}
 
 // The `down` pixel stage in HLSL: the same grid, from the same offsets, and
 // the WGSL text's light, LINEAR_LIGHT 3 included (an HDR feed in linear light).
@@ -1390,10 +1272,20 @@ float3 enc(float3 c) {
 
 float4 MwsrPS(VSOut i) : SV_Target {
     float2 uv = i.uv;
-    float2 span = texel / scale * R_DOWN;
+${
+    taps === 1
+        ? `    float3 c = dec(S(uv));
+${downSharpenHlsl()}`
+        : `    float2 span = texel / scale * R_DOWN;
     float3 acc = 0.0;
 ${lines.join('\n')}
-    return float4(enc(acc * ${wgslNumber('f32', 1 / taps)}), 1.0);
+${
+    taps === 4
+        ? `    float3 c = acc * ${wgslNumber('f32', 1 / taps)};
+${downSharpenHlsl()}`
+        : `    return float4(enc(acc * ${wgslNumber('f32', 1 / taps)}), 1.0);`
+}`
+}
 }
 `;
 }
@@ -1402,13 +1294,13 @@ ${lines.join('\n')}
  * The HLSL twin of one mode, for Direct3D 11 (FXC, ps_5_0) and 12 (DXC,
  * ps_6_0): the same kernel and the same constants as mwsrWgsl(), from the
  * same tables. Entry points MwsrVS (the full-screen triangle, three vertices
- * from SV_VertexID) and MwsrPS. Registers b0 (the 16 floats of
+ * from SV_VertexID) and MwsrPS. Registers b0 (the 24 floats of
  * mwsrUniforms()), t0 (the input) and s0 (a linear, clamp-to-edge sampler),
  * each a define (MWSR_CB_REGISTER, MWSR_TEX_REGISTER, MWSR_SAMPLER_REGISTER).
- * The constants are defines of their name prefixed MWSR_ (MWSR_DERING,
+ * The constants are defines of their name prefixed MWSR_ (MWSR_CHROMA444,
  * MWSR_R_DOWN...), at their default unless the compiler is handed another.
- * `half` runs the up mode's edge path in min16float, the twin of the WGSL
- * f16 module.
+ * `half` runs the up mode's colour arithmetic in min16float, the twin of the
+ * WGSL f16 module.
  * @param {{mode?: 'up'|'down', taps?: number, half?: boolean}} [opts]
  * @returns {string}
  */

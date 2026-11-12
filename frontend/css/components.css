@@ -367,11 +367,25 @@
     font-style: italic;
 }
 
-/* "· auto" after the bitrate value while it follows the estimate */
+/* "· auto (local network)" after the bitrate value while it follows the
+   estimate: the description's grey, which small text can be read in */
 .settings-bitrate-auto {
-    color: var(--text-3);
+    color: var(--text-2);
     font-weight: normal;
     font-size: var(--fs-xs);
+}
+
+/* The house or the globe before the bitrate: where the host sees this
+   browser. A touch above the text's middle, where Rajdhani's figures sit. */
+.settings-bitrate-net {
+    display: inline-block;
+    width: 16px;
+    height: 16px;
+    margin-right: 4px;
+    vertical-align: middle;
+    position: relative;
+    top: -2px;
+    color: var(--neon-cyan);
 }
 
 /* Custom resolution — two numbers side by side, styled like the select */
@@ -1408,7 +1422,10 @@ body.ios .settings-checkbox-label input[type='checkbox']:checked::before {
    window while the button hangs off the footer, so this clearance is measured,
    not derived: ~35px of footer bar, the 16px gap above it, the 58px circle and a
    last gap. Too generous costs nothing — a toast a little higher is still read —
-   while too tight puts text on the button. The keyboard inset stacks on top. */
-body:has(.discord-fab) #toast-container {
+   while too tight puts text on the button. The keyboard inset stacks on top.
+   Not during a stream: the button is hidden there but still in the page, and
+   the clearance lifted every toast ~100px over the picture, the touch keyboard
+   warning (issue #44) well above the special-keys bar (iPhone, 08/11/2026). */
+body:has(.discord-fab):not(.streaming-active) #toast-container {
     bottom: calc(var(--space-5) + var(--kbd-inset, 0px) + 95px);
 }

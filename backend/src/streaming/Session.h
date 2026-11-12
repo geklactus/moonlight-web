@@ -91,6 +91,14 @@ public:
     /// true (default) → host muted; false → audio also plays on the host.
     void setMuteHostAudio(bool mute) { m_Config.muteHostAudio = mute; }
 
+    /// Native host, Windows: which sound the stream carries (AudioSource.h).
+    void setAudioSource(const QString& source) { m_Config.audioSource = source; }
+    /// Told the app that sound comes from, on the capture's own thread.
+    void setAudioAppObserver(std::function<void(const std::string&)> observer)
+    {
+        m_Config.onAudioAppChanged = std::move(observer);
+    }
+
     /// Enable auto-mode behavior: WS fallback is disabled so that ICE timeout
     /// emits sessionEnded() instead of starting the internal WS fallback.
     /// This allows the auto fallback chain in main.cpp to try the next transport.
@@ -280,10 +288,25 @@ public:
     /// native engine acts on it — see mw::native::SessionConfig::maxFps.
     void setMaxFps(int fps) { m_MaxFps = fps > 0 ? fps : 0; }
 
+    /// The administrator's ceilings (settings.json max_allowed_*), 0 for
+    /// none: the launch is already held to them, and the native engine holds
+    /// what moves mid-stream — a cadence step, the bitrate that follows the
+    /// frame. Other engines take a rate and a bitrate at launch only.
+    void setStreamLimits(int fps, int bitrateKbps)
+    {
+        m_FpsLimit = fps > 0 ? fps : 0;
+        m_BitrateLimitKbps = bitrateKbps > 0 ? bitrateKbps : 0;
+    }
+
     /// The viewer's aspect setting is "Auto", so a native stream rebuilds at
     /// the display's new shape when the host changes mode — see
     /// mw::native::SessionConfig::followDisplayShape. Other engines ignore it.
     void setFollowDisplayShape(bool follow) { m_FollowDisplayShape = follow; }
+
+    /// The viewer's codec setting is "Auto" (the browser asks for HEVC by
+    /// name either way) — see mw::native::SessionConfig::codecAuto. Other
+    /// engines ignore it.
+    void setCodecAuto(bool on) { m_CodecAuto = on; }
 
     /// The requested size is a box to fit (the display's shape inside it),
     /// and whether a native stream may then be larger than the display — the
@@ -647,8 +670,14 @@ private:
     /// See setMaxFps.
     int m_MaxFps = 0;
 
+    /// See setStreamLimits.
+    int m_FpsLimit = 0;
+    int m_BitrateLimitKbps = 0;
+
     /// See setFollowDisplayShape.
     bool m_FollowDisplayShape = false;
+    /// See setCodecAuto.
+    bool m_CodecAuto = false;
 
     /// See setFrameFit.
     bool m_FitRequestedBox = false;

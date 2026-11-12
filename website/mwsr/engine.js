@@ -90,8 +90,6 @@ fn fs(in : VSOut) -> @location(0) vec4f {
 /** The upscalers, in the order of the page. `wrap`: runs inside the reversible tone map on HDR. */
 export const KERNELS = [
   { id: 'mwsr', name: 'MWSR', half: true },
-  // MoonlightWeb's own: MWSR reading its native host's zones (zones.js); the law where there are none
-  { id: 'mwsrz', name: 'MWSR zones', half: true },
   { id: 'fsr1', name: 'FSR1', half: true, wrap: true },
   { id: 'nis', name: 'NIS', half: false, wrap: true },
   { id: 'sgsr1', name: 'SGSR1', half: true, wrap: true },
@@ -99,7 +97,7 @@ export const KERNELS = [
 ];
 
 export async function createEngine({ K, mwsr, nis, soft = false, onLost = () => {} }) {
-  const { mwsrRegime, mwsrUniforms, mwsrWgsl } = mwsr;
+  const { mwsrDownConstants, mwsrRegime, mwsrUniforms, mwsrWgsl } = mwsr;
   const { nisCoefTexture, nisConfig } = nis;
   if (!navigator.gpu) throw new Error('nogpu');
   const adapter = await navigator.gpu.requestAdapter(
@@ -107,7 +105,8 @@ export async function createEngine({ K, mwsr, nis, soft = false, onLost = () => 
   );
   if (!adapter) throw new Error('noadapter');
   const info = adapter.info || (adapter.requestAdapterInfo ? await adapter.requestAdapterInfo() : {});
-  const label = [info.vendor, info.architecture, info.description].filter(Boolean).join(' ') || 'WebGPU adapter';
+  const label =
+    [...new Set([info.vendor, info.architecture, info.description].filter(Boolean))].join(' ') || 'WebGPU adapter';
   // soft=1 (the tests): SwiftShader or nothing, before anything is compiled
   if (soft && !(info.isFallbackAdapter || /swiftshader/i.test(label)))
     throw new Error('soft=1 asks for SwiftShader, and the adapter is ' + label);
@@ -117,6 +116,11 @@ export async function createEngine({ K, mwsr, nis, soft = false, onLost = () => 
     requiredLimits: { maxTextureDimension2D: Math.min(8192, adapter.limits.maxTextureDimension2D) },
   });
   device.lost.then((l) => onLost(l.message || l.reason || 'lost'));
+  // what the GPU refused, for a measure's report: the console gets it all the same
+  const refused = [];
+  device.addEventListener('uncapturederror', (e) => {
+    if (refused.length < 8) refused.push(e.error.message);
+  });
   const hasTs = device.features.has('timestamp-query');
   const hasF16 = device.features.has('shader-f16');
 
@@ -143,13 +147,6 @@ export async function createEngine({ K, mwsr, nis, soft = false, onLost = () => 
     { texture: { sampleType: 'float' } },
     { texture: { sampleType: 'unfilterable-float' } },
     { buffer: {} },
-  ]);
-  // MWSR's second text: the zones' r16float texture at binding 3, read bilinearly
-  const plMap = layout([
-    { sampler: {} },
-    { texture: { sampleType: 'float' } },
-    { buffer: {} },
-    { texture: { sampleType: 'float' } },
   ]);
   const plView = layout([
     { texture: { sampleType: 'unfilterable-float' } },
@@ -211,9 +208,8 @@ export async function createEngine({ K, mwsr, nis, soft = false, onLost = () => 
     return t;
   };
 
-  /** Uploads a case: `native` may be null (a picture taken as the input); `zones`, the native host's
-   *  codes (zones.js), only where its client would read them. */
-  function setCase({ outW, outH, inW, inH, hdr, native, input, zones = null }) {
+  /** Uploads a case: `native` may be null (a picture taken as the input). */
+  function setCase({ outW, outH, inW, inH, hdr, native, input }) {
     for (const t of owned.splice(0)) t.destroy();
     // MWSR's mode as the client picks it, its reduction below 1:1; at 1:1,
     // where the client copies, its kernel all the same, as every other one
@@ -265,20 +261,9 @@ export async function createEngine({ K, mwsr, nis, soft = false, onLost = () => 
             0,
           ]),
         ),
-        mwsr: ubo(mwsrUniforms(inW, inH, outW, outH, {})),
+        mwsr: ubo(mwsrUniforms(inW, inH, outW, outH, { hdr })),
       },
-      zoneView: null,
     };
-    if (zones && reg.mode === 'up') {
-      const z = tex(zones.cols, zones.rows, 'r16float', T.TEXTURE_BINDING | T.COPY_DST);
-      device.queue.writeTexture(
-        { texture: z },
-        zones.texels,
-        { bytesPerRow: zones.cols * 2 },
-        { width: zones.cols, height: zones.rows },
-      );
-      C.zoneView = z.createView();
-    }
     if (hdr) {
       // the input in the tone map, once for the three that run inside it
       const pl = pipeline('srtm', SRTM(false), format, plOne);
@@ -297,20 +282,6 @@ export async function createEngine({ K, mwsr, nis, soft = false, onLost = () => 
     const sv = src.createView();
     const dv = dst.createView();
     switch (id) {
-      case 'mwsrz': {
-        // without zones (a reduction, under x1.3, HDR, no native frame), the law: MWSR's own passes
-        if (!C.zoneView) return passes('mwsr', half, { c444 }, src, dst);
-        const constants = c444 ? { CHROMA444: 1 } : {};
-        const pl = pipeline(
-          'mwsrz' + (half ? 'h' : '') + (c444 ? '444' : ''),
-          mwsrWgsl({ feed: 'tex', half, mode: 'up', map: true }),
-          f,
-          plMap,
-          ['vs', 'fs'],
-          constants,
-        );
-        return [{ pipeline: pl, group: bind(pl, [sampler, sv, { buffer: C.u.mwsr }, C.zoneView]), view: dv }];
-      }
       case 'mwsr': {
         const r = C.reg;
         if (r.mode === 'down') {
@@ -322,7 +293,7 @@ export async function createEngine({ K, mwsr, nis, soft = false, onLost = () => 
             fv,
             plTex,
             ['vs', 'fs'],
-            { R_DOWN: r.rDown, LINEAR_LIGHT: r.linearLight },
+            mwsrDownConstants(r),
           );
           const from = C.hdr ? C.linIn.createView() : src.createView({ format: fv });
           return [
@@ -439,52 +410,56 @@ export async function createEngine({ K, mwsr, nis, soft = false, onLost = () => 
 
   /**
    * `iters` draws of upscaler `id` (its own passes, not the tone map around it,
-   * into a scratch texture), in command buffers of `chunk` draws submitted
-   * together. One timestamp at the start of the first pass, one at the end of
-   * the last: the browser rounds timestamps (to 0.1 ms in Chrome), a batch of
-   * 100 draws makes that a small share. Without timestamp-query, the wall time
-   * from the submission to the completion.
+   * into a scratch texture), in pieces of `chunk` draws, each submitted once the
+   * one before is done. One timestamp at the start of a piece's first pass, one
+   * at the end of its last: the browser rounds timestamps (to 0.1 ms in Chrome),
+   * and the time per draw is the pieces' sum over `iters`. Without
+   * timestamp-query, the wall time from each submission to its completion.
+   * `stop` is asked before each piece: when it says yes the page wants the GPU,
+   * the batch is dropped and the answer is null.
    */
-  async function time(id, half, opts, iters = 100, chunk = iters) {
+  async function time(id, half, opts, iters = 100, chunk = iters, stop = () => false) {
     const src = C.hdr && KERNELS.find((x) => x.id === id).wrap ? C.tmIn : C.inTex;
     const list = passes(id, half, opts, src, C.scratch);
     const n = list.length;
-    const cbs = [];
+    let wall = 0;
+    let gpu = hasTs ? 0 : null;
     for (let i0 = 0; i0 < iters; i0 += chunk) {
+      if (stop()) return null;
+      const count = Math.min(chunk, iters - i0);
       const enc = device.createCommandEncoder();
-      for (let i = i0; i < Math.min(iters, i0 + chunk); i++) {
+      for (let i = 0; i < count; i++) {
         let stamps = null;
-        if (hasTs && (i === 0 || i === iters - 1)) {
+        if (hasTs && (i === 0 || i === count - 1)) {
           stamps = new Array(n).fill(null);
           const first = i === 0 ? { beginningOfPassWriteIndex: 0 } : {};
-          const last = i === iters - 1 ? { endOfPassWriteIndex: 1 } : {};
+          const last = i === count - 1 ? { endOfPassWriteIndex: 1 } : {};
           if (n === 1) stamps[0] = { querySet: qs, ...first, ...last };
           else {
             if (i === 0) stamps[0] = { querySet: qs, ...first };
-            if (i === iters - 1) stamps[n - 1] = { querySet: qs, ...last };
+            if (i === count - 1) stamps[n - 1] = { querySet: qs, ...last };
           }
         }
         encode(enc, list, stamps);
       }
-      if (hasTs && i0 + chunk >= iters) {
+      if (hasTs) {
         enc.resolveQuerySet(qs, 0, 2, qResolve, 0);
         enc.copyBufferToBuffer(qResolve, 0, qRead, 0, 16);
       }
-      cbs.push(enc.finish());
+      const t0 = performance.now();
+      device.queue.submit([enc.finish()]);
+      await device.queue.onSubmittedWorkDone();
+      wall += performance.now() - t0;
+      if (hasTs) {
+        await qRead.mapAsync(GPUMapMode.READ, 0, 16);
+        const q = new BigInt64Array(qRead.getMappedRange(0, 16));
+        const span = Number(q[1] - q[0]) / 1e6;
+        qRead.unmap();
+        if (span > 0 && gpu != null) gpu += span;
+        else gpu = null;
+      }
     }
-    const t0 = performance.now();
-    device.queue.submit(cbs);
-    await device.queue.onSubmittedWorkDone();
-    const wall = (performance.now() - t0) / iters;
-    let gpu = null;
-    if (hasTs) {
-      await qRead.mapAsync(GPUMapMode.READ, 0, 16);
-      const q = new BigInt64Array(qRead.getMappedRange(0, 16));
-      const span = Number(q[1] - q[0]) / 1e6;
-      qRead.unmap();
-      if (span > 0) gpu = span / iters;
-    }
-    return { gpu, wall };
+    return { gpu: gpu != null ? gpu / iters : null, wall: wall / iters };
   }
 
   // ── panes ──
@@ -571,10 +546,15 @@ export async function createEngine({ K, mwsr, nis, soft = false, onLost = () => 
     hasF16,
     /** Whether `id` has a 16-bit text for this case (MWSR's reduction has none). */
     halfOf: (id) =>
-      hasF16 && KERNELS.find((k) => k.id === id).half && !(id.startsWith('mwsr') && C.reg.mode === 'down'),
-    hasZones: () => !!(C && C.zoneView),
+      hasF16 && KERNELS.find((k) => k.id === id).half && !(id === 'mwsr' && C.reg.mode === 'down'),
     /** MWSR's mode for this case: 'up' or 'down'. */
     mwsrMode: () => C && C.reg.mode,
+    /** The text MWSR runs in this case: 'up', 'down1', 'down9lin'… */
+    mwsrKey: () => C && mwsr.mwsrRegimeKey(C.reg),
+    vendor: info.vendor,
+    architecture: info.architecture,
+    /** What the GPU refused since the last call. */
+    takeRefused: () => refused.splice(0),
     setCase,
     draw,
     readOut,

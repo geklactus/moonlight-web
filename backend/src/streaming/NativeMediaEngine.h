@@ -96,6 +96,10 @@ public:
         /// A rate the session may not exceed, alignment included (0 = none) —
         /// see SessionConfig::maxFps.
         int maxFps = 0;
+        /// The administrator's ceilings (0 = none): no cadence step above
+        /// the one, no client bitrate above the other.
+        int fpsLimit = 0;
+        int bitrateLimitKbps = 0;
         int bitrateKbps = 20000;
         /// VIDEO_FORMAT_* bitmask of what the browser can decode.
         int clientVideoFormats = 0;
@@ -117,6 +121,8 @@ public:
         /// Rebuild at the display's new shape when its mode changes under the
         /// session — see SessionConfig::followDisplayShape.
         bool followDisplayShape = false;
+        /// The viewer's codec setting is Auto — see SessionConfig::codecAuto.
+        bool codecAuto = false;
         /// width × height is a box to fit (the display's shape inside it),
         /// and whether the frame may then be larger than the display — see
         /// SessionConfig::fitRequestedBox and allowUpscale.
@@ -146,6 +152,11 @@ public:
         /// Silence the host's speakers while the session runs — the same
         /// stream setting GameStream hosts receive as localAudioPlayMode.
         bool muteHostAudio = true;
+        /// Which sound the stream carries, as stored ("all", "focused",
+        /// "app:discord.exe") — see SessionConfig::audioSource.
+        std::string audioSource;
+        /// See SessionConfig::onAudioAppChanged.
+        std::function<void(const std::string&)> onAudioAppChanged;
         /// The desktop portal consent this machine was granted last time, if
         /// any — see SessionConfig::portalRestoreToken. Empty means the user
         /// will be asked; whatever comes back arrives as portalGrantReceived().
@@ -638,6 +649,9 @@ private:
     FeedPublisher* m_Publisher = nullptr;
     /// A guest's end of the feed's pipe; null for every other engine.
     std::unique_ptr<FeedSubscriber> m_Subscriber;
+    /// StartParams::fpsLimit and bitrateLimitKbps.
+    int m_FpsLimit = 0;
+    int m_BitrateLimitKbps = 0;
     /// The feed's session as its `info` said — what a guest's engine reports
     /// instead of its own — its overlay name and its log line. Under
     /// m_FeedMutex: read by the relay's thread, written on this engine's.

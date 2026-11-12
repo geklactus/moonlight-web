@@ -183,10 +183,15 @@ Reste, en amont et hors du patch :
 - **Windows** : la règle de l'installeur porte sur le programme, tous protocoles : le TCP entrant
   passe sans autre règle. Une `--dev` est couverte par `scripts/dev-firewall-allow.ps1`, qui ouvre
   48550-48573 en TCP et en UDP.
-- **Linux** : les paquets n'ouvrent que `48550:48573/udp` dans ufw et firewalld. Il faudra
-  `48550:48573/tcp`, plus les ports du tunnel, pour qu'un hôte Linux au pare-feu actif accepte
-  l'appel. C'est une modification d'empaquetage, pas encore faite au passage du défaut à vrai
-  (26/10) : d'ici là, un tel hôte refuse la connexion TCP, comme avant.
+- **Linux** (D3, v0.4.2) : le `.deb`, le `.rpm` et le paquet AUR ouvrent désormais dans ufw et
+  firewalld, en plus de `48550:48573/udp`, le même bloc en TCP et les ports du tunnel en TCP
+  (`3478:3481`, `5349:5352`, `46000:46031`). L'édition DEV ouvre son propre bloc de tunnel,
+  `46064:46095/tcp`. Le README de Docker et `install.sh` donnent les mêmes lignes, puisqu'un
+  conteneur ne touche pas au pare-feu de sa machine. Un pare-feu à états laisse revenir une
+  réponse UDP, jamais un SYN venu de l'extérieur : sans ces règles, un hôte Linux au pare-feu
+  actif refuse la connexion TCP. Rien n'écoute sur ces ports entre deux connexions, et pendant
+  l'une d'elles seul un contrôle signé pour elle est admis (§3).
+  - Limite : sans UPnP, le tunnel prend un port éphémère, qu'aucune règle ne peut ouvrir d'avance.
 - **macOS** : le pare-feu applicatif porte sur le programme.
 - **Le trou TCP du routeur** suit maintenant la règle du trou UDP (26/10, revue de sécurité, T3).
   On ne l'écrit, ne le renouvelle et ne le retire que s'il est libre ou à nous. Avant, une
@@ -206,6 +211,12 @@ Reste, en amont et hors du patch :
    - Le premier écoute (`ACTIVE_PASSIVE`). Le second ne reçoit que ses candidats TCP passifs, et
      appelle en TCP actif.
    - On attend qu'ils se connectent et échangent des données sans aucun UDP.
+   - Le test choisit d'avance un port libre en TCP et en UDP pour l'agent qui écoute. Laissé au
+     système, le port UDP peut être refusé en TCP : Windows réserve des blocs de 100 ports ou plus
+     à un seul protocole (`netsh int ipv4 show excludedportrange protocol=tcp`, erreur 10013) et
+     distribue les ports UDP en séquence, donc l'agent suivant retombe dans le même bloc. Le test
+     échouait ainsi 4 fois sur 60 (03/11). En production le port est épinglé dans 48550-48573, hors
+     de la plage dynamique, sauf si tout le bloc est pris.
    - Tests de la porte : sans trame, la connexion est fermée en 2 s ; une longueur hors bornes, un
      message qui n'est pas du STUN, un mauvais ufrag ou un mauvais HMAC la ferment ; la 5ᵉ
      connexion en attente aussi ; après `COMPLETED`, l'écoute refuse.
@@ -237,10 +248,34 @@ Reste, en amont et hors du patch :
      | TCP, file + `boot.js` | 5,6 s | 16,1 s |
      | UDP avant | 19,4 s | 27,9 s |
      | UDP, `boot.js` | 2,8 s | 10,7 s |
-   - v0.4.2 : compresser l'interface dans le tunnel (le JS se réduit d'environ 4 fois). L'hôte
-     compresse chaque réponse, `boot.js` la décompresse (`DecompressionStream`). Il faut un
-     drapeau dans le manifeste, pour qu'un `boot.js` récent sache traiter un hôte ancien et
-     l'inverse.
+   - v0.4.2 : compresser l'interface dans le tunnel (le JS se réduit d'environ 4 fois). La
+     négociation se fait par requête plutôt que par un drapeau dans le manifeste. `tunnel.js`
+     met `"z":"deflate"` dans la tête d'une requête quand le navigateur a `DecompressionStream`.
+     L'hôte compresse alors la réponse en zlib (`qCompress`) et marque sa propre tête de la même
+     façon ; `tunnel.js` la décompresse avant de construire la `Response`. Les empreintes et la
+     liste officielle voient donc les mêmes octets qu'avant. Un hôte ancien ignore le champ, et
+     un navigateur sans `DecompressionStream` ne le demande pas : chaque mélange d'anciens et de
+     nouveaux reçoit le corps tel quel. Ne sont compressés que les fichiers de l'interface
+     (GET hors `/api/`, statut 200, type texte, 1 Ko ou plus, manifeste web exclu). Une réponse
+     de l'API porte des sessions et des clés à côté de texte choisi par l'appelant, et sa
+     longueur compressée en dirait trop (la forme de BREACH). Les vecteurs zlib sont partagés
+     entre `backend/tests/test_tunnel_frame.cpp` et `frontend/test/tunnelFrame.test.js`.
+   - Mesuré le 07/11 (21:1x-21:3x) au même banc : une `--dev` par stream.dev, UPnP coupé, un
+     Chrome du WSL sur profil neuf, +115 ms. `boot.js` et `tunnel.js` du dépôt sont substitués
+     par CDP. Le témoin est une copie de `tunnel.js` qui ne demande jamais la compression. Pour
+     le TCP, l'UDP sortant du WSL est coupé par nft, sauf vers son résolveur DNS ; la seule
+     connexion de l'hôte était alors sur l'écoute TCP passive. On mesure du début du
+     téléchargement au 194ᵉ fichier :
+
+     | Chemin | Sans compression | Avec compression |
+     |---|---|---|
+     | TCP | 14,2 s, 25,0 s | 3,9 s, 3,9 s |
+     | UDP | 3,5 s, 3,8 s | 3,6 s, 3,1 s |
+
+     - 174 des 194 fichiers arrivent compressés : 4,73 Mo deviennent 1,37 Mo sur le fil.
+     - La vérification des empreintes passe à chaque fois.
+     - En UDP, le gain se perd dans le bruit : le temps vient des allers-retours.
+     - Le TCP n'est plus le parent pauvre de l'UDP.
 6. ✅ **Depuis un vrai réseau** (26/10, 09:41-09:43) : Bruno, au bureau, sur un Mac d'entreprise
    sans droits d'administration. Le réseau laisse sortir l'UDP : la `--dev` de 59 portait la clé de
    banc `debug_ice_drop_udp` (§3.6). Le tunnel passe en TCP sur 46064 et le flux en

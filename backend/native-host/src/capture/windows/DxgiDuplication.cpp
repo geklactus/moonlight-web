@@ -20,6 +20,7 @@
 #include "../../core/Log.h"
 #include "../../core/PresentLattice.h"
 #include "CursorShape.h"
+#include "DisplayRotation.h"
 
 #include <chrono>
 
@@ -147,6 +148,7 @@ bool DxgiDuplication::start(std::string& error)
 
     DXGI_OUTDUPL_DESC duplDesc = {};
     m_Duplication->GetDesc(&duplDesc);
+
     m_Width = static_cast<int>(duplDesc.ModeDesc.Width);
     m_Height = static_cast<int>(duplDesc.ModeDesc.Height);
     // The mode's refresh as a rational, for the lattice the stream's gate
@@ -177,6 +179,16 @@ bool DxgiDuplication::start(std::string& error)
         m_DesktopRect.bottom = static_cast<int>(outputDesc.DesktopCoordinates.bottom);
     }
 
+    // A desktop turned against its panel comes back as the panel scans it
+    // out, on its side or upside down, and turning it is left to the caller
+    // (issue #54): the converter turns it upright as it reads it. Everything
+    // else goes by the desktop as it stands — so the mode is stood that way
+    // too, and the turn kept for the converter (DisplayRotation.h).
+    m_Turn = quarterTurns(static_cast<int>(duplDesc.Rotation));
+    duplicationUprightSize(m_Width, m_Height, static_cast<int>(duplDesc.Rotation),
+                           m_DesktopRect.width(), m_DesktopRect.height());
+    m_TurnChecked = m_Turn == 0;
+
     // Calibrate the two clocks against each other, as close together as
     // possible — see qpcToMicroseconds.
     LARGE_INTEGER qpcNow = {};
@@ -194,7 +206,11 @@ bool DxgiDuplication::start(std::string& error)
                : m_Format == DXGI_FORMAT_B8G8R8A8_UNORM
                    ? " (SDR, BGRA8)"
                    : " (format " + std::to_string(static_cast<int>(m_Format)) + ")") +
-              hz);
+              hz +
+              (m_Turn != 0 ? ", the display turned " + std::to_string(m_Turn * 90) +
+                                 "° against its panel: its pictures are turned upright in the "
+                                 "conversion"
+                           : ""));
     return true;
 }
 
@@ -261,9 +277,20 @@ bool DxgiDuplication::retake(std::string& error)
     }
     DXGI_OUTDUPL_DESC desc = {};
     m_Duplication->GetDesc(&desc);
-    if (static_cast<int>(desc.ModeDesc.Width) != m_Width ||
-        static_cast<int>(desc.ModeDesc.Height) != m_Height || desc.ModeDesc.Format != m_Format) {
+    // Stood as start() stands it, so that a turned display compares upright.
+    int width = static_cast<int>(desc.ModeDesc.Width);
+    int height = static_cast<int>(desc.ModeDesc.Height);
+    duplicationUprightSize(width, height, static_cast<int>(desc.Rotation), m_DesktopRect.width(),
+                           m_DesktopRect.height());
+    if (width != m_Width || height != m_Height || desc.ModeDesc.Format != m_Format) {
         error = "the display changed mode meanwhile";
+        m_RetakeLost = true;
+        return false;
+    }
+    // A half turn keeps the size: only the rotation says the picture would now
+    // arrive upside down, to a converter built for the turn start() read.
+    if (quarterTurns(static_cast<int>(desc.Rotation)) != m_Turn) {
+        error = "the display was turned meanwhile";
         m_RetakeLost = true;
         return false;
     }
@@ -490,6 +517,26 @@ AcquireStatus DxgiDuplication::acquire(int timeoutMs, CapturedFrame& frame)
         return AcquireStatus::Failed;
     }
 
+    // The first picture of a turned display, looked at once: the size the
+    // turn swaps is the one Microsoft's sample, Sunshine and OBS all take it
+    // to arrive at. Said when it does not, so that a driver handing the
+    // picture over otherwise is found in the log rather than guessed at.
+    if (!m_TurnChecked) {
+        m_TurnChecked = true;
+        D3D11_TEXTURE2D_DESC desc = {};
+        m_AcquiredTexture->GetDesc(&desc);
+        const bool odd = (m_Turn & 1) != 0;
+        const int expectedWidth = odd ? m_Height : m_Width;
+        const int expectedHeight = odd ? m_Width : m_Height;
+        if (static_cast<int>(desc.Width) != expectedWidth ||
+            static_cast<int>(desc.Height) != expectedHeight)
+            log::warning("[native] the duplication of a display turned " +
+                         std::to_string(m_Turn * 90) + "° hands its pictures over at " +
+                         std::to_string(desc.Width) + "x" + std::to_string(desc.Height) + ", not " +
+                         std::to_string(expectedWidth) + "x" + std::to_string(expectedHeight) +
+                         " — the stream may come stretched or turned");
+    }
+
     // AccumulatedFrames counts every present folded into this one: one is
     // the frame itself, anything above it was presented and never acquired.
     if (info.AccumulatedFrames > 1) m_FoldedPresents += info.AccumulatedFrames - 1;
@@ -527,6 +574,8 @@ void DxgiDuplication::stop()
     m_Device.Reset();
     m_Width = 0;
     m_Height = 0;
+    m_Turn = 0;
+    m_TurnChecked = true;
     m_RefreshPeriodNs = 0;
 }
 

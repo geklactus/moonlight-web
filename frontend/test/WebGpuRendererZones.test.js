@@ -45,6 +45,8 @@ function fakeGpu() {
             code: desc.code,
             getCompilationInfo: async () => ({ messages: [] }),
         })),
+        pushErrorScope() {},
+        popErrorScope: async () => null,
         createRenderPipeline: vi.fn((desc) => ({
             code: desc.fragment.module.code,
             getBindGroupLayout: () => ({}),
@@ -216,9 +218,9 @@ describe("WebGpuRenderer — mwsr's zones from the native host", () => {
         await r.draw(frame(6));
         expect(last(gpu).pipeline).toBe(up);
         expect(r._zonesByTs.size).toBe(0);
-        // ×1.25: under the bench's scales, whatever the host decided for
-        r.setOutputSize(800, 450);
-        r.noteFrameZones(7, zones(1.25));
+        // ×1.11: under the bench's scales, whatever the host decided for
+        r.setOutputSize(711, 400);
+        r.noteFrameZones(7, zones(1.11));
         await r.draw(frame(7));
         expect(last(gpu).pipeline).toBe(up);
         expect(zoneWrites(gpu, r)).toHaveLength(0);

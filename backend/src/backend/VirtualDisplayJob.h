@@ -82,15 +82,23 @@ public:
     /// @p hdr: the viewer asked for HDR. macOS makes its display able to
     /// show it (EDR) only then — an SDR stream off a display declared in
     /// BT.2020 would come out washed. Windows ignores it: its display is SDR.
-    void activate(int width, int height, int refreshMilliHz, bool hdr, Callback cb);
-    void activate(Callback cb) { activate(0, 0, 0, false, std::move(cb)); }
+    ///
+    /// The owner's. @p othersOff: this stream wants the other displays off
+    /// (VirtualDisplay::ownerWantsOthersOff: the admin allows it and the
+    /// viewer chose it). They go off when this runs an operation and no guest
+    /// is on the display (othersGoOff). On already in that mode, it does not
+    /// run one and they stay as they are.
+    void activate(int width, int height, int refreshMilliHz, bool hdr, bool othersOff, Callback cb);
+    void activate(Callback cb) { activate(0, 0, 0, false, false, std::move(cb)); }
 
     /// For an invited guest, who arrives with no owner stream on it: turn the
     /// display on, in that mode, when it is off. On already — whatever its
     /// mode — or on its way on, it is left as it is and answers once it is
     /// there: another guest may be watching it, and a new mode would take it
     /// from them for as long as the driver restarts. SDR (Windows' display
-    /// is, and a guest's stream is). Cancels a pending releaseSoon().
+    /// is, and a guest's stream is). Cancels a pending releaseSoon(). Never
+    /// turns the other displays off (VirtualDisplay::othersGoOff); left off by
+    /// an owner who is gone, they come back on before this answers.
     void activateIfOff(int width, int height, int refreshMilliHz, Callback cb);
 
     /// Turn it off (previous primary back, disable). @p cb may be null.
@@ -107,6 +115,12 @@ public:
     /// (cancelling the grace) BEFORE the stream it replaces is torn down, and
     /// that teardown starts the grace again — under the new stream.
     void setInUse(std::function<bool()> inUse) { m_InUse = std::move(inUse); }
+
+    /// Which side streams the display. With the owner gone and a guest on it,
+    /// the other displays come back on when that grace runs out or a guest
+    /// arrives; with a guest on it, the owner's stream leaves them on.
+    void setOwnerOn(std::function<bool()> ownerOn) { m_OwnerOn = std::move(ownerOn); }
+    void setGuestOn(std::function<bool()> guestOn) { m_GuestOn = std::move(guestOn); }
 
     /// Asked when the display is about to go off for good (no stream left
     /// once the grace ran out; on Linux, at the stream's end): closes what
@@ -139,11 +153,17 @@ private:
         int height = 0;
         int refreshMilliHz = 0;
         bool hdr = false;
+        bool exclusive = false; ///< VirtualDisplay::Request::exclusive
         Callback cb;
     };
 
+    void activateAs(VirtualDisplay::Asker asker, int width, int height, int refreshMilliHz,
+                    bool hdr, bool othersOff, Callback cb);
+    /// The other displays are off and the owner's stream that wanted them so
+    /// is gone (VirtualDisplay::othersComeBack).
+    bool othersDueBack() const;
     void enqueue(VirtualDisplay::Request::Action action, int width, int height, int refreshMilliHz,
-                 bool hdr, Callback cb);
+                 bool hdr, bool exclusive, Callback cb);
     void startNext();
     void setState(State s);
     void fail(const QString& error);
@@ -182,6 +202,8 @@ private:
     /// Since when runTask() waits for the task's previous run to end.
     QElapsedTimer m_TaskBusySince;
     std::function<bool()> m_InUse;
+    std::function<bool()> m_OwnerOn;
+    std::function<bool()> m_GuestOn;
     std::function<bool()> m_BeforeRelease;
     QByteArray m_HelperOut;
     // The service path runs the node stage as SYSTEM and the desktop stages

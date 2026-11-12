@@ -21,6 +21,7 @@
 #include "common/Logger.h"
 #include "common/PairingCrypto.h"
 
+#include <QCryptographicHash>
 #include <QDateTime>
 #include <QDir>
 #include <QFile>
@@ -35,6 +36,7 @@
 #include <QStandardPaths>
 #include <QHash>
 #include <QSet>
+#include <QThread>
 #include <QUuid>
 
 #include <algorithm>
@@ -45,7 +47,11 @@
 
 namespace {
 QString g_FileOverride;
-}
+// Every setter reads the whole file, changes one key and writes it all back, so
+// a read that did not get the file's content is never written back. Per thread:
+// a read and the write it feeds run on the same one.
+thread_local bool t_LastReadIncomplete = false;
+} // namespace
 
 AppSettings::AppSettings()
 {
@@ -75,17 +81,82 @@ QString AppSettings::fileOverride()
 
 QJsonObject AppSettings::readAll() const
 {
-    QFile file(m_FilePath);
-    if (!file.open(QIODevice::ReadOnly)) {
+    bool complete = false;
+    return readAll(&complete);
+}
+
+QJsonObject AppSettings::readAll(bool* complete) const
+{
+    *complete = true;
+    t_LastReadIncomplete = false;
+    if (!QFileInfo::exists(m_FilePath)) return {};
+
+    // Another process can hold the file for a moment (the installer reading it,
+    // an antivirus scan, a rename by another instance): try again shortly before
+    // concluding anything from a failed read.
+    bool opened = false;
+    QByteArray data;
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        if (attempt > 0) QThread::msleep(15);
+        QFile file(m_FilePath);
+        if (!file.open(QIODevice::ReadOnly)) {
+            opened = false;
+            continue;
+        }
+        opened = true;
+        data = file.readAll();
+        if (file.error() != QFileDevice::NoError) {
+            opened = false;
+            continue;
+        }
+        if (data.trimmed().isEmpty()) return {};
+        QJsonParseError err{};
+        const QJsonDocument doc = QJsonDocument::fromJson(data, &err);
+        if (err.error == QJsonParseError::NoError && doc.isObject()) return doc.object();
+    }
+
+    if (!opened) {
+        if (!QFileInfo::exists(m_FilePath)) return {};
+        Logger::warning("[AppSettings] Could not read " + m_FilePath +
+                        ": settings are not saved until it can be read again");
+        *complete = false;
+        t_LastReadIncomplete = true;
         return {};
     }
-    QJsonObject obj = QJsonDocument::fromJson(file.readAll()).object();
-    file.close();
-    return obj;
+
+    // Readable but not a settings document. Keep it beside the new one rather
+    // than lose what it holds, then start from the defaults. Named after its
+    // content, so the reads before the next write keep one copy, not one each.
+    const QString aside =
+        m_FilePath + ".unreadable-" +
+        QString::fromLatin1(
+            QCryptographicHash::hash(data, QCryptographicHash::Sha256).toHex().left(12));
+    if (QFileInfo::exists(aside)) return {};
+    QFile copy(aside);
+    if (!copy.open(QIODevice::WriteOnly) || copy.write(data) != data.size() || !copy.flush()) {
+        copy.close();
+        QFile::remove(aside);
+        Logger::warning("[AppSettings] " + m_FilePath +
+                        " is not valid and could not be kept aside: settings are not saved");
+        *complete = false;
+        t_LastReadIncomplete = true;
+        return {};
+    }
+    copy.close();
+    Logger::warning("[AppSettings] " + m_FilePath + " is not valid: kept as " + aside +
+                    ", settings start from the defaults");
+    return {};
 }
 
 void AppSettings::writeAll(const QJsonObject& obj)
 {
+    const bool incomplete = t_LastReadIncomplete;
+    t_LastReadIncomplete = false;
+    if (incomplete) {
+        Logger::warning("[AppSettings] Not writing " + m_FilePath +
+                        ": its last read failed, and the write would replace what it holds");
+        return;
+    }
     // QSaveFile, not a plain truncate-and-rewrite: this file is read by other
     // processes while we run — the Windows installer reads it to decide which
     // wizard pages are already answered — and a truncating write leaves it empty
@@ -433,6 +504,19 @@ void AppSettings::seedDocumentedDefaults()
         obj["ice_tcp_passive"] = true;
         changed = true;
     }
+    // The administrator's ceilings (AppSettings.h), none until one is written.
+    if (!obj.contains("max_allowed_frame_rate")) {
+        obj["max_allowed_frame_rate"] = 0;
+        changed = true;
+    }
+    if (!obj.contains("max_allowed_bitrate")) {
+        obj["max_allowed_bitrate"] = 0;
+        changed = true;
+    }
+    if (!obj.contains("max_allowed_stream_resolution")) {
+        obj["max_allowed_stream_resolution"] = QStringLiteral("0x0");
+        changed = true;
+    }
     // The admin's codec of a native session (8f8d9307, never released): PyroWave
     // moved to each browser's Settings → Video codec, where it is chosen per
     // device — the one on Ethernet — rather than for every browser at once.
@@ -570,6 +654,167 @@ void AppSettings::setStreamFps(int fps)
     writeAll(obj);
 }
 
+// ── The administrator's ceilings ─────────────────────────────────────────────────
+
+namespace {
+
+/// A whole number from 0 to kLimitMax, or -1. Digits only: "60", " 60 ".
+int limitNumber(const QString& text)
+{
+    const QString t = text.trimmed();
+    if (t.isEmpty() || t.size() > 6) return -1;
+    for (const QChar c : t)
+        if (!c.isDigit()) return -1;
+    const int n = t.toInt();
+    return n <= AppSettings::kLimitMax ? n : -1;
+}
+
+/// A rate as the file holds it: a number, or the same written as a string.
+/// Anything else is no limit, said once per read.
+int readLimit(const QJsonObject& obj, const char* key)
+{
+    const QJsonValue v = obj.value(QLatin1String(key));
+    if (v.isUndefined() || v.isNull()) return 0;
+    int n = -1;
+    if (v.isDouble()) {
+        const double d = v.toDouble();
+        if (d >= 0 && d <= AppSettings::kLimitMax) n = static_cast<int>(d);
+    } else if (v.isString()) {
+        n = limitNumber(v.toString());
+    }
+    if (n < 0) {
+        Logger::warning(QString("settings.json: %1 is not a whole number from 0 to %2 — no limit")
+                            .arg(QLatin1String(key))
+                            .arg(AppSettings::kLimitMax));
+        return 0;
+    }
+    return n;
+}
+
+} // namespace
+
+bool AppSettings::parseStreamResolution(const QString& text, int* width, int* height)
+{
+    *width = 0;
+    *height = 0;
+    const QString t = text.trimmed().toLower();
+    int sep = t.indexOf(QLatin1Char('x'));
+    if (sep < 0) sep = t.indexOf(QChar(0x00D7)); // ×
+    if (sep < 0) {
+        const int n = limitNumber(t);
+        if (n < 0) return false;
+        *width = n;
+        *height = n;
+        return true;
+    }
+    const int w = limitNumber(t.left(sep));
+    const int h = limitNumber(t.mid(sep + 1));
+    if (w < 0 || h < 0) return false;
+    *width = w;
+    *height = h;
+    return true;
+}
+
+QString AppSettings::streamResolutionText(int width, int height)
+{
+    return QString("%1x%2").arg(qMax(0, width)).arg(qMax(0, height));
+}
+
+AppSettings::StreamLimits AppSettings::streamLimits() const
+{
+    const QJsonObject obj = readAll();
+    StreamLimits limits;
+    limits.fps = readLimit(obj, "max_allowed_frame_rate");
+    limits.bitrateMbps = readLimit(obj, "max_allowed_bitrate");
+    const QJsonValue res = obj.value("max_allowed_stream_resolution");
+    if (res.isDouble() || res.isString()) {
+        const QString text =
+            res.isDouble() ? QString::number(res.toDouble(), 'f', 0) : res.toString();
+        if (!parseStreamResolution(text, &limits.width, &limits.height))
+            Logger::warning(QString("settings.json: max_allowed_stream_resolution \"%1\" is not "
+                                    "WIDTHxHEIGHT (\"1920x1080\", \"1920\", \"0x1440\", \"0\") — "
+                                    "no limit")
+                                .arg(text));
+    } else if (!res.isUndefined() && !res.isNull()) {
+        Logger::warning("settings.json: max_allowed_stream_resolution is not WIDTHxHEIGHT — "
+                        "no limit");
+    }
+    // Encoders take even sides.
+    limits.width &= ~1;
+    limits.height &= ~1;
+    return limits;
+}
+
+AppSettings::LimitedSize AppSettings::limitStreamSize(const StreamLimits& limits, int width,
+                                                      int height, bool fitBox, bool matchDisplay,
+                                                      bool nativeHost, int fallbackWidth,
+                                                      int fallbackHeight)
+{
+    LimitedSize out;
+    out.width = width;
+    out.height = height;
+    out.fitBox = fitBox;
+    out.fallbackWidth = fallbackWidth;
+    out.fallbackHeight = fallbackHeight;
+    if (limits.width <= 0 && limits.height <= 0) return out;
+    const int maxW = limits.width > 0 ? limits.width : kLimitMax;
+    const int maxH = limits.height > 0 ? limits.height : kLimitMax;
+
+    if (height <= 0) {
+        // The display's own size, which only the native host answers: the
+        // largest frame of its shape inside the ceiling, never upscaled.
+        out.width = maxW;
+        out.height = maxH;
+        out.fitBox = true;
+    } else if (fitBox && !matchDisplay) {
+        out.width = qMin(width, maxW) & ~1;
+        out.height = qMin(height, maxH) & ~1;
+    } else {
+        const int w = width > 0 ? width : height * 16 / 9;
+        const double scale = qMin(1.0, qMin(double(maxW) / w, double(maxH) / height));
+        if (scale < 1.0) {
+            out.width = qRound(w * scale) & ~1;
+            out.height = qRound(height * scale) & ~1;
+        }
+        // The native host's fixed height takes its display's shape, which
+        // may be wider than the ceiling (a 21:9 display at 1080 lines): a
+        // box as wide as the ceiling, as tall as that height.
+        if (nativeHost && !fitBox && limits.width > 0) {
+            out.width = maxW;
+            out.fitBox = true;
+        }
+    }
+    if (fallbackWidth > 0 && fallbackHeight > 0) {
+        out.fallbackWidth = qMin(fallbackWidth, maxW) & ~1;
+        out.fallbackHeight = qMin(fallbackHeight, maxH) & ~1;
+    }
+    out.changed = out.width != width || out.height != height || out.fitBox != fitBox ||
+                  out.fallbackWidth != fallbackWidth || out.fallbackHeight != fallbackHeight;
+    return out;
+}
+
+void AppSettings::setMaxAllowedFrameRate(int fps)
+{
+    QJsonObject obj = readAll();
+    obj["max_allowed_frame_rate"] = qBound(0, fps, kLimitMax);
+    writeAll(obj);
+}
+
+void AppSettings::setMaxAllowedBitrate(int mbps)
+{
+    QJsonObject obj = readAll();
+    obj["max_allowed_bitrate"] = qBound(0, mbps, kLimitMax);
+    writeAll(obj);
+}
+
+void AppSettings::setMaxAllowedStreamResolution(int width, int height)
+{
+    QJsonObject obj = readAll();
+    obj["max_allowed_stream_resolution"] =
+        streamResolutionText(qBound(0, width, kLimitMax), qBound(0, height, kLimitMax));
+    writeAll(obj);
+}
+
 // ── HDR ──────────────────────────────────────────────────────────────────────────
 
 bool AppSettings::hdrEnabled() const
@@ -600,6 +845,32 @@ void AppSettings::setMuteHostAudio(bool enabled)
     writeAll(obj);
 }
 
+// ── Which sound the stream carries ────────────────────────────────────────────
+
+QString AppSettings::canonicalAudioSource(const QString& source)
+{
+    if (source == QLatin1String("focused")) return source;
+    if (source.startsWith(QLatin1String("app:"))) {
+        const QString exe = source.mid(4).trimmed().toLower();
+        if (exe.size() <= 260 && exe.endsWith(QLatin1String(".exe")) &&
+            !exe.contains(QLatin1Char('/')) && !exe.contains(QLatin1Char('\\')))
+            return QStringLiteral("app:") + exe;
+    }
+    return QStringLiteral("all");
+}
+
+QString AppSettings::audioSource() const
+{
+    return canonicalAudioSource(readAll().value("audio_source").toString());
+}
+
+void AppSettings::setAudioSource(const QString& source)
+{
+    QJsonObject obj = readAll();
+    obj["audio_source"] = canonicalAudioSource(source);
+    writeAll(obj);
+}
+
 // ── Streaming notifications ────────────────────────────────────────────────────
 
 bool AppSettings::streamNotifications() const
@@ -612,6 +883,19 @@ void AppSettings::setStreamNotifications(bool enabled)
 {
     QJsonObject obj = readAll();
     obj["stream_notifications"] = enabled;
+    writeAll(obj);
+}
+
+bool AppSettings::remoteDesktopReturn() const
+{
+    QJsonObject obj = readAll();
+    return obj.value("remote_desktop_return").toBool(true);
+}
+
+void AppSettings::setRemoteDesktopReturn(bool enabled)
+{
+    QJsonObject obj = readAll();
+    obj["remote_desktop_return"] = enabled;
     writeAll(obj);
 }
 
@@ -700,6 +984,12 @@ bool AppSettings::debugIceDropUdp() const
 {
     QJsonObject obj = readAll();
     return obj.value("debug_ice_drop_udp").toBool(false);
+}
+
+QString AppSettings::debugTunnelPublicAddress() const
+{
+    QJsonObject obj = readAll();
+    return obj.value("debug_tunnel_public_address").toString();
 }
 
 bool AppSettings::sharedFeedEnabled() const
@@ -811,7 +1101,16 @@ void AppSettings::setVirtualDisplayExclusive(bool enabled)
 {
     QJsonObject obj = readAll();
     obj["virtual_display_exclusive"] = enabled;
+    obj["virtual_display_exclusive_inherited"] = false;
     writeAll(obj);
+}
+
+bool AppSettings::virtualDisplayExclusiveInherited() const
+{
+    QJsonObject obj = readAll();
+    const QJsonValue inherited = obj.value("virtual_display_exclusive_inherited");
+    return inherited.isBool() ? inherited.toBool()
+                              : obj.value("virtual_display_exclusive").toBool(false);
 }
 
 QString AppSettings::virtualDisplayGpu() const
@@ -1774,6 +2073,19 @@ void AppSettings::setRemoteAdminInternet(bool enabled)
     writeAll(obj);
 }
 
+bool AppSettings::pairRequestInternet() const
+{
+    QJsonObject obj = readAll();
+    return obj.value("pair_request_internet").toBool(false);
+}
+
+void AppSettings::setPairRequestInternet(bool enabled)
+{
+    QJsonObject obj = readAll();
+    obj["pair_request_internet"] = enabled;
+    writeAll(obj);
+}
+
 void AppSettings::setCertAuthEnabled(bool enabled)
 {
     QJsonObject obj = readAll();
@@ -1860,43 +2172,45 @@ int AppSettings::internetConsentVersion() const
     return consent.value("version").toInt(1);
 }
 
-// ── Host key (host-machine recognition over the public domain) ────────────────
+// ── Host key ──────────────────────────────────────────────────────────────────
 
-static QString generateLocalKey()
+bool AppSettings::forgetLocalKey()
 {
-    QByteArray raw(32, '\0');
-    for (int i = 0; i < raw.size(); ++i)
-        raw[i] = static_cast<char>(QRandomGenerator::system()->bounded(256));
-    return QString::fromLatin1(
-        raw.toBase64(QByteArray::Base64UrlEncoding | QByteArray::OmitTrailingEquals));
+    bool complete = false;
+    QJsonObject obj = readAll(&complete);
+    // A file that could not be read whole is not written over: what it holds
+    // would be lost with the key.
+    if (!complete || !obj.contains("local_key")) return false;
+    obj.remove("local_key");
+    writeAll(obj);
+    return true;
 }
 
-QString AppSettings::localKey()
+qint64 AppSettings::hostSessionRepairBefore()
 {
-    QJsonObject obj = readAll();
-    QString key = obj.value("local_key").toString();
-    if (!key.isEmpty()) return key;
+    bool complete = false;
+    QJsonObject obj = readAll(&complete);
+    const qint64 stored = obj.value("host_session_repair_before").toInteger();
+    if (stored > 0) return stored;
+    // As for the local key: a file that could not be read may well hold the
+    // date already, and a later one would take in sessions it must not.
+    if (!complete) return 0;
 
-    key = generateLocalKey();
-    obj["local_key"] = key;
+    const qint64 now = QDateTime::currentSecsSinceEpoch();
+    obj["host_session_repair_before"] = now;
     writeAll(obj);
-    return key;
-}
-
-QString AppSettings::rotateLocalKey()
-{
-    QJsonObject obj = readAll();
-    const QString key = generateLocalKey();
-    obj["local_key"] = key;
-    writeAll(obj);
-    return key;
+    return now;
 }
 
 // ── MW-BIND-v1 host identity key ────────────────────────────────────────────────
 
 QByteArray AppSettings::hostSigningKeyPem()
 {
-    QJsonObject obj = readAll();
+    bool complete = false;
+    QJsonObject obj = readAll(&complete);
+    // As for the local key: a file that could not be read may well hold the
+    // key every paired browser knows, so none is made in its place.
+    if (!complete) return {};
     const QString stored = obj.value("host_signing_key").toString();
     if (!stored.isEmpty()) {
         const QByteArray pem = QByteArray::fromBase64(stored.toUtf8());

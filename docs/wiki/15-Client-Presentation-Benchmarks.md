@@ -1,4 +1,4 @@
-[← Conclusion](14-Conclusion.md) · **Client Presentation Benchmarks**
+[← Conclusion](14-Conclusion.md) · **Client Presentation Benchmarks** · [Next: Auto Bitrate Benchmarks →](16-Auto-Bitrate-Benchmarks.md)
 
 ---
 
@@ -14,7 +14,7 @@ Two instruments, both in the repo.
 
 **Pipeline statistics** (the in-stream overlay, `PipelineDiag`): per frame, the time from the last fragment's arrival to `decode()` ("Handoff" — this is where a worker hand-over shows), the decoder's own time, the render call, and for WebGPU the wait on `onSubmittedWorkDone()`. Reported as average and p99. This is cheap and always available, but it stops **before the compositor**: it cannot see the vsync wait of a `<video>` element or the extra hop a WebGPU canvas may pay on the way to the screen.
 
-**Click-to-photon probe** (debug builds only): the host draws a small flag on the primary screen the instant a mouse click is seen (`LatencyFlag.cpp`, a low-level mouse hook); the client, on the same machine, samples the presented pixels of the stream (`frontend/js/stream/LatencyProbe.js`, `mwLatency.run(clicks, spacingMs)` in the console) and measures click → flag visible in the stream. Ten clicks after one warm-up click, median and p90. The first click after a launch is always cold (35–40 ms) and is discarded. This measures the **whole chain including presentation**, which is exactly what the pipeline stats miss — it is what settled the `<video>` question. Two constraints learned the hard way: the tab must be visible (the probe runs on `requestAnimationFrame`), and a canvas presented with `desynchronized: true` reads back empty through `drawImage`, so the probe asks the renderer for its pixels instead (`probePixels`; on an `rgba16float` HDR canvas it decodes half floats).
+**Click-to-photon probe** (any build, off until `latency_flag_enabled` is set in `settings.json`, [Settings Reference](07-Settings-Reference.md)): the host draws a small flag on the primary screen the instant a mouse click is seen (`LatencyFlag.cpp`, a low-level mouse hook); the client, on the same machine, samples the presented pixels of the stream (`frontend/js/stream/LatencyProbe.js`, `mwLatency.run(clicks, spacingMs)` in the console) and measures click → flag visible in the stream. Ten clicks after one warm-up click, median and p90. The first click after a launch is always cold (35–40 ms) and is discarded. This measures the **whole chain including presentation**, which is exactly what the pipeline stats miss — it is what settled the `<video>` question. Two constraints learned the hard way: the tab must be visible (the probe runs on `requestAnimationFrame`), and a canvas presented with `desynchronized: true` reads back empty through `drawImage`, so the probe asks the renderer for its pixels instead (`probePixels`; on an `rgba16float` HDR canvas it decodes half floats).
 
 Machines: **bench-desk** (Windows 11, 2× RTX 5060 Ti 16 GB, Chrome 152, M27Q 1440p 165 Hz), a MacBook (Chrome 126, macOS 10.15) for the Mac series, an iPhone for nothing in this chapter. Hosts: Sunshine on bench-desk, or the native host (`mw-native-host`, NVENC or AMF) on the same machine.
 
@@ -104,7 +104,7 @@ Four routes, chosen from the codec and the display (`_hdrMode` in `StreamView.js
 
 Since 0.4.1 the Auto codec, the default, takes the AV1 rows for an HDR stream with the Enhancer; the HEVC rows are reached by picking HEVC.
 
-The HDR checkbox is offered only when the client can honour it: HDR display **and** a WebGPU adapter **and** a 10-bit decoder (`hdrClientCapability()`); otherwise it is greyed with the reason ("HDR is not active on this device" or "browser cannot present HDR"), and the launch does not send `hdr_enabled`. `mw_hdr_request=1` in localStorage bypasses the guard for experiments; `mw_hdr_tonemap=1/0` forces or disables the readback.
+The HDR checkbox is greyed only when the browser lacks a WebGPU adapter or a 10-bit decoder (`hdrClientCapability()`, "HDR is not available in this browser."); on a screen not in HDR it stays, with the note "This screen is not in HDR mode right now: streams stay SDR until it is.", and the launch sends `hdr_enabled:false` until the screen is in HDR. A native host follows the screen live. `mw_hdr_request=1` in localStorage bypasses the launch gate for other hosts, for experiments; `mw_hdr_tonemap=1/0` forces or disables the readback.
 
 Overlay measurements (Sunshine bench-desk 1080p60, M27Q in Windows HDR; render p99 / GPU wait / decode p99, ms):
 
@@ -189,4 +189,4 @@ The client is half of the latency. The native host's encoder was benched the sam
 
 ---
 
-[← Conclusion](14-Conclusion.md) · [Home](Home.md)
+[← Conclusion](14-Conclusion.md) · [Home](Home.md) · [Next: Auto Bitrate Benchmarks →](16-Auto-Bitrate-Benchmarks.md)

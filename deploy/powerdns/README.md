@@ -321,6 +321,32 @@ establish the browser connection counts as its own very short session, so a
 spike in `dur-0-1m` reads as "the first transport is not working here", not as
 "people leave immediately".
 
+## The MWSR page's measure log
+
+The page at `/mwsr/` times the upscalers on the visitor's GPU when they press its
+button, and posts that result once to `/v1/mwsr` on the site's own host
+(`mw-proxy/mwsrlog.go`). It carries technical data and measured metrics only: no
+address, cookie, identifier, User-Agent string, language, referrer or picture.
+
+- **Kept** in the `mwproxy_data` volume, one file per month:
+  `/data/mwsr-measures/YYYY-MM.jsonl`, each line's time stopping at the hour. The
+  production backup already copies that volume.
+- **Counted** in an Umami website of its own, with one fixed address and
+  User-Agent, so Visitors means nothing there. **Views** is the number of measures,
+  **Pages** splits them by path and GPU vendor, and **Events** `failed-*` by step.
+- **Bounded:** 3 posts per subscriber per 5 minutes (Caddy, in memory), then 2000 a
+  day and 2 GiB in all, past which a post is dropped without saying so.
+
+- **No address kept:** the handler never reads one, the site block has no access
+  log, and Caddy's global log filter removes the request and the address from every
+  log line. After deploying a change to that filter, go past the limit from a known
+  address, stop `mw-proxy` for one post, and check `docker compose logs caddy` does
+  not contain that address.
+
+To turn the count on, add a website `MoonlightWeb MWSR measures` in Umami, append
+`MW_UMAMI_MWSR_WEBSITE_ID=<id>` to `.env`, then
+`docker compose up -d --force-recreate mw-proxy`. The startup log names the website.
+
 ## Linux package repository (APT + DNF)
 
 `release.yml`'s `linux-repo` job builds the signed APT and DNF repository tree
@@ -477,7 +503,12 @@ cd ~/moonlight-web/deploy/powerdns
 cd ~
 ```
 
-Rolling back is the same two blocks with the previous tag. The script refuses
+Rolling back is the same two blocks with the previous tag. A target that does
+not contain the latest release (the nearest `v*` tag on `origin/main`) is
+refused: a `srv-` tag cut from a branch without it would take the bootstrap,
+and its list of official interfaces, back to before that release, and
+production would then refuse every machine on it. A deliberate rollback past
+the latest release adds `--force` to both runs. The script refuses
 a dirty tree, refuses to run outside `~/moonlight-web`, and asks nothing
 interactively — a prompt in the middle of a paste would eat the next line. It
 reads nothing from its stdin either, so a script fed to `ssh box bash -s` can

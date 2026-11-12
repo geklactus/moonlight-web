@@ -71,11 +71,69 @@ const PROTOCOL = 'MW-BIND-v1';
 export const IDENTITY_REFUSED = 'identity_refused';
 
 /**
+ * The same refusal seen from the other side: the HOST refused our key. It ends
+ * the launch for the same reason, and says something else to the person: the
+ * host proved nothing wrong about itself, this browser is the one that is not
+ * paired with the session it holds.
+ */
+export const KEY_REFUSED = 'key_refused';
+
+/**
+ * This browser holds no key of the host's to check its offer with: its stored
+ * record lost it, or was made before the host had one. Off the host machine (see
+ * mayTakeUncheckedOffer) an offer nobody can check proves nothing, signed or not,
+ * so the launch ends here too, and a PIN brings the host's key back.
+ */
+export const HOST_KEY_MISSING = 'host_key_missing';
+
+/** What /api/auth/status last said of this browser: local privilege here. */
+let localPrivilegeSaid = false;
+
+/** Records what /api/auth/status says (is_localhost), for mayTakeUncheckedOffer. */
+export function noteLocalPrivilege(isLocalhost) {
+    localPrivilegeSaid = !!isLocalhost;
+}
+
+/** Whether a page's hostname is a private LAN address: an IPv4 or IPv6 literal. */
+export function isPrivateLanHostname(hostname) {
+    const h = String(hostname || '')
+        .replace(/^\[|\]$/g, '')
+        .toLowerCase();
+    const v4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(h);
+    if (v4) {
+        const a = Number(v4[1]);
+        const b = Number(v4[2]);
+        return a === 10 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168);
+    }
+    // fc00::/7 (unique local) and fe80::/10 (link-local).
+    return /^(f[cd][0-9a-f]{0,2}|fe[89ab][0-9a-f]?):/.test(h);
+}
+
+/**
+ * Whether this page may take an offer it has no host key to check: on the host
+ * machine only, where no relay can sit in front of it. Known by the page's own
+ * address (localhost, 127.0.0.1, ::1); on a private LAN address, by the host's
+ * word that this browser has local privilege there. Anywhere else a browser
+ * without the host's key gets it first: on the LAN by ensurePairingKey, or by
+ * the PIN.
+ */
+export function mayTakeUncheckedOffer(hostname = globalThis.location?.hostname) {
+    const h = String(hostname || '').toLowerCase();
+    if (h === 'localhost' || h === '127.0.0.1' || h === '::1' || h === '[::1]') return true;
+    return localPrivilegeSaid && isPrivateLanHostname(h);
+}
+
+/** Whichever way round, the launch ends here: see IDENTITY_REFUSED. */
+export function isBindRefusal(reason) {
+    return reason === IDENTITY_REFUSED || reason === KEY_REFUSED || reason === HOST_KEY_MISSING;
+}
+
+/**
  * Is this signalling-socket close the HOST refusing the binding? The other half
  * of IDENTITY_REFUSED: the host closes with 1008 and this reason when our hello
  * names a key the session is not paired with (or our signature fails). Every
  * WebRTC rung would be refused the same way, and wss would walk around it — so
- * it ends the launch too.
+ * it ends the launch too, as KEY_REFUSED.
  */
 export function isBindRefusedClose(evt) {
     return evt?.code === 1008 && evt.reason === 'pairing verification failed';
@@ -368,6 +426,45 @@ export async function verifyHostSignature(identity, message) {
     }
 }
 
+/**
+ * The exact bytes a sharing-board request is signed over: the backend's
+ * OwnerProof::message builds the same, field for field (both pinned to one
+ * vector in the TNR). Its own label, so it never stands for a signature of the
+ * handshake above.
+ */
+export function shareOwnerDigestInput(hostId, nonce, action, slot) {
+    return buildSignedMessage([`${PROTOCOL}|share-owner`, hostId, nonce, action, String(slot)]);
+}
+
+/**
+ * Prove a sharing-board request comes from this browser: sign the host's
+ * single-use challenge for @p action on @p slot with this browser's pairing key.
+ * Returns the base64 signature, or null when there is no key to sign with — the
+ * host then refuses the request, as it refuses this browser's streams.
+ *
+ * @param {string} hostId       the host's identity, as the challenge named it
+ * @param {string} nonceBase64  the challenge (POST /api/share/owner-proof)
+ * @param {string} action       'activate' | 'credentials' | 'permissions'
+ * @param {number} slot
+ */
+export async function signShareOwnerProof(hostId, nonceBase64, action, slot) {
+    const identity = await loadOrCreateIdentity();
+    if (!identity) return null;
+    try {
+        const signed = shareOwnerDigestInput(
+            hostId || '',
+            base64ToBytes(nonceBase64),
+            action,
+            slot,
+        );
+        const sig = await crypto.subtle.sign(SIGN_PARAMS, identity.privateKey, signed);
+        return bytesToBase64(new Uint8Array(sig));
+    } catch (e) {
+        console.error('[MW-BIND] Could not sign the sharing request:', e.message);
+        return null;
+    }
+}
+
 /** Sign our answer's fingerprint. Returns the base64 signature, or null. */
 export async function signAnswer(identity, hostId, nonceHBase64, fingerprintHost, answerSdp) {
     const fingerprintBrowser = extractFingerprint(answerSdp);
@@ -387,6 +484,58 @@ export async function signAnswer(identity, hostId, nonceHBase64, fingerprintHost
         return bytesToBase64(new Uint8Array(sig));
     } catch (e) {
         console.error('[MW-BIND] Could not sign the SDP answer:', e.message);
+        return null;
+    }
+}
+
+/**
+ * The bytes this page signs to let a device in by its QR code (MW-PAIR-v1,
+ * PhonePairing::approveMessage in backend/src/server/PhonePairing.h): the code
+ * typed from the device's screen, for that request on that host. Same framing as
+ * MW-BIND, under a label of its own. The host's tests and this page's share a
+ * vector for it.
+ */
+export function pairApprovalMessage(hostId, requestId, code) {
+    return buildSignedMessage(['MW-PAIR-v1|approve', hostId || '', requestId, code]);
+}
+
+/**
+ * Sign this page's yes to a device that asks in by its QR code: see
+ * pairApprovalMessage. The host checks it against the key of this browser's
+ * session, so a cookie copied out of this browser cannot let anyone in. It is
+ * made for the host this identity paired with, the one @p hostId names only when
+ * the identity remembers none. Returns the base64 signature, or null.
+ */
+export async function signPairApproval(identity, hostId, requestId, code) {
+    try {
+        const signed = pairApprovalMessage(identity.hostId || hostId, requestId, code);
+        const sig = await crypto.subtle.sign(SIGN_PARAMS, identity.privateKey, signed);
+        return bytesToBase64(new Uint8Array(sig));
+    } catch (e) {
+        console.error('[MW-PAIR] Could not sign the approval:', e.message);
+        return null;
+    }
+}
+
+/**
+ * The bytes this page signs to turn a device away (PhonePairing::refuseMessage):
+ * the approval's framing, for that request on that host, without a code.
+ */
+export function pairRefusalMessage(hostId, requestId) {
+    return buildSignedMessage(['MW-PAIR-v1|refuse', hostId || '', requestId]);
+}
+
+/**
+ * Sign this page's no to a device that asks in by its QR code, as a yes is
+ * signed (signPairApproval). Returns the base64 signature, or null.
+ */
+export async function signPairRefusal(identity, hostId, requestId) {
+    try {
+        const signed = pairRefusalMessage(identity.hostId || hostId, requestId);
+        const sig = await crypto.subtle.sign(SIGN_PARAMS, identity.privateKey, signed);
+        return bytesToBase64(new Uint8Array(sig));
+    } catch (e) {
+        console.error('[MW-PAIR] Could not sign the refusal:', e.message);
         return null;
     }
 }

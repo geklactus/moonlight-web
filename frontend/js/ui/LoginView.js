@@ -37,9 +37,19 @@ import { tunnelHostId } from '../net/tunnelBridge.js';
 const MACHINE_NAME_KEY = 'mw-session-name';
 
 export class LoginView {
-    constructor(container, onAuthenticated) {
+    /**
+     * @param {object} [options]
+     * @param {boolean} [options.sessionKeyRefused] This browser holds a session
+     *        bound to another browser's key. It reads as signed in, and the PIN is
+     *        what it needs all the same.
+     * @param {boolean} [options.askPin] The PIN screen stays although the session
+     *        reads as signed in: the person asked for it.
+     */
+    constructor(container, onAuthenticated, { sessionKeyRefused = false, askPin = false } = {}) {
         this.container = container;
         this.onAuthenticated = onAuthenticated || (() => {});
+        this._sessionKeyRefused = sessionKeyRefused;
+        this._askPin = askPin || sessionKeyRefused;
 
         // Internal state
         this._loading = true;
@@ -54,6 +64,9 @@ export class LoginView {
         this._lockoutTimer = null;
         this._submitting = false;
         this._machineName = '';
+        // The name of the machine being unlocked, when the host gave it (see
+        // _renderHostName). Not to be confused with _machineName, this session's.
+        this._hostName = '';
         this._certAuthAvailable = false; // Server has cert auth enabled
         this._certMode = false; // User chose cert upload mode
         this._selectedFileName = '';
@@ -93,13 +106,15 @@ export class LoginView {
         // Check auth status — maybe already authenticated
         try {
             const status = await BackendClient.getAuthStatus();
-            if (status.authenticated) {
+            if (status.authenticated && !this._askPin) {
                 this._releaseServerField();
                 this.onAuthenticated();
                 return;
             }
             this._loading = false;
             this._certAuthAvailable = status.cert_auth_enabled || false;
+            const hostName = status.display_name;
+            this._hostName = typeof hostName === 'string' ? hostName.trim() : '';
             this._remaining = status.remaining !== undefined ? status.remaining : 3;
             if (status.lockout_seconds > 0) {
                 this._startLockoutTimer(status.lockout_seconds);
@@ -218,6 +233,7 @@ export class LoginView {
                         <span class="login-logo-img" role="img" aria-label="Moonlight"></span>
                     </div>
                     <h1 class="login-title">MoonlightWeb</h1>
+                    ${this._renderHostName()}
 
                     <div id="login-form-area">
                         ${
@@ -273,9 +289,22 @@ export class LoginView {
         `;
     }
 
+    /**
+     * "Server: <name>", under the title: the machine being unlocked, named when
+     * the host gave its name, which it does to a caller on its own home network
+     * only (/api/auth/status's display_name). Without it the screen is the one
+     * it has always been. Both forms keep it, the certificate's too.
+     */
+    _renderHostName() {
+        if (this._loading || !this._hostName) return '';
+        const line = this.esc(t('login.serverName', { name: this._hostName }));
+        return `<p class="login-subtitle" id="login-host-name">${line}</p>`;
+    }
+
     _renderPinForm() {
         return `
             <div class="login-form login-form--pin">
+                ${this._sessionKeyRefused ? `<p class="login-subtitle" id="login-session-key-refused">${t('login.sessionOtherBrowser')}</p>` : ''}
                 <p class="login-subtitle">${t('login.pinSubtitle')}</p>
 
                 <!-- Machine name -->
@@ -367,14 +396,15 @@ export class LoginView {
      * reached, and it costs nothing to offer it before the PIN rather than
      * after it.
      *
-     * What it deliberately does NOT say is which machine this is. The name of
-     * the machine being unlocked is not on this screen and must not be put
-     * there: this is the screen shown to whoever holds the link, including
-     * someone who should not have it, and a name is the one thing that turns an
-     * opaque identifier into a machine worth attacking. The rows below name
-     * only machines this browser has already paired with, which tells that
-     * visitor nothing they could not learn by opening any of them — and the
-     * selected row is a neutral label, never the current name.
+     * Which machine this is, the screen says to a caller on its home network
+     * alone. The host gives its name (/api/auth/status's display_name) only to
+     * a caller it places on its own LAN, by the rule a device's QR code request
+     * is held to, and the line under the title shows it then (_renderHostName).
+     * Over the Internet the host gives no name, and the screen still never
+     * names the machine: there it is shown to whoever holds the link. The rows
+     * below name only machines this browser has already paired with, which
+     * tells that visitor nothing they could not learn by opening any of them —
+     * and the selected row is a neutral label, never the current name.
      *
      * Absent entirely when there is nowhere to go, rather than shown empty: a
      * chooser with one unusable entry is a question with no answer.

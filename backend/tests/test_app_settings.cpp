@@ -3,6 +3,7 @@
  */
 #include "test_framework.h"
 #include "server/AppSettings.h"
+#include "common/Logger.h"
 
 #include "mw/native/VideoPipeline.h"
 
@@ -12,9 +13,67 @@
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QDir>
+
+#ifdef Q_OS_WIN
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+
+namespace {
+// Holds a file so that nobody else can read it, for as long as it lives, while
+// it can still be replaced by a rename: a handle shared for delete only on
+// Windows, no permissions elsewhere. held() is false where that does not stop
+// this process (running as root).
+class FileHold
+{
+public:
+    explicit FileHold(const QString& path)
+        : m_Path(path)
+    {
+#ifdef Q_OS_WIN
+        m_Handle = CreateFileW(
+            reinterpret_cast<const wchar_t*>(QDir::toNativeSeparators(path).utf16()), GENERIC_READ,
+            FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+#else
+        m_Perms = QFile::permissions(path);
+        QFile::setPermissions(path, QFileDevice::Permissions{});
+#endif
+        QFile probe(path);
+        m_Held = !probe.open(QIODevice::ReadOnly);
+    }
+    ~FileHold()
+    {
+#ifdef Q_OS_WIN
+        if (m_Handle != INVALID_HANDLE_VALUE) CloseHandle(m_Handle);
+#else
+        QFile::setPermissions(m_Path, m_Perms);
+#endif
+    }
+    bool held() const { return m_Held; }
+
+private:
+    QString m_Path;
+    bool m_Held = false;
+#ifdef Q_OS_WIN
+    HANDLE m_Handle = INVALID_HANDLE_VALUE;
+#else
+    QFileDevice::Permissions m_Perms;
+#endif
+};
+} // namespace
 
 void run_app_settings_tests()
 {
+    SECTION("AppSettings: audio_source reads in its one form, all apps otherwise");
+    CHECK_EQ(AppSettings::canonicalAudioSource("focused"), QString("focused"));
+    CHECK_EQ(AppSettings::canonicalAudioSource("app:Discord.EXE"), QString("app:discord.exe"));
+    for (const char* other :
+         {"", "all", "Focused", "app:", "app:discord", "app:a\\b.exe", "app:a/b.exe"})
+        CHECK_EQ(AppSettings::canonicalAudioSource(other), QString("all"));
+
     SECTION("AppSettings");
 
     QTemporaryDir tmp;
@@ -692,6 +751,105 @@ void run_app_settings_tests()
         CHECK(s.nativeTuning().isEmpty());
     }
 
+    // The administrator's ceilings (issue #53): seeded at 0, read in every
+    // form Bruno's examples give, and anything else is no limit.
+    {
+        s.seedDocumentedDefaults();
+        const QJsonObject seeded = s.readAll();
+        CHECK_EQ(seeded.value("max_allowed_frame_rate").toInt(-1), 0);
+        CHECK_EQ(seeded.value("max_allowed_bitrate").toInt(-1), 0);
+        CHECK_EQ(seeded.value("max_allowed_stream_resolution").toString(), QString("0x0"));
+        CHECK(!s.streamLimits().any());
+
+        int w = -1, h = -1;
+        CHECK(AppSettings::parseStreamResolution("1920x1080", &w, &h));
+        CHECK(w == 1920 && h == 1080);
+        CHECK(AppSettings::parseStreamResolution("1920", &w, &h));
+        CHECK(w == 1920 && h == 1920);
+        CHECK(AppSettings::parseStreamResolution(" 0x1440 ", &w, &h));
+        CHECK(w == 0 && h == 1440);
+        CHECK(AppSettings::parseStreamResolution("0", &w, &h));
+        CHECK(w == 0 && h == 0);
+        CHECK(AppSettings::parseStreamResolution("0x0", &w, &h));
+        CHECK(w == 0 && h == 0);
+        CHECK(AppSettings::parseStreamResolution("2560X1440", &w, &h));
+        CHECK(w == 2560 && h == 1440);
+        for (const char* bad : {"", "x", "1920x", "1920*1080", "-1", "1080p", "1920x1080x2"})
+            CHECK(!AppSettings::parseStreamResolution(bad, &w, &h));
+
+        QJsonObject obj = s.readAll();
+        obj["max_allowed_frame_rate"] = 60;
+        obj["max_allowed_bitrate"] = "40";
+        obj["max_allowed_stream_resolution"] = 1920;
+        s.writeAll(obj);
+        AppSettings::StreamLimits limits = s.streamLimits();
+        CHECK_EQ(limits.fps, 60);
+        CHECK_EQ(limits.bitrateMbps, 40);
+        CHECK(limits.width == 1920 && limits.height == 1920);
+        obj["max_allowed_frame_rate"] = -5;
+        obj["max_allowed_bitrate"] = "a lot";
+        obj["max_allowed_stream_resolution"] = "big";
+        s.writeAll(obj);
+        CHECK(!s.streamLimits().any());
+
+        s.setMaxAllowedFrameRate(30);
+        s.setMaxAllowedBitrate(15);
+        s.setMaxAllowedStreamResolution(0, 1080);
+        CHECK_EQ(s.readAll().value("max_allowed_stream_resolution").toString(), QString("0x1080"));
+        limits = s.streamLimits();
+        CHECK(limits.fps == 30 && limits.bitrateMbps == 15 && limits.width == 0 &&
+              limits.height == 1080);
+        // A hand edit of the file stays as it was written at the next start.
+        s.seedDocumentedDefaults();
+        CHECK_EQ(s.streamLimits().fps, 30);
+        obj = s.readAll();
+        obj.remove("max_allowed_frame_rate");
+        obj.remove("max_allowed_bitrate");
+        obj.remove("max_allowed_stream_resolution");
+        s.writeAll(obj);
+    }
+
+    // The size a launch keeps under the resolution ceiling.
+    {
+        AppSettings::StreamLimits box;
+        box.width = 1920;
+        box.height = 1080;
+        // An explicit size keeps its shape.
+        auto r = AppSettings::limitStreamSize(box, 2560, 1440, false, false, false, 0, 0);
+        CHECK(r.changed && r.width == 1920 && r.height == 1080 && !r.fitBox);
+        r = AppSettings::limitStreamSize(box, 2560, 1080, false, false, false, 0, 0);
+        CHECK(r.width == 1920 && r.height == 810);
+        // Under it: untouched.
+        r = AppSettings::limitStreamSize(box, 1280, 720, false, false, false, 0, 0);
+        CHECK(!r.changed && r.width == 1280 && r.height == 720);
+        // A portrait phone's own size, literally inside 1920x1080.
+        r = AppSettings::limitStreamSize(box, 1170, 2532, false, false, false, 0, 0);
+        CHECK(r.height == 1080 && r.width == 498);
+        // The native host's box is clipped side by side; "Match my screen"
+        // keeps its shape, its fallback box is clipped.
+        r = AppSettings::limitStreamSize(box, 2560, 1600, true, false, true, 0, 0);
+        CHECK(r.fitBox && r.width == 1920 && r.height == 1080);
+        r = AppSettings::limitStreamSize(box, 2560, 1600, true, true, true, 2560, 1440);
+        CHECK(r.width == 1728 && r.height == 1080 && r.fallbackWidth == 1920 &&
+              r.fallbackHeight == 1080);
+        // Its own size becomes the ceiling's box; its fixed height, a box as
+        // wide as the ceiling.
+        r = AppSettings::limitStreamSize(box, 0, 0, false, false, true, 0, 0);
+        CHECK(r.fitBox && r.width == 1920 && r.height == 1080);
+        r = AppSettings::limitStreamSize(box, 1920, 1080, false, false, true, 0, 0);
+        CHECK(r.changed && r.fitBox && r.width == 1920 && r.height == 1080);
+        // The height alone: a free width.
+        AppSettings::StreamLimits tall;
+        tall.height = 1440;
+        r = AppSettings::limitStreamSize(tall, 3840, 2160, false, false, true, 0, 0);
+        CHECK(!r.fitBox && r.width == 2560 && r.height == 1440);
+        r = AppSettings::limitStreamSize(tall, 0, 0, false, false, true, 0, 0);
+        CHECK(r.fitBox && r.width == AppSettings::kLimitMax && r.height == 1440);
+        // No ceiling: nothing moves.
+        r = AppSettings::limitStreamSize({}, 0, 0, false, false, true, 0, 0);
+        CHECK(!r.changed && r.width == 0 && r.height == 0 && !r.fitBox);
+    }
+
     // Low-level access.
     QJsonObject all = s.readAll();
     CHECK(all.contains("http_port"));
@@ -761,5 +919,115 @@ void run_app_settings_tests()
         AppSettings::setFileOverride(QString());
         CHECK(AppSettings::fileOverride().isEmpty());
         CHECK_EQ(AppSettings().filePath(), defaultPath);
+    }
+
+    SECTION("AppSettings: a file that cannot be read is never written over");
+    {
+        AppSettings h;
+        h.m_FilePath = tmp.path() + "/held/settings.json";
+        QDir().mkpath(tmp.path() + "/held");
+        h.setHttpPort(81);
+        // The key an earlier version kept in this file, as it left it there.
+        const QString key = QStringLiteral("a-key-of-an-earlier-version");
+        {
+            QJsonObject withKey = h.readAll();
+            withKey["local_key"] = key;
+            h.writeAll(withKey);
+        }
+        const QByteArray signing = h.hostSigningKeyPem();
+        CHECK(!signing.isEmpty());
+        bool complete = false;
+        CHECK_EQ(h.readAll(&complete).value("http_port").toInt(), 81);
+        CHECK(complete);
+        // The date host sessions are older than: written once, then read back.
+        const qint64 before = h.hostSessionRepairBefore();
+        CHECK(before > 0);
+        CHECK(before <= QDateTime::currentSecsSinceEpoch());
+        CHECK_EQ(h.readAll(&complete).value("host_session_repair_before").toInteger(), before);
+        CHECK_EQ(h.hostSessionRepairBefore(), before);
+
+        bool held = false;
+        {
+            FileHold hold(h.m_FilePath);
+            held = hold.held();
+            if (held) {
+                h.setHttpsPort(9443); // not written
+                CHECK(h.hostSigningKeyPem().isEmpty());
+                CHECK(!h.forgetLocalKey()); // nothing removed from a file not read whole
+                CHECK_EQ(h.hostSessionRepairBefore(), qint64(0)); // none made in its place
+                h.readAll(&complete);
+                CHECK(!complete);
+            } else {
+                Logger::info("[test] the file could not be held here: skipping the held part");
+            }
+        }
+        if (held) {
+            // The file reads again by the time the write comes: what that read
+            // missed is still not written over it.
+            QJsonObject one;
+            one["https_port"] = 9443;
+            h.writeAll(one);
+        }
+
+        CHECK_EQ(h.httpPort(1), quint16(81));
+        CHECK_EQ(h.httpsPort(1), quint16(1));
+        CHECK_EQ(h.readAll().value("local_key").toString(), key);
+        CHECK(h.hostSigningKeyPem() == signing);
+        CHECK_EQ(h.hostSessionRepairBefore(), before);
+        // The earlier version's key leaves the file once it reads, and takes
+        // nothing else with it.
+        CHECK(h.forgetLocalKey());
+        CHECK(!h.readAll().contains("local_key"));
+        CHECK(!h.forgetLocalKey()); // nothing left to remove
+        CHECK_EQ(h.httpPort(1), quint16(81));
+        CHECK(h.hostSigningKeyPem() == signing);
+        CHECK_EQ(h.hostSessionRepairBefore(), before);
+        h.setHttpsPort(9443); // and written again once it reads
+        CHECK_EQ(h.httpsPort(1), quint16(9443));
+        CHECK_EQ(h.httpPort(1), quint16(81));
+
+        // A missing file and an empty one hold nothing: read whole, written freely.
+        AppSettings e;
+        e.m_FilePath = tmp.path() + "/held/none.json";
+        e.readAll(&complete);
+        CHECK(complete);
+        QFile empty(e.m_FilePath);
+        CHECK(empty.open(QIODevice::WriteOnly));
+        empty.close();
+        e.readAll(&complete);
+        CHECK(complete);
+        e.setHttpPort(82);
+        CHECK_EQ(e.httpPort(1), quint16(82));
+    }
+
+    SECTION("AppSettings: a file that is not a settings document is kept aside");
+    {
+        const QString dir = tmp.path() + "/bad";
+        QDir().mkpath(dir);
+        AppSettings b;
+        b.m_FilePath = dir + "/settings.json";
+        for (const QByteArray& content :
+             {QByteArray("{\"http_port\": 81,"), QByteArray("[1, 2]")}) {
+            for (const QFileInfo& old : QDir(dir).entryInfoList(QDir::Files))
+                QFile::remove(old.absoluteFilePath());
+            QFile f(b.m_FilePath);
+            CHECK(f.open(QIODevice::WriteOnly));
+            f.write(content);
+            f.close();
+
+            bool complete = false;
+            CHECK(b.readAll(&complete).isEmpty());
+            CHECK(complete);
+            const QStringList aside =
+                QDir(dir).entryList({"settings.json.unreadable-*"}, QDir::Files);
+            CHECK_EQ(aside.size(), 1);
+            if (!aside.isEmpty()) {
+                QFile kept(dir + "/" + aside.first());
+                CHECK(kept.open(QIODevice::ReadOnly));
+                CHECK(kept.readAll() == content);
+            }
+            b.setHttpPort(83); // starts from the defaults
+            CHECK_EQ(b.httpPort(1), quint16(83));
+        }
     }
 }

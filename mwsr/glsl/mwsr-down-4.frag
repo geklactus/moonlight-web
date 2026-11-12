@@ -28,46 +28,25 @@ precision highp float;
 precision highp int;
 uniform sampler2D uTex;
 uniform vec4 uTexelScale; // texel.xy, scale.xy: the first four of mwsrUniforms()
-uniform vec4 uTauSharp; // tau, sharp, the gaze zone's weight, 0: the next four
+uniform vec4 uDimsAcross; // the input's size, the across taps' distance
+uniform vec4 uKernel; // kc, ft, kg, kwc
 uniform vec4 uZone; // the gaze zone's centre.xy and half-axes.xy (GAZE 1)
-uniform vec4 uZoneBonus; // its ring, and its tau and sharpness at the centre, 0
+uniform vec4 uZoneBonus; // its ring, its threshold and kg at the centre, its weight
+uniform vec4 uBound; // kl, zref, then the block's pad
 in vec2 vUv;
 out vec4 oColor;
 
 vec3 S(vec2 uv) {
     return textureLod(uTex, uv, 0.0).rgb;
 }
-vec3 L(ivec2 c) {
-    return texelFetch(uTex, c, 0).rgb;
-}
-
-const mediump float EPS_H = 0.001;
 
 const uint SHOW = 0u;
-const float W_ALONG = 0.15;
-const float W_ACROSS = 0.3;
-const float R_ALONG = 0.5;
-const float R_ACROSS = 1.0;
-const float S_FULL = 1.5;
-const float W_MIN = -0.5;
-const uint DERING = 2u;
 const uint CHROMA444 = 0u;
-const uint FLAT_TAPS = 5u;
-const float FLAT_C = 0.5;
 const uint GAZE = 0u;
-const uint FLAT_ZONE = 0u;
 const float R_DOWN = 1.0;
 const uint LINEAR_LIGHT = 1u;
 
 const vec3 LUMA = vec3(0.25, 0.625, 0.125);
-
-float luma(vec3 c) {
-    return dot(c, LUMA);
-}
-
-mediump float lumah(mediump vec3 c) {
-    return dot(c, LUMA);
-}
 
 vec3 srgbToLin(vec3 c) {
     vec3 lo = c / 12.92;
@@ -109,5 +88,23 @@ void main() {
     acc += dec(S(uv + vec2(0.25, -0.25) * span));
     acc += dec(S(uv + vec2(-0.25, 0.25) * span));
     acc += dec(S(uv + vec2(0.25, 0.25) * span));
-    oColor = vec4(enc(acc * 0.25), 1.0);
+    vec3 c = acc * 0.25;
+    float l = dot(sqrt(max(c, vec3(0.0))), LUMA);
+    vec2 g = vec2(dFdx(l), dFdy(l));
+    if (uKernel.z == 0.0 || abs(g.x) + abs(g.y) < uKernel.y) {
+        oColor = vec4(enc(c), 1.0);
+        return;
+    }
+    vec2 px = uTexelScale.xy / uTexelScale.zw;
+    vec3 a = dec(S(uv - vec2(px.x, 0.0)));
+    vec3 b = dec(S(uv + vec2(px.x, 0.0)));
+    vec3 d = dec(S(uv - vec2(0.0, px.y)));
+    vec3 e = dec(S(uv + vec2(0.0, px.y)));
+    vec3 mean = 0.25 * (a + b + d + e);
+    vec3 mn = min(c, min(a, min(b, min(d, e))));
+    vec3 mx = max(c, max(a, max(b, max(d, e))));
+    float t = smoothstep(0.2, 0.5, dot(sqrt(max(mx, vec3(0.0))) - sqrt(max(mn, vec3(0.0))), LUMA));
+    vec3 R = c + mix(uKernel.z, uKernel.w, t) * (c - mean);
+    vec3 mg = (mx - mn) * mix(uBound.x, uBound.y, t);
+    oColor = vec4(enc(clamp(R, max(mn - mg, vec3(0.0)), mx + mg)), 1.0);
 }

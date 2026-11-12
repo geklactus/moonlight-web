@@ -66,7 +66,7 @@ export class Host {
         // which is the default and what every Sunshine card stays. The token is
         // never sent to the browser — backendConfigured only says one is stored.
         this.backendType = data.backendType || '';
-        // The native host only: {state: 'ok'|'no_display'|
+        // The native host only: {state: 'ok'|'no_display'|'session_disconnected'|
         // 'no_capture_permission'|'unavailable', input_permission,
         // virtual_display: {supported, installed, enabled, active, name},
         // hid: 'ok'|'driver_missing'|'setup'|'unsupported' (hidHelpFor)}.
@@ -93,6 +93,11 @@ export class Host {
         // name the product, and the product names itself once the address is
         // given.
         this.mayHaveControlApi = data.mayHaveControlApi === true;
+
+        // The machine at this host's address did not show the certificate of the
+        // pairing, so the server sends it nothing. Not a verdict on the pairing:
+        // the server's next check clears it once the right machine answers.
+        this.certificateChanged = data.certificateChanged === true;
     }
 
     get isOnline() {
@@ -105,7 +110,7 @@ export class Host {
         return this.isOnline && !this.isPaired;
     }
     get isAvailable() {
-        return this.isOnline && this.isPaired;
+        return this.isOnline && this.isPaired && !this.certificateChanged;
     }
 
     // The native host with nothing attached AND no "MoonlightWeb Virtual
@@ -120,6 +125,39 @@ export class Host {
             this.nativeDisplay?.state === 'no_display' &&
             !this.nativeDisplay?.virtual_display?.installed
         );
+    }
+
+    // Whether this host can have "MoonlightWeb Virtual Display" at all. The
+    // server says no where none is shipped (Windows ARM64, a Linux desktop
+    // without the portal's virtual monitor): the card then never sends the
+    // owner to an installer that has nothing to offer.
+    get canHaveVirtualDisplay() {
+        return this.nativeDisplay?.virtual_display?.supported !== false;
+    }
+
+    // The native host on Windows, whose session Remote Desktop left without a
+    // screen (mstsc closed): no cable or virtual display brings one back, only
+    // the session returning to the PC's screen. The card says so instead of an
+    // app grid — unless returnsFromRemoteDesktop.
+    get leftByRemoteDesktop() {
+        return (
+            this.backendType === 'native' && this.nativeDisplay?.state === 'session_disconnected'
+        );
+    }
+
+    // leftByRemoteDesktop, with the admin's setting on: the card's one app is
+    // "This PC's screen", and opening it brings the session back to the PC's
+    // screen, locked, then streams it.
+    get returnsFromRemoteDesktop() {
+        return this.leftByRemoteDesktop && this.nativeDisplay?.remote_desktop_return === true;
+    }
+
+    // leftByRemoteDesktop, and the card's one app is "This PC's sign-in
+    // screen" instead: it streams the PC's sign-in screen, where the user
+    // signs in with their own account, and Windows brings the session back.
+    // A kiosk never shows it (HostListView), and the host refuses it there.
+    get opensSignInScreen() {
+        return this.leftByRemoteDesktop && this.nativeDisplay?.sign_in_screen === true;
     }
 
     // A Mac whose Screen Recording grant is gone: the card stays, and says
@@ -176,25 +214,28 @@ export class Host {
     }
 
     get statusLabel() {
-        if (this.needsVirtualDisplay) return t('hosts.statusNoDisplay');
+        if (this.needsVirtualDisplay || this.leftByRemoteDesktop) return t('hosts.statusNoDisplay');
         if (this.isUnavailable) return t('hosts.statusUnavailable');
         if (!this.isOnline) return t('hosts.statusOffline');
+        if (this.certificateChanged) return t('hosts.statusCertificateChanged');
         if (this.isPaired) return t('hosts.statusReady');
         return t('hosts.statusNotPaired');
     }
 
     get statusClass() {
-        if (this.needsVirtualDisplay) return 'nodisplay';
+        if (this.needsVirtualDisplay || this.leftByRemoteDesktop) return 'nodisplay';
         if (this.isUnavailable) return 'unavailable';
         if (!this.isOnline) return 'offline';
+        if (this.certificateChanged) return 'locked';
         if (this.isPaired) return 'ready';
         return 'locked';
     }
 
     get statusIcon() {
-        if (this.needsVirtualDisplay) return Icons.unavailable; // no screen to stream
+        if (this.needsVirtualDisplay || this.leftByRemoteDesktop) return Icons.unavailable; // no screen to stream
         if (this.isUnavailable) return Icons.unavailable; // reachable, service down
         if (!this.isOnline) return Icons.power; // power off
+        if (this.certificateChanged) return Icons.lock; // nothing goes to it
         if (this.isPaired) return Icons.check; // checkmark
         return Icons.lock; // lock
     }

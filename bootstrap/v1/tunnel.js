@@ -145,6 +145,100 @@ export const PROTO = 1;
 /** How many of the host's candidates to hold before its offer arrives. */
 const MAX_EARLY_CANDIDATES = 64;
 
+/** How long the failure report waits for the browser's own ICE counters. */
+const DIAG_STATS_WAIT_MS = 500;
+
+/** Where a count in the failure report stops: past it, the number says nothing more. */
+const DIAG_COUNT_CAP = 999;
+
+const DIAG_TYPES = new Set(['host', 'srflx', 'prflx', 'relay']);
+const DIAG_PROTOCOLS = new Set(['udp', 'tcp']);
+
+/**
+ * The kind of a candidate this page sent, as the failure report counts it:
+ * `type/protocol/family`, for example `host/udp/v4`. Null when the browser does
+ * not say enough to tell, and then it is not counted.
+ *
+ * The address is read here only to tell its family: an mDNS name (`….local`),
+ * IPv6, or IPv4. It goes no further — the report carries this key and a count,
+ * never an address or a port.
+ */
+export function candidateKind(candidate) {
+    if (!candidate) return null;
+    const type = String(candidate.type || '').toLowerCase();
+    const protocol = String(candidate.protocol || '').toLowerCase();
+    if (!DIAG_TYPES.has(type) || !DIAG_PROTOCOLS.has(protocol)) return null;
+    // Older browsers leave `address` out; it is the fifth field of the line.
+    const address = candidate.address || String(candidate.candidate || '').split(' ')[4] || '';
+    if (!address) return null;
+    const family = address.endsWith('.local') ? 'mdns' : address.includes(':') ? 'v6' : 'v4';
+    return `${type}/${protocol}/${family}`;
+}
+
+/**
+ * The browser's ICE counters, added up over every candidate pair: checks it
+ * sent, answers it had to them, checks it received. Only these numbers are
+ * read — never a pair's addresses, ports or URLs. Null when the browser does not
+ * answer within DIAG_STATS_WAIT_MS: the report goes without them rather than
+ * after the line has closed.
+ */
+export async function checkCounts(pc) {
+    let timer;
+    const stats = await Promise.race([
+        Promise.resolve()
+            .then(() => pc.getStats())
+            .catch(() => null),
+        new Promise((resolve) => {
+            timer = setTimeout(() => resolve(null), DIAG_STATS_WAIT_MS);
+        }),
+    ]);
+    clearTimeout(timer);
+    if (!stats) return null;
+    const sum = { sent: 0, answered: 0, received: 0 };
+    const add = (key, value) => {
+        if (Number.isFinite(value) && value > 0)
+            sum[key] = Math.min(sum[key] + value, DIAG_COUNT_CAP);
+    };
+    stats.forEach((report) => {
+        if (report.type !== 'candidate-pair') return;
+        add('sent', report.requestsSent);
+        add('answered', report.responsesReceived);
+        add('received', report.requestsReceived);
+    });
+    return sum;
+}
+
+/**
+ * The report a page sends its machine when the direct connection could not be
+ * opened (issue #48: a car whose browser reached the introduction server and
+ * then nothing at all reached its machine, with nothing on either side to say
+ * where it stopped).
+ *
+ * It goes over the signalling line, to the machine and nowhere else: the
+ * introduction server relays it as it relays the candidates, without reading or
+ * keeping it. The machine writes one line in its own log. What it carries is
+ * states and numbers — the ICE, connection and gathering states, how long since
+ * the answer went out, how many candidates of each kind this page sent, how
+ * many it had from the machine, and the ICE check counters. No address, no
+ * port, no browser name.
+ */
+export function diagMessage({ why, ice, connection, gathering, ms, sent, received, checks }) {
+    const cand = {};
+    for (const [kind, n] of sent) cand[kind] = Math.min(n, DIAG_COUNT_CAP);
+    const message = {
+        type: 'diag',
+        why,
+        ice,
+        connection,
+        gathering,
+        ms: Math.max(0, Math.round(ms)),
+        cand,
+        recv: Math.min(received, DIAG_COUNT_CAP),
+    };
+    if (checks) message.checks = checks;
+    return message;
+}
+
 /**
  * The failure where the machine answered and the network did not carry it.
  *
@@ -160,9 +254,25 @@ const MAX_EARLY_CANDIDATES = 64;
 function noRouteError() {
     const err = new Error('Your machine answered, but no direct connection could be opened.');
     err.answered = true;
+    err.mayPass = true;
     err.hint =
         'This network is not letting the two ends reach each other. Company networks and ' +
         'public Wi-Fi often block what that takes. A phone hotspot is the quickest way to tell.';
+    return err;
+}
+
+/**
+ * A failure that may pass, but not within the minute, marked `mayPass`: the
+ * network between the two ends (above), or a machine on its line that said
+ * nothing in time. What fixes those is a router opening its ports again, a phone
+ * leaving the office Wi-Fi, a machine done with whatever held it — nothing this
+ * page can hurry. So a page may try again now and then, never every few
+ * seconds: each try waits out the whole deadline, and the explanation on screen
+ * is the one to read in the meantime (boot.js, connectWhenReachable).
+ */
+function silentError() {
+    const err = new Error('Your machine did not answer in time.');
+    err.mayPass = true;
     return err;
 }
 
@@ -185,6 +295,50 @@ export function encodeFrame(kind, id, payload) {
     out[0] = kind;
     view.setUint32(1, id, false);
     out.set(body, 5);
+    return out;
+}
+
+/**
+ * Compression of the interface's files (v0.4.2).
+ *
+ * A request carries `z: 'deflate'` in its head when this browser can inflate;
+ * the host then may send the body deflated (zlib, RFC 1950) and marks its own
+ * head the same way. The first visit downloads the whole application over the
+ * tunnel, and its scripts shrink about four times. Both marks live in the
+ * frames' heads, not in HTTP headers, so the Response built here is the file
+ * as served, and every check on it (the hashes, the official list) sees the
+ * same bytes as before. An older host ignores the field; a browser without
+ * DecompressionStream never sends it. The format is pinned in
+ * backend/src/server/TunnelFrame.h.
+ */
+export const DEFLATE = 'deflate';
+
+export function canInflate() {
+    return typeof DecompressionStream === 'function';
+}
+
+export async function inflate(bytes) {
+    const input = new ReadableStream({
+        start(controller) {
+            controller.enqueue(bytes);
+            controller.close();
+        },
+    });
+    const reader = input.pipeThrough(new DecompressionStream(DEFLATE)).getReader();
+    const parts = [];
+    let total = 0;
+    for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        parts.push(value);
+        total += value.length;
+    }
+    const out = new Uint8Array(total);
+    let offset = 0;
+    for (const p of parts) {
+        out.set(p, offset);
+        offset += p.length;
+    }
     return out;
 }
 
@@ -379,6 +533,16 @@ export class Tunnel {
         // network blocks everything" and "it found its public address and the
         // checks still went nowhere".
         this._localTypes = new Set();
+        // For the report a failed connection sends its machine (diagMessage):
+        // candidates by kind, counted only once actually sent, so the report
+        // never claims more than the machine was given; the machine's own
+        // candidates, counted as they come; and whether this page's signed
+        // answer went out — before it has, the machine would not listen, and
+        // nothing is sent.
+        this._sentKinds = new Map();
+        this._remoteCount = 0;
+        this._answeredAt = null;
+        this._diagSent = false;
 
         this._nextId = 1;
         this._pending = new Map(); // request id → { resolve, reject, head, chunks }
@@ -391,6 +555,14 @@ export class Tunnel {
         this.onstatus = null;
         /** Called when the channel goes away for good. */
         this.onclosed = null;
+        /**
+         * True once connect() has given up at its deadline. Nothing stops the
+         * attempt then: on a slow network the channel can still open a few
+         * seconds later, and `onlate` is called if it does. Whoever gave up on
+         * it either takes it at that moment or closes it.
+         */
+        this.overdue = false;
+        this.onlate = null;
     }
 
     get connected() {
@@ -417,10 +589,18 @@ export class Tunnel {
 
         this._status('calling');
         await new Promise((resolve, reject) => {
-            const deadline = setTimeout(() => reject(this._deadlineError()), CONNECT_TIMEOUT_MS);
+            const deadline = setTimeout(() => {
+                this.overdue = true;
+                reject(this._deadlineError());
+                // After the verdict, not before it: a page that gives up here
+                // keeps the attempt going (see `overdue`), so the line is still
+                // there to carry the report.
+                this._reportNoRoute('deadline');
+            }, CONNECT_TIMEOUT_MS);
             const settle = (err) => {
                 clearTimeout(deadline);
                 if (err) reject(err);
+                else if (this.overdue) this.onlate?.();
                 else resolve();
             };
 
@@ -511,12 +691,42 @@ export class Tunnel {
      * heard from it and the plain reading is the right one.
      */
     _deadlineError() {
-        return this._pc ? noRouteError() : new Error('Your machine did not answer in time.');
+        return this._pc ? noRouteError() : silentError();
     }
 
+    /** Returns whether the payload went out on the line. */
     _sendSignal(payload) {
-        if (this._ws?.readyState === WebSocket.OPEN)
-            this._ws.send(JSON.stringify({ t: 'msg', d: payload }));
+        if (this._ws?.readyState !== WebSocket.OPEN) return false;
+        this._ws.send(JSON.stringify({ t: 'msg', d: payload }));
+        return true;
+    }
+
+    /**
+     * Tell the machine where the direct connection stopped (diagMessage), once
+     * per connection, and only when this page's signed answer has gone out:
+     * before that, the offer may not have been verified and the machine would
+     * not listen. `why` is 'failed' (the browser gave up on ICE) or 'deadline'
+     * (connect()'s 25 s ran out first).
+     */
+    async _reportNoRoute(why) {
+        if (this._diagSent || this._answeredAt === null || !this._pc) return;
+        this._diagSent = true;
+        const pc = this._pc;
+        const checks = await checkCounts(pc);
+        // Opened while the counters were read: there is nothing to report.
+        if (this.connected) return;
+        this._sendSignal(
+            diagMessage({
+                why,
+                ice: pc.iceConnectionState,
+                connection: pc.connectionState,
+                gathering: pc.iceGatheringState,
+                ms: performance.now() - this._answeredAt,
+                sent: this._sentKinds,
+                received: this._remoteCount,
+                checks,
+            }),
+        );
     }
 
     async _onRelayFrame(raw, settle) {
@@ -588,27 +798,34 @@ export class Tunnel {
                 // browser managed to find is most of the diagnosis, and it is
                 // otherwise only visible in chrome://webrtc-internals.
                 if (ev.candidate.type) this._localTypes.add(ev.candidate.type);
-                this._sendSignal({
+                const sent = this._sendSignal({
                     type: 'ice',
                     candidate: ev.candidate.candidate,
                     mid: ev.candidate.sdpMid,
                 });
+                const kind = sent ? candidateKind(ev.candidate) : null;
+                if (kind) this._sentKinds.set(kind, (this._sentKinds.get(kind) || 0) + 1);
             }
         };
         this._pc.ondatachannel = (ev) => this._adoptChannel(ev.channel);
-        this._pc.onconnectionstatechange = () => {
-            const state = this._pc.connectionState;
+        const pc = this._pc;
+        pc.onconnectionstatechange = async () => {
+            const state = pc.connectionState;
             if (state !== 'failed' && state !== 'closed') return;
             // A verdict, not a symptom: before the channel has ever opened this
             // IS the outcome of the attempt, and sitting on it until the
             // deadline only spends another twenty seconds to end up saying
             // something less true.
-            if (!this.connected && this._onChannelOpen) {
+            const waiting = !this.connected ? this._onChannelOpen : null;
+            if (waiting) {
                 console.warn(
-                    `[MW] No route to the host: ice=${this._pc.iceConnectionState} ` +
+                    `[MW] No route to the host: ice=${pc.iceConnectionState} ` +
                         `local candidates=${[...this._localTypes].join(',') || 'none'}`,
                 );
-                this._onChannelOpen(noRouteError());
+                // Sent before the verdict: the page that hears it may close the
+                // signalling line at once.
+                if (state === 'failed') await this._reportNoRoute('failed');
+                waiting(noRouteError());
             }
             this._teardown('the connection ended');
         };
@@ -628,7 +845,8 @@ export class Tunnel {
             return;
         }
         await this._pc.setLocalDescription(answer);
-        this._sendSignal({ type: 'sdp', sdp: answer.sdp, sig });
+        if (this._sendSignal({ type: 'sdp', sdp: answer.sdp, sig }))
+            this._answeredAt = performance.now();
         this._status('connecting');
     }
 
@@ -656,6 +874,7 @@ export class Tunnel {
      * anything that costs memory.
      */
     async _onRemoteCandidate(msg) {
+        if (this._remoteCount < DIAG_COUNT_CAP) this._remoteCount++;
         if (!this._pc?.remoteDescription) {
             if (this._earlyCandidates.length < MAX_EARLY_CANDIDATES)
                 this._earlyCandidates.push(msg);
@@ -718,6 +937,7 @@ export class Tunnel {
      */
     close() {
         this.onclosed = null;
+        this.onlate = null;
         this._teardown('closed');
         for (const part of [this._dc, this._pc, this._ws]) {
             try {
@@ -802,15 +1022,24 @@ export class Tunnel {
         }
     }
 
-    _buildResponse(waiter) {
+    async _buildResponse(waiter) {
         const head = waiter.head || { s: 502, h: {} };
         let total = 0;
         for (const c of waiter.chunks) total += c.length;
-        const body = new Uint8Array(total);
+        let body = new Uint8Array(total);
         let offset = 0;
         for (const c of waiter.chunks) {
             body.set(c, offset);
             offset += c.length;
+        }
+        if (head.z !== undefined) {
+            // Only ever sent when this page asked, and only the one encoding.
+            if (head.z !== DEFLATE) throw new Error(`your machine sent a body in ${head.z}`);
+            try {
+                body = await inflate(body);
+            } catch (e) {
+                throw new Error(`a file from your machine did not inflate (${e && e.message})`);
+            }
         }
 
         const headers = new Headers();
@@ -863,14 +1092,14 @@ export class Tunnel {
             body = new TextEncoder().encode(String(body));
 
         const id = this._nextId++;
-        const payload = encodeHead(
-            {
-                m: (init.method || 'GET').toUpperCase(),
-                p: url.pathname + url.search,
-                h: headers,
-            },
-            body,
-        );
+        const head = {
+            m: (init.method || 'GET').toUpperCase(),
+            p: url.pathname + url.search,
+            h: headers,
+        };
+        // The host decides which answers to deflate (its interface files only).
+        if (canInflate()) head.z = DEFLATE;
+        const payload = encodeHead(head, body);
 
         return new Promise((resolve, reject) => {
             const timer = setTimeout(() => {

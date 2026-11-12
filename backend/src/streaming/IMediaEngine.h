@@ -46,6 +46,10 @@ struct CharKeyHints
     /// AltGr, or a Mac's Option, chose the character on the client: the Ctrl
     /// and Alt the viewer holds are a level for the host, not a shortcut.
     bool altGraph = false;
+    /// A movement key the client wants kept down through a brief stall
+    /// (`hold`), typed as a character because the owner wants the client's
+    /// characters in gaming mode too: the watchdog gives it the long period.
+    bool hold = false;
 };
 
 /**
@@ -370,6 +374,16 @@ public:
         return m_GamingKeys.exchange(now, std::memory_order_relaxed) != now;
     }
 
+    /// Whether the key about to go through sendKeyEvent came from the client's
+    /// gaming mode, for that one call: every other caller of sendKeyEvent (typed
+    /// text, the watchdog's) finds it false. Set by InputMsg::sendKey, read by
+    /// the native engine.
+    void setKeyFromGamingMode(bool gaming)
+    {
+        m_KeyFromGamingMode.store(gaming, std::memory_order_relaxed);
+    }
+    bool keyFromGamingMode() const { return m_KeyFromGamingMode.load(std::memory_order_relaxed); }
+
     /// Snapshot the host's real lock-key state. Only possible when the streamed
     /// host IS this machine — which is always true for a native engine and
     /// conditional for GameStream, hence the parameter.
@@ -463,6 +477,11 @@ signals:
     /// The host asked to rumble a controller (forwarded to the browser).
     void rumble(int controllerNumber, int lowFreqMotor, int highFreqMotor);
 
+    /// The player number the host's OS gave a controller (0 for player 1), when
+    /// known and each time it changes. Native Windows host only: a pad left
+    /// plugged in there (a Sunshine session kept open) takes player 1 first.
+    void padPlayer(int controllerNumber, int hostNumber);
+
     /// The host's OS asked something of a recreated HID device (an output
     /// report, a feature): forwarded to the page, on the engine's thread.
     /// kind: 0 output, 1 get feature, 2 set feature.
@@ -542,4 +561,5 @@ protected:
     /// std::atomic_load / atomic_store.
     std::shared_ptr<const mw::native::HostKeyboardLayout> m_HostTextLayout;
     std::atomic<int> m_GamingKeys{-1};
+    std::atomic<bool> m_KeyFromGamingMode{false};
 };

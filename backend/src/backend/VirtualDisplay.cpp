@@ -72,6 +72,11 @@ QString resultPath()
     return stagingDir() + QStringLiteral("/result.json");
 }
 
+QString othersOffPath()
+{
+    return stagingDir() + QStringLiteral("/others-off");
+}
+
 QString bundledDriverDir()
 {
     return QCoreApplication::applicationDirPath() + QStringLiteral("/drivers/vdd");
@@ -378,8 +383,9 @@ Status probe()
 {
     Status st;
 #if defined(Q_PROCESSOR_ARM)
-    // The native engine does not run on Windows ARM64, and the ARM64 driver
-    // package would need its own pinned hashes: nothing to offer there.
+    // The native engine runs on Windows ARM64, but Windows on ARM takes a
+    // driver package only signed by Microsoft (0x800b0109, 20/10/2026): none
+    // is shipped there, so there is nothing to offer.
     return st;
 #else
     st.supported = true;
@@ -519,7 +525,9 @@ bool applyInProcess(const Request& req, Result* result)
     switch (req.action) {
     case Request::Action::Install:
     case Request::Action::Uninstall:
-        // Nothing to install: the display is conjured at activation.
+    case Request::Action::OthersBack:
+        // Nothing to install: the display is conjured at activation. Nor are
+        // the other displays ever off here (Windows only).
         res.ok = true;
         res.stage = QStringLiteral("done");
         break;

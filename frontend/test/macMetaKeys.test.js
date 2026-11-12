@@ -13,8 +13,8 @@ import { StreamView } from '../js/ui/StreamView.js';
  *
  * The fix sends the chord as a tap (down immediately followed by up) instead
  * of waiting for a release that will not come. The Cmd→Windows-key mapping is
- * deliberately left alone: Cmd alone still opens the Start menu, and Ctrl+C
- * remains the way to copy on the host.
+ * deliberately left alone: Cmd alone still opens the Start menu. With the
+ * shared clipboard, Cmd+V and Cmd+C alone become the host's Ctrl+V and Ctrl+C.
  */
 
 const VK_C = 0x43;
@@ -51,6 +51,7 @@ function keySink(overrides = {}) {
         _releaseKeysHeldUnderMeta: StreamView.prototype._releaseKeysHeldUnderMeta,
         _releaseHeldMeta: StreamView.prototype._releaseHeldMeta,
         _sendPendingPasteKey: StreamView.prototype._sendPendingPasteKey,
+        _sendCopyChord: StreamView.prototype._sendCopyChord,
         ...overrides,
     };
 }
@@ -151,9 +152,28 @@ describe('Cmd+V reaching the host as a paste', () => {
         const v = macPasting();
         v.handlePaste(pasteEv('x'));
 
-        expect(v.sent[0]).toMatchObject({ type: 'keyup', keyCode: VK_LWIN });
-        expect(v.sent[1]).toMatchObject({ type: 'clipboardpaste', text: 'x', injectCtrl: true });
+        expect(v.sent[2]).toMatchObject({ type: 'keyup', keyCode: VK_LWIN });
+        expect(v.sent[3]).toMatchObject({ type: 'clipboardpaste', text: 'x', injectCtrl: true });
         expect(v._heldPhysKeys.has('MetaLeft')).toBe(false);
+    });
+
+    // Win down then up with nothing between is what opens the Start menu, and
+    // the injected chord would paste into its search box.
+    it('taps Ctrl under the Windows key so its release opens no Start menu', () => {
+        const v = macPasting();
+        v.handlePaste(pasteEv('x'));
+
+        expect(v.sent[0]).toMatchObject({ type: 'keydown', code: 'ControlLeft', metaKey: true });
+        expect(v.sent[1]).toMatchObject({ type: 'keyup', code: 'ControlLeft', metaKey: true });
+        expect(v._heldPhysKeys.has('ControlLeft')).toBe(false);
+    });
+
+    it('leaves a Cmd pressed alone a plain Windows key', () => {
+        const v = keySink({ _clipboardEnabled: true });
+        v.handleKeyDown(ev('MetaLeft', 'Meta', { metaKey: true }));
+        v.handleKeyUp(ev('MetaLeft', 'Meta'));
+
+        expect(v.sent.map((m) => m.code)).toEqual(['MetaLeft', 'MetaLeft']);
     });
 
     // No text to ship (empty or non-text local clipboard): the host pastes its
@@ -163,8 +183,8 @@ describe('Cmd+V reaching the host as a paste', () => {
         const v = macPasting();
         v._sendPendingPasteKey(); // what the 150ms timer does
 
-        expect(v.sent.map((m) => m.type)).toEqual(['keyup', 'clipboardpaste']);
-        expect(v.sent[1]).toMatchObject({ text: '', injectCtrl: true });
+        expect(v.sent.map((m) => m.type)).toEqual(['keydown', 'keyup', 'keyup', 'clipboardpaste']);
+        expect(v.sent[3]).toMatchObject({ text: '', injectCtrl: true });
         expect(v._heldPhysKeys.size).toBe(0);
     });
 
@@ -172,7 +192,7 @@ describe('Cmd+V reaching the host as a paste', () => {
         const v = macPasting();
         v.handleKeyUp(ev('KeyV', 'v', { metaKey: true }));
 
-        expect(v.sent.map((m) => m.type)).toEqual(['keyup', 'clipboardpaste']);
+        expect(v.sent.map((m) => m.type)).toEqual(['keydown', 'keyup', 'keyup', 'clipboardpaste']);
         expect(v._heldPhysKeys.has('KeyV')).toBe(false);
     });
 });
@@ -229,6 +249,91 @@ describe('Ctrl+V away from Apple keyboards', () => {
         expect(v.sent).toHaveLength(1);
         expect(v.sent[0]).toMatchObject({ type: 'keydown', keyCode: VK_V, ctrlKey: true });
         expect(v._heldPhysKeys.has('KeyV')).toBe(true);
+    });
+});
+
+/** Cmd held, then C, with the shared clipboard on. */
+function macCopying(mods = {}, key = 'c', code = 'KeyC') {
+    const v = keySink({ _clipboardEnabled: true });
+    v.handleKeyDown(ev('MetaLeft', 'Meta', { metaKey: true }));
+    v.sent.length = 0;
+    v.handleKeyDown(ev(code, key, { metaKey: true, ...mods }));
+    return v;
+}
+
+describe('Cmd+C reaching the host as a copy', () => {
+    // Sent as is, Cmd+C is Win+C on the host: the window loses its selection
+    // and nothing is copied (Bruno on the native card, 08/11).
+    it('sends Ctrl+C, after letting go of the Windows key', () => {
+        const v = macCopying();
+
+        expect(v.sent.map((m) => [m.type, m.code])).toEqual([
+            ['keydown', 'ControlLeft'], // the tap that keeps the Start menu shut
+            ['keyup', 'ControlLeft'],
+            ['keyup', 'MetaLeft'],
+            ['keydown', 'ControlLeft'],
+            ['keydown', 'KeyC'],
+            ['keyup', 'KeyC'],
+            ['keyup', 'ControlLeft'],
+        ]);
+        expect(v.sent[4]).toMatchObject({ keyCode: VK_C, ctrlKey: true, metaKey: false });
+        expect(v._heldPhysKeys.size).toBe(0);
+    });
+
+    it('swallows the late keyup of C', () => {
+        const v = macCopying();
+        v.sent.length = 0;
+
+        v.handleKeyUp(ev('KeyC', 'c'));
+        expect(v.sent).toEqual([]);
+        expect(v._metaTapCodes.size).toBe(0);
+    });
+
+    // A layout where another key types "c": Windows still copies with VK_C.
+    it('copies with VK_C whichever key types "c"', () => {
+        const v = macCopying({}, 'c', 'KeyI');
+
+        expect(
+            v.sent.find((m) => m.type === 'keydown' && m.ctrlKey && m.code !== 'ControlLeft'),
+        ).toMatchObject({
+            code: 'KeyC',
+            keyCode: VK_C,
+        });
+        v.sent.length = 0;
+        v.handleKeyUp(ev('KeyI', 'c'));
+        expect(v.sent).toEqual([]);
+    });
+
+    it('leaves Cmd+Shift+C and Cmd+Option+C to the plain tap', () => {
+        for (const mods of [{ shiftKey: true }, { altKey: true }]) {
+            const v = macCopying(mods, 'C');
+            expect(v.sent.map((m) => [m.type, m.keyCode])).toEqual([
+                ['keydown', VK_C],
+                ['keyup', VK_C],
+            ]);
+            expect(v._heldPhysKeys.has('MetaLeft')).toBe(true);
+        }
+    });
+
+    it('stays a Win+C tap when the clipboard is not shared', () => {
+        const v = keySink();
+        v.handleKeyDown(ev('MetaLeft', 'Meta', { metaKey: true }));
+        v.sent.length = 0;
+        v.handleKeyDown(ev('KeyC', 'c', { metaKey: true }));
+
+        expect(v.sent.map((m) => [m.type, m.keyCode])).toEqual([
+            ['keydown', VK_C],
+            ['keyup', VK_C],
+        ]);
+        expect(v._heldPhysKeys.has('MetaLeft')).toBe(true);
+    });
+
+    it('does not turn Win+C into a copy on a non-Apple client', () => {
+        const v = keySink({ _clipboardEnabled: true, _appleKeyboard: false });
+        v.handleKeyDown(ev('KeyC', 'c', { metaKey: true }));
+
+        expect(v.sent).toHaveLength(1);
+        expect(v.sent[0]).toMatchObject({ type: 'keydown', keyCode: VK_C, ctrlKey: false });
     });
 });
 

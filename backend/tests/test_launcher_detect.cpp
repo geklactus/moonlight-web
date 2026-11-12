@@ -115,6 +115,20 @@ void run_launcher_detect_tests()
         FakeMachine none;
         CHECK(!LauncherDetect::steamLinux(none.lookup()).has_value());
     }
+    // The Flatpak alone, installed for the user, with its icon where Flatpak exports it.
+    {
+        FakeMachine m;
+        m.env["HOME"] = "/home/u";
+        m.files << "/home/u/.local/share/flatpak/app/com.valvesoftware.Steam"
+                << "/home/u/.local/share/flatpak/exports/share/icons/hicolor/128x128/apps/"
+                   "com.valvesoftware.Steam.png";
+        const auto steam = LauncherDetect::steamLinux(m.lookup());
+        CHECK(steam.has_value());
+        CHECK_EQ(steam->command, QString("steam://open/bigpicture"));
+        CHECK_EQ(steam->iconPath,
+                 QString("/home/u/.local/share/flatpak/exports/share/icons/hicolor/128x128/apps/"
+                         "com.valvesoftware.Steam.png"));
+    }
 
     // What AppSettings takes.
     {
@@ -132,6 +146,24 @@ void run_launcher_detect_tests()
     CHECK(!HostAppLauncher::isUrl("C:\\Games\\game.exe"));
     CHECK(!HostAppLauncher::isUrl("lutris lutris:rungameid/3"));
     CHECK(!HostAppLauncher::isUrl("retroarch"));
+
+    // Linux: a link's handler outlives xdg-open, which returns as soon as it
+    // has started it; everything before "--" belongs to systemd-run.
+    {
+        const QStringList run{QString("xdg-open"), QString("steam://open/bigpicture")};
+        const QStringList arguments = HostAppLauncher::systemdRunArguments(
+            QString("moonlightweb-app-1"),
+            {QString("DISPLAY=:0"), QString("XDG_CURRENT_DESKTOP=ubuntu:GNOME")}, run);
+        const qsizetype split = arguments.indexOf(QString("--"));
+        CHECK(split > 0);
+        const QStringList own = arguments.mid(0, split);
+        CHECK(own.contains(QString("--user")));
+        CHECK(own.contains(QString("--unit=moonlightweb-app-1")));
+        CHECK(own.contains(QString("--property=KillMode=process")));
+        CHECK(own.contains(QString("--setenv=DISPLAY=:0")));
+        CHECK(own.contains(QString("--setenv=XDG_CURRENT_DESKTOP=ubuntu:GNOME")));
+        CHECK(arguments.mid(split + 1) == run);
+    }
     {
         QString program, args;
         HostAppLauncher::splitWindowsCommand(
@@ -167,5 +199,42 @@ void run_launcher_detect_tests()
         CHECK_EQ(
             HostAppLauncher::windowsToMove({}, {}, {client, bigPicture}, virtualDisplay).size(),
             qsizetype(2));
+    }
+
+    // Linux: where a moved window lands, and the request that puts it there.
+    {
+        const QRect virtualDisplay(0, 0, 800, 600);
+        CHECK(HostAppLauncher::placedOn(QSize(1920, 1080), virtualDisplay) == virtualDisplay);
+        CHECK(HostAppLauncher::placedOn(QSize(446, 225), QRect(2560, 0, 800, 600)) ==
+              QRect(2560, 0, 446, 225));
+        const auto values = HostAppLauncher::moveResizeValues(QRect(10, 20, 800, 600));
+        CHECK_EQ(values[0] & 0xFF, 1L);         // north-west gravity
+        CHECK_EQ((values[0] >> 8) & 0xF, 0xFL); // x, y, width and height are all set
+        CHECK_EQ((values[0] >> 12) & 0xF, 2L);  // from a pager
+        CHECK_EQ(values[1], 10L);
+        CHECK_EQ(values[2], 20L);
+        CHECK_EQ(values[3], 800L);
+        CHECK_EQ(values[4], 600L);
+    }
+
+    // Linux: Big Picture in full screen on another screen leaves it, moves, and
+    // goes back to it; a window that never moves is given up on.
+    {
+        using HostAppLauncher::nextWindowStep;
+        using HostAppLauncher::WindowStep;
+        HostAppLauncher::WindowMove move;
+        CHECK(nextWindowStep(move, true, false, 8) == WindowStep::LeaveFullScreen);
+        move.wasFullScreen = true;
+        move.tries = 1;
+        CHECK(nextWindowStep(move, true, false, 8) == WindowStep::LeaveFullScreen);
+        CHECK(nextWindowStep(move, false, false, 8) == WindowStep::Move);
+        CHECK(nextWindowStep(move, false, true, 8) == WindowStep::EnterFullScreen);
+        CHECK(nextWindowStep(move, true, true, 8) == WindowStep::Done);
+        move.tries = 8;
+        CHECK(nextWindowStep(move, false, false, 8) == WindowStep::GiveUp);
+        CHECK(nextWindowStep(move, false, true, 8) == WindowStep::EnterFullScreen);
+        HostAppLauncher::WindowMove windowed;
+        CHECK(nextWindowStep(windowed, false, false, 8) == WindowStep::Move);
+        CHECK(nextWindowStep(windowed, false, true, 8) == WindowStep::Done);
     }
 }

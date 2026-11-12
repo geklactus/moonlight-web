@@ -24,6 +24,7 @@
 #include <openssl/core_names.h>
 #include <openssl/ec.h>
 #include <openssl/ecdsa.h>
+#include <openssl/err.h>
 #include <openssl/evp.h>
 #include <openssl/pem.h>
 #include <openssl/rand.h>
@@ -48,6 +49,10 @@ struct MdCtxDeleter
 struct SigDeleter
 {
     void operator()(ECDSA_SIG* s) const { ECDSA_SIG_free(s); }
+};
+struct X509Deleter
+{
+    void operator()(X509* x) const { X509_free(x); }
 };
 
 using PkeyPtr = std::unique_ptr<EVP_PKEY, PkeyDeleter>;
@@ -235,8 +240,21 @@ QByteArray browserDigestInput(const QString& hostId, const QByteArray& nonceH,
 
 // ── Sign / verify ──────────────────────────────────────────────────────────
 
+namespace {
+
+/// Whatever the answer, the thread's OpenSSL error queue is left empty for the
+/// next caller on it.
+struct OpenSslErrorsCleared
+{
+    ~OpenSslErrorsCleared() { ERR_clear_error(); }
+};
+
+} // namespace
+
 QByteArray sign(const QByteArray& privatePem, const QByteArray& message)
 {
+    const OpenSslErrorsCleared clearErrors;
+
     PkeyPtr key = loadPrivatePem(privatePem);
     if (!key || message.isEmpty()) return {};
 
@@ -265,6 +283,8 @@ bool verify(const QByteArray& spkiDer, const QByteArray& message, const QByteArr
     // distinguish "wrong signature" from "unparseable key" and treat one as a
     // reason to continue.
     if (message.isEmpty() || signature.size() != SIGNATURE_BYTES) return false;
+
+    const OpenSslErrorsCleared clearErrors;
 
     PkeyPtr key = loadPublicSpki(spkiDer);
     if (!key) return false;
@@ -295,6 +315,37 @@ QByteArray generateNonce()
         return {};
     }
     return nonce;
+}
+
+// ── MW-TLS-v1 ──────────────────────────────────────────────────────────────
+
+QByteArray tlsProofInput(const QString& hostId, const QByteArray& nonce,
+                         const QByteArray& tlsKeyDigest)
+{
+    return buildSignedMessage(
+        {QByteArray(TLS_PROOF_PROTOCOL) + "|host", hostId.toUtf8(), nonce, tlsKeyDigest});
+}
+
+QByteArray certificateSpki(const QByteArray& certDer)
+{
+    if (certDer.isEmpty()) return {};
+    const OpenSslErrorsCleared clearErrors;
+    const unsigned char* p = reinterpret_cast<const unsigned char*>(certDer.constData());
+    std::unique_ptr<X509, X509Deleter> cert(
+        d2i_X509(nullptr, &p, static_cast<long>(certDer.size())));
+    if (!cert) return {};
+
+    // Owned by the certificate. Re-encoded from the key, as a client re-encodes
+    // the one it reads off the handshake: the same bytes for any key a CA or
+    // this host would put in a certificate.
+    EVP_PKEY* key = X509_get0_pubkey(cert.get());
+    if (!key) return {};
+    unsigned char* der = nullptr;
+    const int len = i2d_PUBKEY(key, &der);
+    if (len <= 0 || !der) return {};
+    QByteArray out(reinterpret_cast<const char*>(der), len);
+    OPENSSL_free(der);
+    return out;
 }
 
 } // namespace PairingCrypto

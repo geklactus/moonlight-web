@@ -16,6 +16,8 @@
  */
 
 #include "server/routes/SystemRoutes.h"
+#include "server/routes/HostKeyRoute.h"
+#include "server/routes/PairRequestRoutes.h"
 
 #include "server/HttpServer.h"
 #include "server/RestRouter.h"
@@ -34,6 +36,10 @@
 #include "backend/streambackend/NativeHostBackend.h"
 #include "backend/streambackend/NativeProbeService.h"
 #include "streaming/ConsoleSession.h"
+#include "server/AudioApps.h"
+#include "streaming/RemoteDesktopReturnPolicy.h"
+#include "streaming/StreamWorkerHost.h"
+#include "streaming/WorkerService.h"
 #include "mw/native/Capabilities.h"
 #include "mw/native/HostKeyboardLayout.h"
 #include "mw/native/VideoPipeline.h"
@@ -43,6 +49,7 @@
 #include "common/DesktopSession.h"
 #include "common/Edition.h"
 #include "common/Logger.h"
+#include "common/PairingCrypto.h"
 #include "common/RunFlags.h"
 
 #include <QCoreApplication>
@@ -53,6 +60,7 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QNetworkInterface>
+#include <QOperatingSystemVersion>
 #include <QPointer>
 #include <QProcess>
 #include <QStandardPaths>
@@ -71,6 +79,20 @@ static constexpr int kServiceRestartExitCode = 79;
 // NVENC, AMF or oneVPL. A Snapdragon's Media Foundation encoder has none, nor
 // has a machine with no GPU encoder at all, and the admin hides the choice
 // there rather than offer a switch that changes nothing.
+// "Stream audio from" one app — the native Windows host's per-process loopback,
+// which arrived in Windows build 20348 (Windows 11). Elsewhere the choice is
+// shown locked: the stream carries the whole mix whatever is stored.
+static bool audioSourceFocusedSupported()
+{
+#if defined(Q_OS_WIN)
+    if (!NativeHostBackend::isEnabled()) return false;
+    return QOperatingSystemVersion::current() >=
+           QOperatingSystemVersion(QOperatingSystemVersion::Windows, 10, 0, 20348);
+#else
+    return false;
+#endif
+}
+
 static bool nativeVideoPipelineSupported()
 {
 #if defined(Q_OS_WIN)
@@ -103,9 +125,10 @@ static QJsonArray nativeVideoPipelineOptions()
 
 void registerSystemRoutes(HttpServer& server, AppSettings& appSettings, AuthManager& authManager,
                           InternetAccessManager& internetAccess, ComputerManager& computerManager,
-                          std::function<void()> onHostKeyRotated,
+                          std::function<bool(const QString& key)> spendHostKey,
                           std::function<void(bool)> onInternetAccessToggled,
-                          std::function<QJsonObject()> rendezvousStatus)
+                          std::function<QJsonObject()> rendezvousStatus,
+                          std::function<bool(const HttpRequest&)> viewerOnLan)
 {
     // API route: get Internet Access status
     // rendezvousStatus captured BY VALUE, like the callbacks below: the
@@ -209,7 +232,7 @@ void registerSystemRoutes(HttpServer& server, AppSettings& appSettings, AuthMana
     // API route: enable/configure Internet Access
     // onInternetAccessToggled captured BY VALUE: the parameter dies when this
     // registration function returns, but the route lambdas live on — the same
-    // reason onHostKeyRotated is captured that way below.
+    // reason spendHostKey is captured that way below.
     server.router()->post("/api/internet/enable", [&, onInternetAccessToggled](
                                                       const HttpRequest& req) {
         // Only localhost can modify internet access settings
@@ -238,6 +261,7 @@ void registerSystemRoutes(HttpServer& server, AppSettings& appSettings, AuthMana
             appSettings.setInternetAccessEnabled(body["internet_access_enabled"].toBool());
         if (body.contains("upnp_enabled"))
             appSettings.setUpnpEnabled(body["upnp_enabled"].toBool());
+        if (RouterPortAllocator* ports = internetAccess.routerPorts()) ports->switchChanged();
 
         // Legal traceability: record the exact agreement text the user read when
         // they ticked the checkbox. The mechanism is decided here, not by the
@@ -274,77 +298,33 @@ void registerSystemRoutes(HttpServer& server, AppSettings& appSettings, AuthMana
         }
     });
 
-    // POST /api/auth/host-key — prove the browser runs on the host machine.
-    // The host's own entry points embed a persistent random key; the frontend
-    // redeems it here to obtain a localhost-equivalent session (admin access),
-    // since anywhere but loopback the peer address is not the machine's own.
-    // Redemption is refused for peers that cannot plausibly be the host machine
-    // itself.
-    //
-    // Two ways in, and the difference is recorded on the session because it
-    // decides what that session is worth afterwards:
-    //
-    //   socket  the key rides in ?mwk= on a local URL. The query reaches only
-    //           this machine, so it is safe there and nowhere else.
-    //   tunnel  the key rides in the FRAGMENT of a rendezvous link (#k=...),
-    //           which is the one part of a URL a browser never sends to the
-    //           server it fetched from — so the introduction server never sees
-    //           it, and it reaches this handler inside the tunnel's own
-    //           encryption. This is what gives the owner an admin page under a
-    //           certificate the browser already trusts.
-    //
-    // The plausibility gate below is what makes the tunnel case safe, and it is
-    // stronger there than it looks: for a tunnel peer clientAddress is the
-    // address ICE actually settled on — where our own stack is sending packets,
-    // not anything the browser said. A forwarded link redeemed from elsewhere on
-    // the internet arrives from an address that is neither private nor ours.
-    // onHostKeyRotated captured by value: the parameter dies when this
+    // POST /api/auth/host-key — the browser on the host machine spends the key
+    // of its owner's link (HostKeyRoute). The key was made for that one link
+    // and is spent by being recognised. A key that opens nothing is counted
+    // against the address it came from, where an address can be: never this
+    // machine's own nor its network's, which several browsers share, so that
+    // one of them cannot lock the others out.
+    // spendHostKey captured by value: the parameter dies when this
     // registration function returns, but the route lambda lives on.
-    server.router()->post("/api/auth/host-key", [&, onHostKeyRotated](const HttpRequest& req) {
-        const QString key = QJsonDocument::fromJson(req.body).object().value("key").toString();
-        const QString addr = AuthManager::cleanClientAddress(req.clientAddress);
-        const bool plausiblyHost =
-            HttpServer::isLocalRequest(addr) ||
-            AuthManager::isPrivateIP(addr) == QLatin1String("Local") ||
-            (!internetAccess.publicIp().isEmpty() && addr == internetAccess.publicIp());
-        // Compare hashes: constant-time, no length leak.
-        const QByteArray given = QCryptographicHash::hash(key.toUtf8(), QCryptographicHash::Sha256);
-        const QByteArray expected =
-            QCryptographicHash::hash(appSettings.localKey().toUtf8(), QCryptographicHash::Sha256);
-        if (!plausiblyHost || key.isEmpty() || given != expected) {
-            // Say which gate closed: the address is the one ICE settled on for
-            // a tunnel peer, and whether it passed is the whole question when
-            // the owner's own link lands on the PIN page.
-            Logger::warning(
-                QStringLiteral("[Auth] Host key redemption refused for %1 (%2; %3)")
-                    .arg(addr,
-                         req.viaTunnel ? QStringLiteral("via tunnel") : QStringLiteral("direct"),
-                         !plausiblyHost  ? QStringLiteral("address not plausibly this machine")
-                         : key.isEmpty() ? QStringLiteral("no key given")
-                                         : QStringLiteral("key does not match")));
-            return HttpResponse::error(403, "Invalid host key");
-        }
+    registerHostKeyRoute(
+        *server.router(), authManager,
+        {spendHostKey, [&server](const QString& address) { server.reportAuthFailure(address); },
+         [](const QString& address) { return HttpServer::isLocalRequest(address); },
+         [&internetAccess]() { return internetAccess.publicIp(); },
+         [&appSettings]() {
+             const QByteArray spki = appSettings.hostSigningPublicKey();
+             QJsonObject identity;
+             identity["host_public_key"] = QString::fromLatin1(spki.toBase64());
+             identity["host_id"] = PairingCrypto::keyId(spki);
+             return identity;
+         }});
 
-        QString token =
-            authManager.createSession(req.clientAddress,
-                                      req.viaTunnel ? QStringLiteral("Host machine (remote link)")
-                                                    : QStringLiteral("Host machine"),
-                                      true, false, req.viaTunnel);
-        Logger::info(QStringLiteral("[Auth] Host session created for %1 (via host key)").arg(addr));
-
-        // Single-use: burn the redeemed key and rewrite the entry points that
-        // embed it, so a leaked/history URL cannot be replayed.
-        appSettings.rotateLocalKey();
-        if (onHostKeyRotated) onHostKeyRotated();
-
-        QJsonObject obj;
-        obj["status"] = "ok";
-        obj["is_localhost"] = true;
-        HttpResponse resp = HttpResponse::json(obj);
-        resp.headers["Set-Cookie"] =
-            QString("mw_session=%1; HttpOnly; Secure; Path=/; SameSite=Strict; Max-Age=7776000")
-                .arg(token);
-        return resp;
+    // The same address check, for a host session that takes the key of its
+    // line after the fact (AuthManager::adoptLineKey).
+    server.setHostAddressCheck([&internetAccess](const QString& address) {
+        return plausiblyHostAddress(
+            address, [](const QString& a) { return HttpServer::isLocalRequest(a); },
+            internetAccess.publicIp());
     });
 
     // ── First-run setup wizard (localhost only) ──────────────────────────────
@@ -420,6 +400,10 @@ void registerSystemRoutes(HttpServer& server, AppSettings& appSettings, AuthMana
                 // from hosting itself: possible, and the wizard says which
                 // step is missing rather than sending it to install Sunshine.
                 nat["needs_display"] = caps.reason == mw::native::Unavailability::NoDisplay;
+                // ...unless none is shipped here (Windows ARM64): the wizard
+                // then never sends the user back to the installer for it.
+                if (caps.reason == mw::native::Unavailability::NoDisplay)
+                    nat["virtual_display_supported"] = VirtualDisplay::probe().supported;
                 nat["possible"] = caps.available ||
                                   caps.reason == mw::native::Unavailability::CapturePermission ||
                                   caps.reason == mw::native::Unavailability::NoInteractiveSession ||
@@ -1035,6 +1019,7 @@ void registerSystemRoutes(HttpServer& server, AppSettings& appSettings, AuthMana
 
             internetAccess.stop();
             appSettings.setInternetAccessEnabled(false);
+            if (RouterPortAllocator* ports = internetAccess.routerPorts()) ports->switchChanged();
             if (onInternetAccessToggled) onInternetAccessToggled(false);
 
             QJsonObject obj;
@@ -1070,6 +1055,9 @@ void registerSystemRoutes(HttpServer& server, AppSettings& appSettings, AuthMana
         // active listener at startup, so they are identical.
         obj["https_port"] = static_cast<int>(appSettings.httpsPort(server.activeHttpsPort()));
         obj["cert_auth_enabled"] = authManager.certAuthEnabled();
+        // Whether a device may also ask to pair by its QR code from outside
+        // the LAN (routes/PairRequestRoutes.cpp).
+        obj["pair_request_internet"] = appSettings.pairRequestInternet();
         // Whether the desktop is told when someone streams this screen.
         obj["stream_notifications"] = appSettings.streamNotifications();
         // Whether the stream's packets ask the Wi-Fi for its video queue.
@@ -1082,6 +1070,17 @@ void registerSystemRoutes(HttpServer& server, AppSettings& appSettings, AuthMana
         obj["virtual_display_exclusive_supported"] = false;
 #endif
         obj["virtual_display_exclusive"] = appSettings.virtualDisplayExclusive();
+        // A session left by Remote Desktop goes back to this PC's screen,
+        // locked: offered where the launcher service can do it, in a version
+        // that offers it (RemoteDesktopReturnPolicy::kReturnOffered).
+#ifdef Q_OS_WIN
+        obj["remote_desktop_return_supported"] = RemoteDesktopReturnPolicy::kReturnOffered &&
+                                                 !ConsoleSession::launchesElsewhere() &&
+                                                 WorkerService::available();
+#else
+        obj["remote_desktop_return_supported"] = false;
+#endif
+        obj["remote_desktop_return"] = appSettings.remoteDesktopReturn();
         // This PC's keyboard layout for the touch keyboard's text: offered when
         // this machine names a layout (Linux only, see HostKeyboardLayout) and a
         // host runs here other than the native one, which types text itself.
@@ -1126,14 +1125,6 @@ void registerSystemRoutes(HttpServer& server, AppSettings& appSettings, AuthMana
         obj["debug_mode_cli"] = mw::run::debugFromCli();
         obj["verbose_logs"] = mw::run::verbose();
         obj["verbose_logs_cli"] = mw::run::verboseFromCli();
-        // Host machine only: the current host key, so the
-        // admin page can carry its session over to the
-        // public-domain URL after Internet activation. Not
-        // isLocal — a LAN admin that unlocked with the password
-        // has the same rights but is NOT the host, and handing
-        // it the key would rotate the one the host's own
-        // shortcut still embeds.
-        if (req.isHostMachine) obj["local_key"] = appSettings.localKey();
         return HttpResponse::json(obj);
     });
 
@@ -1155,6 +1146,10 @@ void registerSystemRoutes(HttpServer& server, AppSettings& appSettings, AuthMana
             obj["cert_auth_enabled"] = enabled;
             hadChange = true;
         }
+
+        // ── QR code pairing requests from the internet ───────────────────
+        // Read by each request as it comes (routes/PairRequestRoutes.cpp).
+        if (writePairRequestInternet(req, body, appSettings, obj)) hadChange = true;
 
         // ── Streaming notifications ──────────────────────────────────────
         // Read by the tray on its next poll (both the in-process one and the
@@ -1183,6 +1178,15 @@ void registerSystemRoutes(HttpServer& server, AppSettings& appSettings, AuthMana
             const bool enabled = body["virtual_display_exclusive"].toBool();
             appSettings.setVirtualDisplayExclusive(enabled);
             obj["virtual_display_exclusive"] = enabled;
+            hadChange = true;
+        }
+
+        // ── A session left by Remote Desktop ─────────────────────────────
+        // Read each time the card is listed or opened (RemoteDesktopReturn).
+        if (body.contains("remote_desktop_return")) {
+            const bool enabled = body["remote_desktop_return"].toBool();
+            appSettings.setRemoteDesktopReturn(enabled);
+            obj["remote_desktop_return"] = enabled;
             hadChange = true;
         }
 
@@ -1290,8 +1294,13 @@ void registerSystemRoutes(HttpServer& server, AppSettings& appSettings, AuthMana
 
     // — Streaming settings —
 
-    server.router()->get("/api/settings/streaming", [&appSettings](const HttpRequest&) {
+    // viewerOnLan captured BY VALUE, like rendezvousStatus above.
+    const auto streamingSettings = [&appSettings, viewerOnLan](const HttpRequest& req) {
         QJsonObject obj;
+        // Whether this browser reaches the host over its own network: the
+        // page's automatic bitrate then takes the LAN rule. Read again at each
+        // launch; false when nothing says (an internet target never overruns).
+        obj["viewer_lan"] = viewerOnLan ? viewerOnLan(req) : false;
 
         // Normalise "auto" → "hevc" (the old "auto" default is replaced by explicit HEVC).
         // Existing settings.json entries with "video_codec":"auto" are migrated on read.
@@ -1323,8 +1332,19 @@ void registerSystemRoutes(HttpServer& server, AppSettings& appSettings, AuthMana
         obj["stream_bitrate_auto"] = appSettings.streamBitrateAuto();
         obj["stream_aspect"] = appSettings.streamAspect();
         obj["stream_fps"] = appSettings.streamFps();
+        // The administrator's ceilings, 0 for none: Settings offers nothing
+        // above them, and a launch asks for nothing above them.
+        {
+            const AppSettings::StreamLimits limits = appSettings.streamLimits();
+            obj["max_allowed_frame_rate"] = limits.fps;
+            obj["max_allowed_bitrate"] = limits.bitrateMbps;
+            obj["max_allowed_stream_width"] = limits.width;
+            obj["max_allowed_stream_height"] = limits.height;
+        }
         obj["hdr_enabled"] = appSettings.hdrEnabled();
         obj["mute_host_audio"] = appSettings.muteHostAudio();
+        obj["audio_source"] = appSettings.audioSource();
+        obj["audio_source_focused_supported"] = audioSourceFocusedSupported();
         obj["chroma_444_enabled"] = appSettings.chroma444Enabled();
         obj["video_enhancement"] = appSettings.videoEnhancement();
         obj["video_enhancement_algo"] = appSettings.videoEnhancementAlgo();
@@ -1360,9 +1380,30 @@ void registerSystemRoutes(HttpServer& server, AppSettings& appSettings, AuthMana
         // options on any build.
         obj["debug_mode"] = mw::run::debug();
         return HttpResponse::json(obj);
+    };
+    server.router()->get("/api/settings/streaming", streamingSettings);
+
+    // — The apps "Stream audio from" can name —
+    //
+    // {"app": "huntgame.exe"} while a stream carries one app's sound, {"app": ""}
+    // otherwise, from the stream worker's reports. Settings shows it beside
+    // Automatic.
+    server.router()->get("/api/audio/focused", [](const HttpRequest&) {
+        QJsonObject obj;
+        obj["app"] = StreamWorkerHost::audioFocusApp();
+        obj["supported"] = audioSourceFocusedSupported();
+        return HttpResponse::json(obj);
+    });
+    // The apps with sound on this PC, to pick one from.
+    server.router()->get("/api/audio/apps", [](const HttpRequest&) {
+        QJsonObject obj;
+        obj["supported"] = audioSourceFocusedSupported();
+        obj["apps"] = audioSourceFocusedSupported() ? AudioApps::list() : QJsonArray();
+        return HttpResponse::json(obj);
     });
 
-    server.router()->post("/api/settings/streaming", [&appSettings](const HttpRequest& req) {
+    server.router()->post("/api/settings/streaming", [&appSettings,
+                                                      &internetAccess](const HttpRequest& req) {
         // Only localhost can modify server-side streaming settings
         if (!req.isLocal)
             return HttpResponse::error(403,
@@ -1465,6 +1506,58 @@ void registerSystemRoutes(HttpServer& server, AppSettings& appSettings, AuthMana
             hadChange = true;
         }
 
+        // The administrator's ceilings: no Settings control writes them, the
+        // file and `moonlightweb --max-allowed-…` do (AppSettings.h). A value
+        // that does not read is refused rather than stored as "no limit".
+        const auto limitValue = [&body](const char* key) -> int {
+            const QJsonValue v = body.value(QLatin1String(key));
+            if (v.isDouble()) {
+                const double d = v.toDouble();
+                return d >= 0 && d <= AppSettings::kLimitMax && d == static_cast<int>(d)
+                           ? static_cast<int>(d)
+                           : -1;
+            }
+            bool ok = false;
+            const int n = v.toString().trimmed().toInt(&ok);
+            return ok && n >= 0 && n <= AppSettings::kLimitMax ? n : -1;
+        };
+        if (body.contains("max_allowed_frame_rate")) {
+            const int fps = limitValue("max_allowed_frame_rate");
+            if (fps < 0)
+                return HttpResponse::error(400, "max_allowed_frame_rate must be a whole number "
+                                                "of frames per second, 0 for no limit");
+            appSettings.setMaxAllowedFrameRate(fps);
+            obj["max_allowed_frame_rate"] = appSettings.streamLimits().fps;
+            obj["status"] = "saved";
+            hadChange = true;
+        }
+        if (body.contains("max_allowed_bitrate")) {
+            const int mbps = limitValue("max_allowed_bitrate");
+            if (mbps < 0)
+                return HttpResponse::error(
+                    400, "max_allowed_bitrate must be a whole number of Mbps, 0 for no limit");
+            appSettings.setMaxAllowedBitrate(mbps);
+            obj["max_allowed_bitrate"] = appSettings.streamLimits().bitrateMbps;
+            obj["status"] = "saved";
+            hadChange = true;
+        }
+        if (body.contains("max_allowed_stream_resolution")) {
+            const QJsonValue v = body.value("max_allowed_stream_resolution");
+            int width = 0, height = 0;
+            if (!AppSettings::parseStreamResolution(
+                    v.isDouble() ? QString::number(v.toDouble(), 'f', 0) : v.toString(), &width,
+                    &height))
+                return HttpResponse::error(400, "max_allowed_stream_resolution must be "
+                                                "WIDTHxHEIGHT (1920x1080, 1920, 0x1440), 0 "
+                                                "for no limit");
+            appSettings.setMaxAllowedStreamResolution(width, height);
+            const AppSettings::StreamLimits limits = appSettings.streamLimits();
+            obj["max_allowed_stream_resolution"] =
+                AppSettings::streamResolutionText(limits.width, limits.height);
+            obj["status"] = "saved";
+            hadChange = true;
+        }
+
         if (body.contains("hdr_enabled")) {
             bool enabled = body["hdr_enabled"].toBool();
             appSettings.setHdrEnabled(enabled);
@@ -1489,9 +1582,17 @@ void registerSystemRoutes(HttpServer& server, AppSettings& appSettings, AuthMana
             hadChange = true;
         }
 
+        if (body.contains("audio_source")) {
+            appSettings.setAudioSource(body["audio_source"].toString());
+            obj["audio_source"] = appSettings.audioSource();
+            obj["status"] = "saved";
+            hadChange = true;
+        }
+
         if (body.contains("upnp_enabled")) {
             bool enabled = body["upnp_enabled"].toBool();
             appSettings.setUpnpEnabled(enabled);
+            if (RouterPortAllocator* ports = internetAccess.routerPorts()) ports->switchChanged();
             obj["upnp_enabled"] = enabled;
             obj["status"] = "saved";
             hadChange = true;

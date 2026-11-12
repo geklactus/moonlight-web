@@ -194,6 +194,72 @@ export function supportsGamingMode() {
     }
 }
 
+/** A finger on the page, or a stylus: the one pointer a touch screen brings. */
+const COARSE_POINTER = '(any-pointer: coarse)';
+
+/** Windows that have seen a real touch since their touch screen last went away. */
+const touchProven = new WeakSet();
+
+/**
+ * True when this device has a touch screen and the OS has it switched on — not
+ * what kind of device it is: IS_TOUCH_DEVICE answers from the user agent or
+ * from `ontouchstart`, and says yes for a phone, or for a laptop whose touch
+ * screen is disabled in Device Manager. Both `maxTouchPoints` and the media
+ * query fall when that driver goes. A real touch proves it, for a browser whose
+ * answers lag behind a screen just switched back on. Never on a TV.
+ * Asked at call time; watchTouchEnabled tells of a change.
+ * @param {{nav?: Navigator, win?: Window}} [env] replace the live sources (tests).
+ */
+export function touchEnabled({ nav = navigator, win = window } = {}) {
+    if (detectTv(nav)) return false;
+    if (touchProven.has(win)) return true;
+    if (!(nav.maxTouchPoints > 0)) return false;
+    try {
+        return !!win.matchMedia && win.matchMedia(COARSE_POINTER).matches;
+    } catch {
+        return false;
+    }
+}
+
+/**
+ * Tell `onChange(enabled)` whenever touchEnabled's answer changes while the
+ * page is open: the touch screen switched off or on in the OS, or a first real
+ * touch. Returns what stops it.
+ * @param {(enabled: boolean) => void} onChange
+ * @param {{nav?: Navigator, win?: Window}} [env]
+ * @returns {() => void}
+ */
+export function watchTouchEnabled(onChange, { nav = navigator, win = window } = {}) {
+    let known = touchEnabled({ nav, win });
+    const update = () => {
+        const now = touchEnabled({ nav, win });
+        if (now === known) return;
+        known = now;
+        onChange(now);
+    };
+    const onTouch = () => {
+        touchProven.add(win);
+        update();
+    };
+    let query = null;
+    try {
+        query = win.matchMedia ? win.matchMedia(COARSE_POINTER) : null;
+    } catch {
+        /* no media query: a real touch is the only way to tell */
+    }
+    const onQuery = () => {
+        // The OS took the screen away: an earlier touch proves nothing now.
+        if (!query.matches) touchProven.delete(win);
+        update();
+    };
+    win.addEventListener('touchstart', onTouch, { capture: true, passive: true });
+    if (query && query.addEventListener) query.addEventListener('change', onQuery);
+    return () => {
+        win.removeEventListener('touchstart', onTouch, { capture: true });
+        if (query && query.removeEventListener) query.removeEventListener('change', onQuery);
+    };
+}
+
 /** The raw platform type string: 'mobile', 'tablet', or 'desktop'. */
 export const PLATFORM_TYPE = platform.type;
 
@@ -625,6 +691,46 @@ export function mwsrGazeWanted() {
         return false;
     }
 }
+
+/**
+ * Lock-free look: once the browser has refused the pointer lock, gaming
+ * mode's mouse goes out as relative moves (the browser's movementX/Y) —
+ * Safari on an iPad with a trackpad, where the absolute position stops
+ * turning at the screen edge (A23, 27/10/2026). On by default on iOS/iPadOS
+ * (Bruno, 12/11/2026), off elsewhere; the lab key mw_lookfree = '1' or '0'
+ * overrides either way. An iPad has no console to set it from: ?mw_lookfree=1
+ * (or 0) in the page's address writes the key. Where storage is refused, the
+ * address alone decides, for that page. The address is read once, when this
+ * module loads: app.js rewrites it to '/' at start-up, long before a stream
+ * builds its StreamView (12/11/2026, the key given that way was lost).
+ * @param {boolean} [byDefault] what to do without the key
+ * @returns {boolean}
+ */
+export function lockFreeLookWanted(byDefault = false) {
+    let key = lockFreeLookAsked;
+    try {
+        key = localStorage.getItem('mw_lookfree');
+    } catch (e) {}
+    if (key === '1') return true;
+    if (key === '0') return false;
+    return byDefault;
+}
+
+/** ?mw_lookfree= as the page was opened ('1', '0' or null). */
+let lockFreeLookAsked = null;
+
+/** Takes ?mw_lookfree=1|0 from the address into the lab key (see above). */
+export function takeLockFreeLookFromAddress() {
+    try {
+        lockFreeLookAsked = new URLSearchParams(location.search).get('mw_lookfree');
+    } catch (e) {}
+    try {
+        if (lockFreeLookAsked === '1' || lockFreeLookAsked === '0') {
+            localStorage.setItem('mw_lookfree', lockFreeLookAsked);
+        }
+    } catch (e) {}
+}
+takeLockFreeLookFromAddress();
 
 /**
  * Lab key, no UI: localStorage.mw_mwsr_map = '1' asks the native host, at

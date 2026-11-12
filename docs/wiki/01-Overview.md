@@ -54,7 +54,18 @@ Per-browser preferences (stored in `localStorage`, with server defaults) are edi
 - Changing quality mid-stream is **seamless**: a second stream is prepared in the background and the display switches on its first frame — no loader, no reconnection (the same mechanism the automatic congestion ladder uses).
 - **Video Enhancement** (GPU upscaling + sharpening): one switch, MoonlightWeb's own upscaler (MWSR) in the flavour the device runs best (WebGL2 on a computer and on Android, WebGPU on iPhone and iPad and in HDR), none on an entry-level Mali GPU:
 
-![Video Enhancement — 720p upscaled to 1440p](../screenshots/video_enhancement.gif)
+![The comparison page's opening view: the native frame and MWSR side by side, 1080p upscaled to 1440p, in 4:2:0](../screenshots/mwsr_compare.png)
+
+*The opening view of the [comparison page](https://moonlightweb.top/mwsr/), where you can compare the upscalers on your own GPU: the native frame against MWSR, from a 1080p 4:2:0 input to 1440p. The picture is Blender 2.81's splash screen, by Alex Treviño and Anaïs Maamar (original concept) / Blender Cloud, [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/), reduced to 2560×1440 and cropped.*
+
+MWSR is also packaged for other programs, under the MIT License, in [`mwsr/`](../../mwsr/README.md). Each text there is generated from the module the client runs:
+
+| System | Graphics API | Text | Checked so far |
+|---|---|---|---|
+| Any browser | WebGPU, WebGL2 | WGSL, GLSL ES 3.00 | MoonlightWeb's client, measured on the comparison page and on three GPUs and two phones |
+| Windows | Direct3D 12, Direct3D 11 | HLSL, with the C++ header | Moonlight-qt on Windows (pull request #1557), the Direct3D 11 example on WARP |
+| Linux | Vulkan, through libplacebo or mpv | a libplacebo user shader | in testing for Moonlight-qt, on Mesa's CPU Vulkan only |
+| macOS | Vulkan through MoltenVK, or Metal | the same user shader, or MSL | in testing for Moonlight-qt; Metal run once on an M1 Pro |
 
 ## 1.2 The Administrator's journey
 
@@ -70,7 +81,7 @@ The admin page controls:
 - **HTTPS port** (rebinds live; the HTTP port is displayed only), **transport mode** (auto or forced), and the **Internet Access** toggle.
 - **Stream notifications** — a desktop notification when someone starts or stops streaming *this* screen through the native host (server-side setting; the tray obeys it, and the tray may live in another process).
 - **Instance name** — the name this install shows in the header of every browser paired with it, and in the switcher those browsers use to reach the others.
-- **Give the stream priority on the network** (AF41 marking, on by default), the **remote administration** password; under **Advanced**, the **video pipeline**, debug mode and **Download logs**; on the native host, **Apps on this PC** (the cards it shows, Steam Big Picture's among them).
+- **Give the stream priority on the network** (DSCP marking, on by default), the **remote administration** password; under **Advanced**, the **video pipeline**, debug mode and **Download logs**; on the native host, **Apps on this PC** (the cards it shows, Steam Big Picture's among them).
 
 ### Internet access
 

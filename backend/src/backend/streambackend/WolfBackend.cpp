@@ -18,6 +18,7 @@
 #include "WolfBackend.h"
 
 #include "../../common/Logger.h"
+#include "../HostCertCheck.h"
 #include "../NvAddress.h"
 #include "../NvComputer.h"
 #include "../NvHTTP.h"
@@ -32,6 +33,8 @@
 #include <QCryptographicHash>
 #include <QSet>
 #include <QTimer>
+
+#include <memory>
 
 namespace {
 
@@ -178,7 +181,51 @@ void WolfBackend::pairIdentity(const QString& seatId, BackendVoidCallback cb)
                                      QStringLiteral("Host has no reachable address")));
         return;
     }
-    const NvAddress& addr = addrs.first();
+    const NvAddress addr = addrs.first();
+
+    // The default identity's pairing is the administrator's, and is what records
+    // a certificate: there may be none to compare, and a new one may be the point.
+    if (seatId.isEmpty() || host->serverCertPem.isEmpty()) {
+        startPairing(seatId, addr, std::move(cb));
+        return;
+    }
+
+    // A seat joins a host already paired, whose certificate is on record. Its
+    // handshake starts over plain HTTP, and a launch comes here before any HTTPS
+    // call: whatever holds this address is asked first.
+    IdentityManager* identity = IdentityManager::get();
+    m_PairingInFlight = true;
+    HostCertCheck::look(
+        addr.address(), host->activeHttpsPort > 0 ? host->activeHttpsPort : MW_HTTPS_PORT,
+        host->serverCertPem, identity->getCertificate(), identity->getPrivateKey(), this,
+        NvHTTP::REQUEST_TIMEOUT_MS,
+        [this, seatId, addr, cb = std::move(cb)](HostCertCheck::Shown shown) mutable {
+            m_PairingInFlight = false;
+            switch (shown) {
+            case HostCertCheck::Shown::Expected: startPairing(seatId, addr, std::move(cb)); break;
+            case HostCertCheck::Shown::Another:
+                Logger::warning(QStringLiteral("Seat %1 not paired at %2: not the certificate "
+                                               "this host was paired with")
+                                    .arg(seatId, addr.toString()));
+                cb(false, BackendError::make(
+                              BackendError::CertificateChanged,
+                              QStringLiteral("Not the certificate this host was paired with")));
+                break;
+            case HostCertCheck::Shown::Nothing:
+                cb(false, BackendError::make(BackendError::Unreachable,
+                                             QStringLiteral("The host did not answer")));
+                break;
+            }
+        });
+}
+
+void WolfBackend::startPairing(const QString& seatId, const NvAddress& addr, BackendVoidCallback cb)
+{
+    NvComputer* host = m_ResolveHost ? m_ResolveHost() : nullptr;
+    if (!host) {
+        cb(false, BackendError::make(BackendError::NotFound, QStringLiteral("Host not found")));
+        return;
+    }
 
     // Snapshot what is already parked on the host. Anything appearing after
     // this that we did not know about is ours — see announcePin().
@@ -210,7 +257,7 @@ void WolfBackend::pairIdentity(const QString& seatId, BackendVoidCallback cb)
         const QString pin = PairingChain::generatePin();
 
         PairingChain::run(
-            m_Pairing.get(), pin,
+            m_Pairing.get(), pin, this,
             [this, knownSecrets](const QString& announced) {
                 announcePin(announced, knownSecrets, kPendingPollAttempts);
             },
@@ -223,6 +270,22 @@ void WolfBackend::pairIdentity(const QString& seatId, BackendVoidCallback cb)
                         // Only the default identity's pairing describes the host.
                         if (m_Commit) m_Commit(result.serverCertPem);
                     } else {
+                        // The handshake named a certificate of its own. A seat
+                        // recorded here is never paired again, so it has to be
+                        // the host's.
+                        const NvComputer* paired = m_ResolveHost ? m_ResolveHost() : nullptr;
+                        if (paired && !paired->serverCertPem.isEmpty() &&
+                            !HostCertCheck::sameCertificate(paired->serverCertPem,
+                                                            result.serverCertPem)) {
+                            Logger::warning(QStringLiteral("Seat %1 not recorded: its handshake "
+                                                           "named another certificate")
+                                                .arg(seatId));
+                            cb(false, BackendError::make(
+                                          BackendError::CertificateChanged,
+                                          QStringLiteral(
+                                              "Not the certificate this host was paired with")));
+                            break;
+                        }
                         markSeatPaired(seatId);
                     }
                     Logger::info(
@@ -480,6 +543,52 @@ void WolfBackend::endCoopSession(const QString& sessionId, BackendVoidCallback c
     }
     m_Api->stopSession(sessionId, [cb](bool ok, const WolfApiError& err) {
         cb(ok, ok ? BackendError{} : toBackendError(err));
+    });
+}
+
+void WolfBackend::stopCoopSession(const QString& sessionId, BackendVoidCallback cb)
+{
+    if (sessionId.isEmpty()) {
+        cb(true, BackendError{});
+        return;
+    }
+    // The lobbies are read on both sides of the stop: before, to know which
+    // ones the session was in (it leaves them as it ends); after, to see that
+    // nobody else is in them. The caller keeps this backend alive until cb.
+    m_Api->lobbies([this, sessionId, cb](bool listed, const WolfApiError&,
+                                         const QVector<WolfLobby>& before) {
+        m_Api->stopSession(sessionId, [this, sessionId, cb, listed,
+                                       before](bool ok, const WolfApiError& err) {
+            // Without the first list, the session still ends: only its lobby
+            // stays, as before.
+            if (!ok || !listed) {
+                cb(ok, ok ? BackendError{} : toBackendError(err));
+                return;
+            }
+            m_Api->lobbies([this, sessionId, cb, before](bool listedAfter, const WolfApiError&,
+                                                         const QVector<WolfLobby>& after) {
+                const QStringList empty = listedAfter
+                                              ? WolfCoop::lobbiesLeftEmpty(before, after, sessionId)
+                                              : QStringList();
+                if (empty.isEmpty()) {
+                    cb(true, BackendError{});
+                    return;
+                }
+                auto pending = std::make_shared<int>(static_cast<int>(empty.size()));
+                for (const QString& id : empty) {
+                    m_Api->stopLobby(
+                        id, {}, [id, pending, cb](bool stopped, const WolfApiError& e) {
+                            if (stopped)
+                                qInfo() << "[Wolf] Lobby" << id << "stopped: nobody is left in it";
+                            else
+                                qWarning() << "[Wolf] Could not stop the empty lobby" << id << ":"
+                                           << e.message;
+                            // The session itself did end: that is what the caller asked.
+                            if (--*pending == 0) cb(true, BackendError{});
+                        });
+                }
+            });
+        });
     });
 }
 

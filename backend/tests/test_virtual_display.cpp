@@ -65,9 +65,9 @@ void run_virtual_display_tests()
     CHECK_EQ(kHeight, 1080);
     CHECK_EQ(kRefreshHz, 120);
 
-    SECTION("VirtualDisplay — only the four verbs get through the request parser");
+    SECTION("VirtualDisplay — only the five verbs get through the request parser");
     QString err;
-    for (const char* verb : {"install", "uninstall", "activate", "deactivate"}) {
+    for (const char* verb : {"install", "uninstall", "activate", "deactivate", "others_back"}) {
         const auto req = parseRequest(QByteArray("{\"action\":\"") + verb + "\"}", &err);
         CHECK(req.has_value());
         if (req) CHECK_EQ(toString(req->action), QString::fromLatin1(verb));
@@ -467,6 +467,28 @@ void run_virtual_display_tests()
         CHECK_EQ(settingsXml(0, 0, 0), settingsXml());
     }
 
+    SECTION("VirtualDisplay — a stream larger than the default mode gets a display of its size");
+    {
+        // "Match my screen": the client's size, smaller than the default too.
+        CHECK_EQ(sizeForStream(1280, 720, true).width, 1280);
+        CHECK_EQ(sizeForStream(1280, 720, true).height, 720);
+        // Larger than 1920 x 1080: its own size, without "Match my screen"
+        // (07/11: a TV's 1440p stream left at 1080p).
+        CHECK_EQ(sizeForStream(2560, 1440, false).width, 2560);
+        CHECK_EQ(sizeForStream(2560, 1440, false).height, 1440);
+        CHECK_EQ(sizeForStream(3840, 2160, false).width, 3840);
+        CHECK_EQ(sizeForStream(3440, 1440, false).width, 3440);
+        // 1920 x 1200 holds more pixels than 1080p: its own size too.
+        CHECK_EQ(sizeForStream(1920, 1200, false).height, 1200);
+        // The default size, or smaller: the display's own mode, as before.
+        CHECK_EQ(sizeForStream(1920, 1080, false).width, 0);
+        CHECK_EQ(sizeForStream(1280, 720, false).width, 0);
+        CHECK_EQ(sizeForStream(1280, 720, false).height, 0);
+        // No size asked (height 0, native): nothing either way.
+        CHECK_EQ(sizeForStream(0, 0, true).width, 0);
+        CHECK_EQ(sizeForStream(0, 0, false).width, 0);
+    }
+
     SECTION("VirtualDisplay — the stream's rate under the product's ceiling, the bench's past it");
     {
         // The product: the stream's own rate, never past kRateMax, whatever
@@ -730,6 +752,46 @@ void run_virtual_display_tests()
         CHECK(!toJson(r).contains("exclusive"));
     }
 
+    SECTION("VirtualDisplay — bench_hdr is a boolean of Activate, written only when asked");
+    {
+        auto req = parseRequest("{\"action\":\"activate\",\"bench_hdr\":true}", &err);
+        CHECK(req.has_value() && req->benchHdr);
+        req = parseRequest("{\"action\":\"activate\"}", &err);
+        CHECK(req.has_value() && !req->benchHdr);
+        CHECK(!parseRequest("{\"action\":\"activate\",\"bench_hdr\":1}", &err).has_value());
+        // Another verb never carries it into the helper.
+        req = parseRequest("{\"action\":\"deactivate\",\"bench_hdr\":true}", &err);
+        CHECK(req.has_value() && !req->benchHdr);
+        Request r;
+        r.benchHdr = true;
+        req = parseRequest(toJson(r), &err);
+        CHECK(req.has_value() && req->benchHdr);
+        r.benchHdr = false;
+        CHECK(!toJson(r).contains("bench_hdr"));
+        // The macOS flag alone is never written: Windows stays SDR without the bench.
+        r.hdr = true;
+        CHECK(!toJson(r).contains("hdr"));
+    }
+
+    SECTION("VirtualDisplay — bench_secondary is a boolean of Activate, written only when asked");
+    {
+        auto req = parseRequest("{\"action\":\"activate\",\"bench_secondary\":true}", &err);
+        CHECK(req.has_value() && req->benchSecondary);
+        req = parseRequest("{\"action\":\"activate\"}", &err);
+        CHECK(req.has_value() && !req->benchSecondary);
+        CHECK(!parseRequest("{\"action\":\"activate\",\"bench_secondary\":\"yes\"}", &err)
+                   .has_value());
+        // Another verb never carries it into the helper.
+        req = parseRequest("{\"action\":\"deactivate\",\"bench_secondary\":true}", &err);
+        CHECK(req.has_value() && !req->benchSecondary);
+        Request r;
+        r.benchSecondary = true;
+        req = parseRequest(toJson(r), &err);
+        CHECK(req.has_value() && req->benchSecondary && !req->benchHdr);
+        r.benchSecondary = false;
+        CHECK(!toJson(r).contains("bench_secondary"));
+    }
+
     SECTION("VirtualDisplay — the GPU the owner chose travels as a name, and only as text");
     {
         // A GPU as Windows names it, into the helper and back.
@@ -825,6 +887,60 @@ void run_virtual_display_tests()
         CHECK(!othersOffAfter(LayoutStep::Exclusive, false, false));
         CHECK(othersOffAfter(LayoutStep::Restore, true, false));
         CHECK(othersOffAfter(LayoutStep::Mode, true, true));
+    }
+
+    SECTION("VirtualDisplay — only the owner's stream turns the other displays off");
+    // Alone on the display, the option decides.
+    CHECK(othersGoOff(Asker::Owner, true, false, false));
+    CHECK(!othersGoOff(Asker::Owner, false, false, false));
+    // A guest on it first: they stay on for this stream.
+    CHECK(!othersGoOff(Asker::Owner, true, true, false));
+    // Off already, a new mode of the owner's keeps them off beside a guest.
+    CHECK(othersGoOff(Asker::Owner, true, true, true));
+    // A guest never asks for it, whatever the rest says.
+    for (const bool option : {false, true})
+        for (const bool guest : {false, true})
+            for (const bool off : {false, true})
+                CHECK(!othersGoOff(Asker::Guest, option, guest, off));
+
+    SECTION("VirtualDisplay — the admin allows, the viewer chooses");
+    // Both keys, when the browser chose.
+    CHECK(ownerWantsOthersOff(true, true, true, false));
+    CHECK(!ownerWantsOthersOff(true, true, false, true));
+    CHECK(!ownerWantsOthersOff(false, true, true, true));
+    // A browser that never chose: what the PC did before (ticked box on update).
+    CHECK(ownerWantsOthersOff(true, false, false, true));
+    CHECK(!ownerWantsOthersOff(true, false, true, false));
+    // Never without the admin's leave, whatever the browser holds.
+    for (const bool has : {false, true})
+        for (const bool choice : {false, true})
+            for (const bool inherited : {false, true})
+                CHECK(!ownerWantsOthersOff(false, has, choice, inherited));
+
+    SECTION("VirtualDisplay — the cards of the displays a stream turned off");
+    CHECK(darkDisplays({1, 2, 3}, {1}, true) == QList<int>({2, 3}));
+    CHECK(darkDisplays({2, 3}, {7}, true) == QList<int>({2, 3}));
+    CHECK(darkDisplays({2, 3}, {2, 3}, true).isEmpty());
+    CHECK(darkDisplays({2, 3}, {7}, false).isEmpty());
+    CHECK(darkDisplays({}, {7}, true).isEmpty());
+    CHECK(darkDisplays({2, 2}, {}, true) == QList<int>({2}));
+
+    SECTION("VirtualDisplay — the other displays come back with the owner gone");
+    CHECK(othersComeBack(false, true));
+    CHECK(!othersComeBack(true, true));
+    CHECK(!othersComeBack(false, false));
+    CHECK(!othersComeBack(true, false));
+    {
+        // The verb reaches the helper as itself, and asks for no exclusive.
+        Request back;
+        back.action = Request::Action::OthersBack;
+        back.exclusive = true;
+        const auto parsed = parseRequest(toJson(back), nullptr);
+        CHECK(parsed.has_value());
+        if (parsed) {
+            CHECK(parsed->action == Request::Action::OthersBack);
+            CHECK(!parsed->exclusive);
+        }
     }
 
     SECTION("VirtualDisplay — the guard restores only a dead server's displays left off");

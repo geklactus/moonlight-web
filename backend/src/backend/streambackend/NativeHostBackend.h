@@ -116,6 +116,21 @@ public:
     /// turns it off.
     static int virtualDisplayAppId();
 
+    /// The app id of "This PC's screen", the one card of a session Remote
+    /// Desktop left (Windows, RemoteDesktopReturn). A /start on it brings the
+    /// session back to the PC's screen, locked, and then streams the display
+    /// primaryDisplayAppId() names.
+    static int remoteDesktopReturnAppId();
+    /// "This PC's sign-in screen", the card of a session Remote Desktop left
+    /// when this version offers it (RemoteDesktopReturnPolicy::kSignInAppId):
+    /// a /start on it streams the console's sign-in screen.
+    static int signInScreenAppId();
+
+    /// The card id of the display a session brought back to the PC's screen is
+    /// streamed on: the primary one, else the first real one. -1 with @p error
+    /// while there is none (yet).
+    static int primaryDisplayAppId(QString* error);
+
     /// Whether @p gpu may be chosen to draw the virtual display: empty (the
     /// driver's own choice), or the name of a GPU this machine has now, on a
     /// machine with several, while the driver's settings file is ours to write

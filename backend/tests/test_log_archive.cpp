@@ -162,6 +162,17 @@ void run_log_archive_tests()
              QString("moonlightweb-worker-service.log"));
     CHECK_EQ(LogArchive::kindOf("moonlightweb-client.log.20260930-101010"),
              QString("moonlightweb-client.log"));
+    // A bench's traces, one file per run: three kinds, not one per file.
+    CHECK_EQ(LogArchive::kindOf("click-trace-13372-1793000000000.csv"),
+             QString("click-trace-*.csv"));
+    CHECK_EQ(LogArchive::kindOf("relay-frames-13372-1793000000000.csv"),
+             QString("relay-frames-*.csv"));
+    CHECK_EQ(LogArchive::kindOf("relay-audio-13372-1793000000000.csv"),
+             QString("relay-audio-*.csv"));
+    // Numbers that do not end the name, or no separator before them: its own name.
+    CHECK_EQ(LogArchive::kindOf("internet-access-audit.log"), QString("internet-access-audit.log"));
+    CHECK_EQ(LogArchive::kindOf("h264-capture.log"), QString("h264-capture.log"));
+    CHECK_EQ(LogArchive::kindOf("trace2.csv"), QString("trace2.csv"));
 
     // Only the newest non-empty file of each kind, never the directory.
     QTemporaryDir tmp;
@@ -215,6 +226,66 @@ void run_log_archive_tests()
         const QMap<QString, Entry> again = readZip(archive.result());
         CHECK(again.contains("dev-run.log"));
         CHECK(!again.contains("moonlightweb.log"));
+    }
+
+    // A folder a bench has filled: the last trace of each sort goes in, and the
+    // others are not even read (1.5 GB in 6,000 files on the machine that showed it).
+    {
+        QTemporaryDir bench;
+        CHECK(bench.isValid());
+        const QString d = bench.path();
+        touch(d + "/moonlightweb.log", "server\n", now);
+        for (int i = 0; i < 50; ++i) {
+            const QString run = QStringLiteral("-%1-%2.csv").arg(1000 + i).arg(1793000000000LL + i);
+            const QDateTime when = now.addSecs(-3600 + i);
+            const QByteArray last = i == 49 ? "newest\n" : "older\n";
+            touch(d + "/click-trace" + run, last, when);
+            touch(d + "/relay-frames" + run, last, when);
+            touch(d + "/relay-audio" + run, last, when);
+        }
+        LogArchive archive;
+        CHECK(archive.start(d, QString(), "about\n", "logs.zip"));
+        QElapsedTimer t;
+        t.start();
+        while (archive.status().state == QLatin1String("running") && t.elapsed() < 10000)
+            QThread::msleep(10);
+        const LogArchive::Status s = archive.status();
+        CHECK_EQ(s.state, QString("done"));
+        CHECK_EQ(s.files, 4);
+        const QMap<QString, Entry> entries = readZip(archive.result());
+        CHECK_EQ(entries.size(), qsizetype(5)); // about.txt too
+        const QString lastRun = QStringLiteral("-1049-%1.csv").arg(1793000000049LL);
+        CHECK(holds(entries.value("click-trace" + lastRun), "newest\n"));
+        CHECK(holds(entries.value("relay-frames" + lastRun), "newest\n"));
+        CHECK(holds(entries.value("relay-audio" + lastRun), "newest\n"));
+    }
+
+    // A log still open for writing, as the client log always is: on Windows
+    // the directory listing says 0 bytes until its writer closes it, and the
+    // archive left it out (issue #48: a Tesla's console, never in the zip).
+    {
+        QTemporaryDir live;
+        CHECK(live.isValid());
+        QFile writer(live.path() + "/moonlightweb-client.log");
+        CHECK(writer.open(QIODevice::WriteOnly | QIODevice::Append));
+        const QByteArray lines = "[Caps] browser {}\n[Life] visibility hidden\n";
+        CHECK_EQ(writer.write(lines), qint64(lines.size()));
+        CHECK(writer.flush()); // written, as the Logger does: no FlushFileBuffers
+        const QList<QFileInfo> picked =
+            LogArchive::latestPerKind(QDir(live.path()).entryInfoList(QDir::Files));
+        CHECK_EQ(picked.size(), qsizetype(1));
+        if (!picked.isEmpty()) CHECK_EQ(picked.first().size(), qint64(lines.size()));
+
+        LogArchive archive;
+        CHECK(archive.start(live.path(), QString(), "about\n", "logs.zip"));
+        QElapsedTimer t;
+        t.start();
+        while (archive.status().state == QLatin1String("running") && t.elapsed() < 10000)
+            QThread::msleep(10);
+        CHECK_EQ(archive.status().state, QString("done"));
+        CHECK_EQ(archive.status().doneBytes, qint64(lines.size()));
+        CHECK(holds(readZip(archive.result()).value("moonlightweb-client.log"), lines));
+        writer.close();
     }
 
     // The Logger's threshold: DEBUG dropped unless asked for.
@@ -385,10 +456,10 @@ void run_log_scrubber_tests()
     CHECK_EQ(s.scrubLine("[2026-09-30 10:00:00.123] [INFO] Chrome/153.0.0.0 Safari/537.36"),
              QString("[2026-09-30 10:00:00.123] [INFO] Chrome/153.0.0.0 Safari/537.36"));
     CHECK_EQ(
-        s.scrubLine(R"~(candidate:1 1 UDP 2122 2a01:e0a:ac5:df0:5d3a:b3cb:1:2 5000 typ host)~"),
-        QString(R"~(candidate:1 1 UDP 2122 2xxx::{3} 5000 typ host)~"));
-    CHECK_EQ(s.scrubLine("from [2a01:e0a:ac5:df0:5d3a:b3cb:1:2]:443 and fd12:3456::c1 fe80::1 ::1"),
-             QString("from [2xxx::{3}]:443 and fd::{g1} fe80::{h1} ::1"));
+        s.scrubLine(R"~(candidate:1 1 UDP 2122 3fff:abc:abc:de0:aaaa:bbbb:1:2 5000 typ host)~"),
+        QString(R"~(candidate:1 1 UDP 2122 3xxx::{3} 5000 typ host)~"));
+    CHECK_EQ(s.scrubLine("from [3fff:abc:abc:de0:aaaa:bbbb:1:2]:443 and fd12:3456::c1 fe80::1 ::1"),
+             QString("from [3xxx::{3}]:443 and fd::{g1} fe80::{h1} ::1"));
     CHECK_EQ(s.scrubLine("mapped ::ffff:88.12.34.56 at 12:34:56"),
              QString("mapped ::ffff:256.x.x.{1} at 12:34:56"));
 
@@ -417,8 +488,8 @@ void run_log_scrubber_tests()
                 R"~(Selected candidate pair: local "host fd7a:115c:a1e0::c036:292d:48550/UDP" -> remote "prflx fd7a:115c:a1e0::c036:292d:63433/UDP")~"),
             QString(
                 R"~(Selected candidate pair: local "host fd::{a1}:48550/UDP" -> remote "prflx fd::{a1}:63433/UDP")~"));
-        CHECK_EQ(pair.scrubLine("srflx 2a01:e0a:ac5:df0:5d3a:b3cb:1:2:5000/UDP at 10:00:00.123"),
-                 QString("srflx 2xxx::{1}:5000/UDP at 10:00:00.123"));
+        CHECK_EQ(pair.scrubLine("srflx 3fff:abc:abc:de0:aaaa:bbbb:1:2:5000/UDP at 10:00:00.123"),
+                 QString("srflx 3xxx::{1}:5000/UDP at 10:00:00.123"));
     }
 
     // Whole files: PEM blocks go, line endings stay.
