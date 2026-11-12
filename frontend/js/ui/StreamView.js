@@ -6655,8 +6655,9 @@ export class StreamView {
         if (!this.connected) return;
         console.log('[StreamView] Back from the background — timing re-primed, pads repeated');
         // What the congestion monitor counted while we were away was the
-        // freeze, not the link (see _recordCongestionEvent).
-        this._congEvents.length = 0;
+        // freeze, not the link (see _recordCongestionEvent). A view that never
+        // started its monitor has nothing counted.
+        if (this._congEvents) this._congEvents.length = 0;
         this._resumedAt = performance.now();
         this._stallDetector.reset();
         this._clearPacingTimer();
