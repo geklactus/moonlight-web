@@ -63,8 +63,8 @@ function fakeDevice({
 }
 
 /** A Wii Remote as WebHID shows it: its ids, a Game Pad collection, and what it was sent. */
-function fakeWiimote({ productId = 0x0306, sendFails = false } = {}) {
-    const d = fakeDevice({ vendorId: 0x057e, productId, usage: 5 });
+function fakeWiimote({ productId = 0x0306, sendFails = false, openFails = false } = {}) {
+    const d = fakeDevice({ vendorId: 0x057e, productId, usage: 5, openFails });
     d.productName = 'Nintendo RVL-CNT-01';
     d.sent = [];
     d.sendReport = vi.fn(async (id, data) => {
@@ -693,6 +693,89 @@ describe('HidPassthrough — a Wii Remote, for a GameStream host on its own mach
         const live = await t.hp.linkWiimoteRemembered();
         expect(live).toBeTruthy();
         await vi.waitFor(() => expect(t.sent).toHaveLength(1));
+    });
+});
+
+describe('HidPassthrough — a Wii Remote that does not connect says why (2026-11-13)', () => {
+    const CANT = "This host can't take a Wii Remote right now.";
+
+    it("opens no chooser when the host can't take one, and says the host's words", async () => {
+        const t = setup([fakeWiimote()]);
+        t.hp.handleMessage({ type: 'hidcaps', available: false, why: CANT });
+        expect(await t.hp.linkWiimote()).toEqual([]);
+        expect(t.hid.requestDevice).not.toHaveBeenCalled();
+        expect(t.sent.filter((m) => m.type === 'hidattach')).toHaveLength(0);
+        expect(t.wiimote).toContainEqual({ type: 'refused', slot: -1, why: CANT });
+    });
+
+    it('before the host has said anything: refused, no reason of its own, no chooser', async () => {
+        const t = setup([fakeWiimote()]);
+        expect(await t.hp.linkWiimote()).toEqual([]);
+        expect(t.hid.requestDevice).not.toHaveBeenCalled();
+        expect(t.wiimote).toContainEqual({ type: 'refused', slot: -1, why: '' });
+    });
+
+    it('a chooser closed with nothing picked comes back as cancelled', async () => {
+        const t = setup([fakeWiimote()]);
+        t.hp.handleMessage({ type: 'hidcaps', available: true, wiimote: true });
+        t.hid.requestDevice.mockResolvedValueOnce([]);
+        expect(await t.hp.linkWiimote()).toEqual([]);
+        expect(t.wiimote).toEqual([{ type: 'cancelled' }]);
+    });
+
+    it("a remote the browser can't open: refused, the browser's doing, nothing sent", async () => {
+        const remote = fakeWiimote({ openFails: true });
+        const t = setup([remote]);
+        t.hp.handleMessage({ type: 'hidcaps', available: true, wiimote: true });
+        expect(await t.hp.linkWiimote()).toEqual([]);
+        expect(t.sent.filter((m) => m.type === 'hidattach')).toHaveLength(0);
+        expect(t.wiimote).toContainEqual(
+            expect.objectContaining({ type: 'refused', local: 'unopened' }),
+        );
+    });
+
+    it("the host's refusal of a Wii Remote is said as one, in its words", async () => {
+        const remote = fakeWiimote();
+        const t = setup([remote]);
+        t.hp.handleMessage({ type: 'hidcaps', available: true, wiimote: true });
+        expect(await t.hp.linkWiimote()).toEqual([remote]);
+        t.hp.handleMessage({ type: 'hidattached', slot: 0, ok: false, why: CANT });
+        expect(t.wiimote).toContainEqual({ type: 'refused', slot: 0, why: CANT });
+    });
+
+    it('a live-picked DolphinBar entry has been heard; the fallback entry only once it reports', async () => {
+        const dead = fakeWiimote();
+        const live = fakeWiimote();
+        const t = setup([dead, live]);
+        t.hp.handleMessage({ type: 'hidcaps', available: true, wiimote: true });
+        t.hid.requestDevice.mockResolvedValueOnce([dead, live]);
+        const p = t.hp.linkWiimote();
+        await vi.waitFor(() => expect(live.sendReport).toHaveBeenCalled());
+        live.report(0x30, [0x00, 0x00]);
+        expect(await p).toEqual([live]);
+        expect(t.wiimote).toContainEqual({ type: 'heard', slot: 0 });
+
+        // None answer (a bar with no remote synced, or asleep): the first entry attaches, unheard.
+        const a = fakeWiimote();
+        const b = fakeWiimote();
+        const u = setup([a, b]);
+        const events = [];
+        u.hp = new (Object.getPrototypeOf(u.hp).constructor)({
+            hid: u.hid,
+            send: (m) => u.sent.push(m),
+            sendFrame: () => true,
+            storage: u.storage,
+            now: () => 0,
+            delay: () => Promise.resolve(),
+            onWiimote: (e) => events.push(e),
+        });
+        u.hp.handleMessage({ type: 'hidcaps', available: true, wiimote: true });
+        u.hid.requestDevice.mockResolvedValueOnce([a, b]);
+        expect(await u.hp.linkWiimote()).toEqual([a]);
+        expect(events.filter((e) => e.type === 'heard')).toHaveLength(0);
+        a.report(0x30, [0x00, 0x08]); // the remote wakes and speaks
+        a.report(0x30, [0x00, 0x00]);
+        expect(events.filter((e) => e.type === 'heard')).toEqual([{ type: 'heard', slot: 0 }]);
     });
 });
 
