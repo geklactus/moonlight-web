@@ -105,13 +105,14 @@ QString GameStreamHid::unavailableReason() const
         m_reasonLogged = true;
         m_loggedReason = why;
         if (why.isEmpty()) {
-            qInfo().noquote() << "[GameStreamHid] can take a device now, for session" << m_sessionId;
+            qInfo().noquote() << "[GameStreamHid] can take a device now, for session"
+                              << m_sessionId;
         } else {
             const std::string backend = m_hostIsSelf ? m_backendReason() : std::string();
             qWarning().noquote() << "[GameStreamHid] can't take a device:" << why
-                                 << (backend.empty()
-                                         ? QString()
-                                         : QStringLiteral("(%1)").arg(QString::fromStdString(backend)));
+                                 << (backend.empty() ? QString()
+                                                     : QStringLiteral("(%1)").arg(
+                                                           QString::fromStdString(backend)));
         }
     }
     return why;
