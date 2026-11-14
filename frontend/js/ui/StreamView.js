@@ -173,6 +173,11 @@ import { StreamViewFullscreen, EXIT_FULLSCREEN_EVENT } from './StreamViewFullscr
 import { flushClientLog, serverDiag } from '../util/ClientLog.js';
 import { UltraPlayer, presentMode, ultraPlayerSupported } from '../stream/ultra/UltraPlayer.js';
 
+// How long the connected remote's line shows before it fades.
+const WIIMOTE_STATUS_TOAST_MS = 6000;
+// The remote's state, told to the page around the stream (see _tellWiimote).
+export const WIIMOTE_EVENT = 'mw-wiimote';
+
 /**
  * The launcher's "a Wii Remote at this computer" choice rides in the stream
  * URL's query string (lola play.js appends ?wiimote=here). During startup the
@@ -8253,6 +8258,8 @@ export class StreamView {
             this._wiimoteOffered = false;
             this._wiimoteStatusToast?.dismiss();
             this._wiimoteStatusToast = null;
+            this._wiimoteStatusKey = null;
+            this._tellWiimote('off');
             this._sayWiimote(t('stream.wiimoteRefused', { why }), 'refused');
             this._offerWiimote();
         } else if (ev.type === 'cancelled') {
@@ -8265,15 +8272,27 @@ export class StreamView {
             this._wiimoteOffered = false;
             this._wiimoteStatusToast?.dismiss();
             this._wiimoteStatusToast = null;
+            this._wiimoteStatusKey = null;
+            this._tellWiimote('off');
             this._offerWiimote();
         }
     }
 
-    /** The connected remote's line: player light, battery, an extension if one is in. */
+    /**
+     * The connected remote's line: player light, battery, an extension if one is in. Said when the
+     * remote connects and again when its light or its extension changes, then it fades: the battery
+     * falls all game, and a line that stayed covered the picture. The state stays in reach of the
+     * page around the stream (_tellWiimote). "No remote has answered yet" stays up: it asks for a
+     * button press.
+     */
     _showWiimoteStatus() {
+        const name = this._wiimoteStatus?.name || '';
         if (!this._wiimoteHeard) {
             // Attached, but no remote has answered through it yet (a DolphinBar with none synced to
             // that slot, or asleep): "connected" would be wrong.
+            this._tellWiimote('waiting', { name });
+            if (this._wiimoteStatusKey === 'waiting') return;
+            this._wiimoteStatusKey = 'waiting';
             this._wiimoteStatusToast?.dismiss();
             this._wiimoteStatusToast = Toast.info(t('stream.wiimoteWaiting'), { sticky: true });
             return;
@@ -8282,6 +8301,10 @@ export class StreamView {
         const light = st.leds ? Math.log2(st.leds & -st.leds) + 1 : 0; // lowest lit light = player number
         const battery =
             typeof st.battery === 'number' ? Math.round((st.battery / 255) * 100) : null;
+        this._tellWiimote('connected', { name, light, battery, extension: !!st.extension });
+        const key = battery === null ? 'connected' : `${light}|${!!st.extension}`;
+        if (key === this._wiimoteStatusKey) return;
+        this._wiimoteStatusKey = key;
         const message =
             battery === null
                 ? t('stream.wiimoteConnected')
@@ -8291,7 +8314,21 @@ export class StreamView {
                       ext: st.extension ? t('stream.wiimoteExtension') : '',
                   });
         this._wiimoteStatusToast?.dismiss();
-        this._wiimoteStatusToast = Toast.info(message, { sticky: true });
+        this._wiimoteStatusToast = Toast.info(message, { durationMs: WIIMOTE_STATUS_TOAST_MS });
+    }
+
+    /**
+     * The remote's state, for the page around the stream (a bar, a list of controllers): a
+     * `mw-wiimote` event on window, once per change. detail: { state: 'off' | 'waiting' |
+     * 'connected', name, light (the player light, 0 unknown), battery (percent, null unknown),
+     * extension }.
+     */
+    _tellWiimote(state, detail = {}) {
+        const now = JSON.stringify([state, detail]);
+        if (now === this._wiimoteTold) return;
+        this._wiimoteTold = now;
+        if (typeof window === 'undefined' || typeof CustomEvent !== 'function') return;
+        window.dispatchEvent(new CustomEvent(WIIMOTE_EVENT, { detail: { state, ...detail } }));
     }
 
     // ── Stats message handler (ping/pong + periodic backend stats) ─────────

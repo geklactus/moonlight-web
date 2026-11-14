@@ -46,6 +46,7 @@ function view(caps) {
         _sayWiimote: P._sayWiimote,
         _onWiimoteEvent: P._onWiimoteEvent,
         _showWiimoteStatus: P._showWiimoteStatus,
+        _tellWiimote: P._tellWiimote,
     };
 }
 
@@ -143,5 +144,112 @@ describe('StreamView — the Wii Remote says why it does not connect', () => {
         v._hidPassthrough = null;
         await v._offerWiimote();
         expect(said(Toast.warning, 'stream.wiimoteNoWebHid')).toHaveLength(1);
+    });
+});
+
+/*
+ * The connected remote's line stayed over the picture for the whole game (2026-11-13). Now it fades,
+ * comes back only when the remote's light or extension changes, and the page around the stream is
+ * told the remote's state (`mw-wiimote`) so a bar or a list of controllers can show it.
+ */
+describe('StreamView — the connected Wii Remote: a line that fades, a state the page can show', () => {
+    let told;
+    const hear = (e) => told.push(e.detail);
+    beforeEach(() => {
+        told = [];
+        globalThis.addEventListener('mw-wiimote', hear);
+        vi.clearAllMocks();
+    });
+    afterEach(() => globalThis.removeEventListener('mw-wiimote', hear));
+
+    // leds 0x1 = light 1; flags' extension bit as HidPassthrough hands it.
+    const status = (battery, extension = false, leds = 1) => ({
+        type: 'status',
+        slot: 0,
+        battery,
+        extension,
+        leds,
+    });
+    function connected() {
+        const v = view({ available: true, wiimote: true });
+        v._onWiimoteEvent({ type: 'attached', slot: 0, name: 'Nintendo RVL-CNT-01' });
+        v._onWiimoteEvent({ type: 'heard', slot: 0 });
+        return v;
+    }
+
+    it('the status line fades: never sticky', () => {
+        const v = connected();
+        v._onWiimoteEvent(status(74));
+        const lines = said(Toast.info, 'stream.wiimoteStatus');
+        expect(lines).toHaveLength(1);
+        expect(lines[0][1]?.sticky).toBeFalsy();
+        expect(lines[0][1]?.durationMs).toBeGreaterThan(0);
+        expect(said(Toast.info, 'stream.wiimoteConnected')[0][1]?.sticky).toBeFalsy();
+    });
+
+    it('a battery that only falls says nothing more', () => {
+        const v = connected();
+        v._onWiimoteEvent(status(74));
+        v._onWiimoteEvent(status(73));
+        v._onWiimoteEvent(status(60));
+        expect(said(Toast.info, 'stream.wiimoteStatus')).toHaveLength(1);
+    });
+
+    it('an extension plugged in, or another light: said again', () => {
+        const v = connected();
+        v._onWiimoteEvent(status(74));
+        v._onWiimoteEvent(status(74, true));
+        v._onWiimoteEvent(status(74, true, 2));
+        expect(said(Toast.info, 'stream.wiimoteStatus')).toHaveLength(3);
+    });
+
+    it('"no remote has answered yet" stays up, and is said once', () => {
+        const v = view({ available: true, wiimote: true });
+        v._onWiimoteEvent({ type: 'attached', slot: 0, name: 'Nintendo RVL-CNT-01' });
+        v._showWiimoteStatus();
+        const waiting = said(Toast.info, 'stream.wiimoteWaiting');
+        expect(waiting).toHaveLength(1);
+        expect(waiting[0][1]).toMatchObject({ sticky: true });
+    });
+
+    it('tells the page: waiting, connected with light, battery and extension, then off', () => {
+        const v = view({ available: true, wiimote: true });
+        v._onWiimoteEvent({ type: 'attached', slot: 0, name: 'Nintendo RVL-CNT-01' });
+        v._onWiimoteEvent({ type: 'heard', slot: 0 });
+        v._onWiimoteEvent(status(74, true));
+        v._onWiimoteEvent(status(74, true)); // the same again: not told twice
+        v._onWiimoteEvent(status(71, true)); // the battery: told, though no line is shown
+        v._onWiimoteEvent({ type: 'detached', slot: 0 });
+        expect(told).toEqual([
+            { state: 'waiting', name: 'Nintendo RVL-CNT-01' },
+            {
+                state: 'connected',
+                name: 'Nintendo RVL-CNT-01',
+                light: 0,
+                battery: null,
+                extension: false,
+            },
+            {
+                state: 'connected',
+                name: 'Nintendo RVL-CNT-01',
+                light: 1,
+                battery: 29,
+                extension: true,
+            },
+            {
+                state: 'connected',
+                name: 'Nintendo RVL-CNT-01',
+                light: 1,
+                battery: 28,
+                extension: true,
+            },
+            { state: 'off' },
+        ]);
+    });
+
+    it('a remote that did not connect is told as off', () => {
+        const v = connected();
+        v._onWiimoteEvent({ type: 'refused', slot: 0, why: 'no' });
+        expect(told.at(-1)).toEqual({ state: 'off' });
     });
 });
