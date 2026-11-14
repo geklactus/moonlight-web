@@ -41,6 +41,7 @@ import { devicePixelSize } from '../util/StreamResolution.js';
 import { PeriodicStallDetector } from '../stream/PeriodicStallDetector.js';
 import { GamepadManager } from '../stream/GamepadManager.js';
 import { HidPassthrough } from '../hid/HidPassthrough.js';
+import { isWiimote } from '../hid/hidWire.js';
 import { GamepadRemapDialog } from './GamepadRemapDialog.js';
 import { padKey, padName } from '../stream/gamepadMapping.js';
 import { armAudioPlayRetry } from '../util/audioAutoplay.js';
@@ -8112,6 +8113,7 @@ export class StreamView {
             onChange: () =>
                 this._gamepadManager?.setExcluded(this._hidPassthrough?.excludedKeys() || []),
             onResult: (device, ok, why) => {
+                if (isWiimote(device)) return; // the Wii Remote's own line says it (_onWiimoteEvent)
                 const name = device.productName || '';
                 if (ok) Toast.info(t('stream.hidForwarded', { name }), { durationMs: 5000 });
                 else Toast.warning(t('stream.hidRefused', { name, why }), { durationMs: 8000 });
@@ -8166,8 +8168,31 @@ export class StreamView {
      * button opens the chooser. The live-entry pick narrows a DolphinBar's four to the streaming one.
      */
     async _offerWiimote() {
+        if (this._quitting || !this._wiimoteLocalPick()) return;
+        if (!navigator.hid) {
+            // Asked for (the launcher offers it only with WebHID, but the link can be opened anywhere):
+            // say this browser can't, once.
+            this._sayWiimote(t('stream.wiimoteNoWebHid'), 'unavailable');
+            return;
+        }
         const hp = this._hidPassthrough;
-        if (!hp || this._quitting || !this._wiimoteLocalPick() || !navigator.hid) return;
+        if (!hp) return;
+        // Offered only once the host said it can take one: otherwise Connect opens the chooser, the
+        // pick goes nowhere, and nothing says why (a host that couldn't open /dev/uhid, 2026-11-13).
+        const caps = hp.caps;
+        if (!caps) return; // the host hasn't said yet: its hidcaps calls this again
+        if (!caps.available) {
+            this._wiimoteConnectToast?.dismiss();
+            this._wiimoteConnectToast = null;
+            this._wiimoteOffered = false;
+            this._sayWiimote(
+                t('stream.wiimoteUnavailable', { why: caps.why || t('stream.wiimoteNoReason') }),
+                'unavailable',
+            );
+            return;
+        }
+        // It can now: the "can't" line goes. A refusal's line stays until Connect is clicked again.
+        if (this._wiimoteWhyKind === 'unavailable') this._sayWiimote(null);
         if (this._wiimoteConnected || this._wiimoteOffered) return;
         this._wiimoteOffered = true;
         if (await hp.linkWiimoteRemembered()) return; // reconnected; onWiimote('attached') shows status
@@ -8179,10 +8204,25 @@ export class StreamView {
                 label: t('stream.wiimoteConnectAction'),
                 onClick: () => {
                     this._wiimoteOffered = false;
+                    this._sayWiimote(null);
+                    // A pick that didn't connect, or none, comes back as 'refused' or 'cancelled',
+                    // which say so and offer Connect again.
                     hp.linkWiimote();
                 },
             },
         });
+    }
+
+    /**
+     * The Wii Remote's one line of trouble, replaced each time; null clears it. `kind` 'unavailable':
+     * the host can't take one at all (cleared once it can); 'refused': a pick that didn't connect.
+     */
+    _sayWiimote(message, kind = 'refused') {
+        if (message === this._wiimoteWhyText) return;
+        this._wiimoteWhyToast?.dismiss();
+        this._wiimoteWhyToast = message ? Toast.warning(message, { sticky: true }) : null;
+        this._wiimoteWhyText = message || null;
+        this._wiimoteWhyKind = message ? kind : null;
     }
 
     /** Attach / status / detach from the passthrough, turned into the banner's state. */
@@ -8191,13 +8231,37 @@ export class StreamView {
             this._wiimoteConnected = true;
             this._wiimoteConnectToast?.dismiss();
             this._wiimoteConnectToast = null;
+            this._sayWiimote(null);
             this._wiimoteStatus = { name: ev.name };
             this._showWiimoteStatus();
+        } else if (ev.type === 'heard') {
+            // The remote itself spoke (a DolphinBar entry attaches before, or without, one).
+            this._wiimoteHeard = true;
+            if (this._wiimoteConnected) this._showWiimoteStatus();
         } else if (ev.type === 'status' && this._wiimoteConnected) {
+            this._wiimoteHeard = true;
             this._wiimoteStatus = { ...(this._wiimoteStatus || {}), ...ev };
             this._showWiimoteStatus();
+        } else if (ev.type === 'refused') {
+            // It didn't connect: in the host's words when it gave them, else ours; Connect again.
+            const why =
+                ev.local === 'unopened'
+                    ? t('stream.wiimoteNotOpened')
+                    : ev.why || t('stream.wiimoteNoReason');
+            this._wiimoteConnected = false;
+            this._wiimoteHeard = false;
+            this._wiimoteOffered = false;
+            this._wiimoteStatusToast?.dismiss();
+            this._wiimoteStatusToast = null;
+            this._sayWiimote(t('stream.wiimoteRefused', { why }), 'refused');
+            this._offerWiimote();
+        } else if (ev.type === 'cancelled') {
+            // The chooser closed with nothing picked: Connect stays on offer.
+            this._wiimoteOffered = false;
+            this._offerWiimote();
         } else if (ev.type === 'detached') {
             this._wiimoteConnected = false;
+            this._wiimoteHeard = false;
             this._wiimoteOffered = false;
             this._wiimoteStatusToast?.dismiss();
             this._wiimoteStatusToast = null;
@@ -8207,6 +8271,13 @@ export class StreamView {
 
     /** The connected remote's line: player light, battery, an extension if one is in. */
     _showWiimoteStatus() {
+        if (!this._wiimoteHeard) {
+            // Attached, but no remote has answered through it yet (a DolphinBar with none synced to
+            // that slot, or asleep): "connected" would be wrong.
+            this._wiimoteStatusToast?.dismiss();
+            this._wiimoteStatusToast = Toast.info(t('stream.wiimoteWaiting'), { sticky: true });
+            return;
+        }
         const st = this._wiimoteStatus || {};
         const light = st.leds ? Math.log2(st.leds & -st.leds) + 1 : 0; // lowest lit light = player number
         const battery =
@@ -8230,6 +8301,7 @@ export class StreamView {
         if (typeof msg.type === 'string' && msg.type.startsWith('hid')) {
             this._ensureHidPassthrough()?.handleMessage(msg);
             if (msg.type === 'hidcaps') {
+                // Without WebHID there is no passthrough object; _offerWiimote still says so.
                 this._offerHid();
                 this._offerWiimote();
             }
@@ -10260,8 +10332,10 @@ export class StreamView {
         this._hidOfferToasts = [];
         this._wiimoteConnectToast?.dismiss();
         this._wiimoteStatusToast?.dismiss();
-        this._wiimoteConnectToast = this._wiimoteStatusToast = null;
-        this._wiimoteConnected = this._wiimoteOffered = false;
+        this._wiimoteWhyToast?.dismiss();
+        this._wiimoteConnectToast = this._wiimoteStatusToast = this._wiimoteWhyToast = null;
+        this._wiimoteWhyText = this._wiimoteWhyKind = null;
+        this._wiimoteConnected = this._wiimoteOffered = this._wiimoteHeard = false;
         document.removeEventListener('keydown', this._onKeyDown);
         if (this._onNetworkChange) {
             window.removeEventListener('online', this._onNetworkChange);

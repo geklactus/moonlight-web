@@ -940,7 +940,13 @@
         "wiimoteConnectAction": "Connect",
         "wiimoteConnected": "Wii Remote connected.",
         "wiimoteStatus": "Wii Remote connected — light {{light}}, battery {{battery}}%{{ext}}",
-        "wiimoteExtension": " (with an extension)"
+        "wiimoteExtension": " (with an extension)",
+        "wiimoteUnavailable": "Your Wii Remote can't connect to this game: {{why}}",
+        "wiimoteRefused": "Your Wii Remote didn't connect: {{why}}",
+        "wiimoteNotOpened": "the browser couldn't open it. Is another tab or app using it?",
+        "wiimoteNoReason": "the host didn't say why.",
+        "wiimoteWaiting": "Connected, but no Wii Remote has answered yet: press a button on the remote. Through a DolphinBar, the remote must be synced to the bar (mode 4).",
+        "wiimoteNoWebHid": "This browser can't connect a Wii Remote. Chrome or Edge on a computer can."
     },
     "transport": {
         "webrtcDcUdp": "WebRTC DataChannel (UDP)",

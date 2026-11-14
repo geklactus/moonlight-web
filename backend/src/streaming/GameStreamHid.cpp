@@ -99,7 +99,22 @@ bool GameStreamHid::setSessionId(const QString& sessionId)
 QString GameStreamHid::unavailableReason() const
 {
     std::lock_guard<std::mutex> lock(m_mutex);
-    return reasonLocked();
+    const QString why = reasonLocked();
+    // With the setting off nothing about a GameStream host changes, the log included.
+    if (m_enabled && (!m_reasonLogged || why != m_loggedReason)) {
+        m_reasonLogged = true;
+        m_loggedReason = why;
+        if (why.isEmpty()) {
+            qInfo().noquote() << "[GameStreamHid] can take a device now, for session" << m_sessionId;
+        } else {
+            const std::string backend = m_hostIsSelf ? m_backendReason() : std::string();
+            qWarning().noquote() << "[GameStreamHid] can't take a device:" << why
+                                 << (backend.empty()
+                                         ? QString()
+                                         : QStringLiteral("(%1)").arg(QString::fromStdString(backend)));
+        }
+    }
+    return why;
 }
 
 QString GameStreamHid::reasonLocked() const

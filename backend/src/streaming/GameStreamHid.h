@@ -124,6 +124,11 @@ private:
     ReasonProbe m_backendReason;
 
     mutable std::mutex m_mutex;
+    // What unavailableReason() last told the page, logged once each time it changes: a host that
+    // can't take a device says so in its own log, with the technical reason (2026-11-13: /dev/uhid
+    // refused, and nothing on the host said why the page's Wii Remote went nowhere).
+    mutable bool m_reasonLogged = false;
+    mutable QString m_loggedReason;
     bool m_enabled = false;
     bool m_hostIsSelf = false;
     QString m_sessionId;

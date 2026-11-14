@@ -193,6 +193,12 @@ export class HidPassthrough {
      * @param {() => void} [o.onChange] the device list or a state changed
      * @param {(device: HIDDevice, ok: boolean, why: string) => void} [o.onResult]
      *     the host's answer to an attach, to tell the viewer
+     * @param {(ev: object) => void} [o.onWiimote] a Wii Remote's life, for the stream page to say:
+     *     {type: 'attached', slot, name}, {type: 'heard', slot} (the remote itself answered: a
+     *     DolphinBar entry can attach with no remote synced to it), {type: 'status', slot, battery,
+     *     extension, leds}, {type: 'detached', slot}, {type: 'cancelled'} (the chooser was closed
+     *     with nothing picked), {type: 'refused', slot, why, local} (it didn't connect: `why` is the
+     *     host's words when it gave them, `local` 'unopened' when the browser couldn't open it)
      */
     constructor({
         hid = globalThis.navigator?.hid,
@@ -227,6 +233,7 @@ export class HidPassthrough {
         this._timer = null;
         this._requests = 0;
         this._offered = new Set(); // models offered in this stream
+        this._answered = new WeakSet(); // Wii Remote entries that reported during the live-pick
         // Devices switched on wait for the host's word (see the file comment).
         this._holding = !!this._hid;
         this._holdTimer = this._holding ? later(() => this._letGo(), HOLD_MS) : null;
@@ -325,6 +332,8 @@ export class HidPassthrough {
                     this._release(device, e);
                     e.state = 'refused';
                     e.why = String(msg.why || '');
+                    if (isWiimote(device))
+                        this._onWiimote?.({ type: 'refused', slot: msg.slot, why: e.why });
                 }
                 if (this._onResult) this._onResult(device, !!msg.ok, e.why);
                 this._changed();
@@ -422,6 +431,12 @@ export class HidPassthrough {
      */
     async linkWiimote() {
         if (!this._hid) return [];
+        // The host can't take one (or hasn't said yet): say why rather than open a chooser whose
+        // pick would go nowhere. (The stream page offers Connect only once it can.)
+        if (!this._caps?.available) {
+            this._onWiimote?.({ type: 'refused', slot: -1, why: this._caps?.why || '' });
+            return [];
+        }
         let chosen = [];
         try {
             chosen = await this._hid.requestDevice({ filters: WIIMOTE_FILTERS });
@@ -429,8 +444,14 @@ export class HidPassthrough {
             chosen = [];
         }
         chosen = chosen.filter(isWiimote);
+        if (!chosen.length) {
+            this._onWiimote?.({ type: 'cancelled' });
+            this._changed();
+            return [];
+        }
         const live = await this._pickLiveWiimote(chosen);
         if (!live) {
+            this._onWiimote?.({ type: 'refused', slot: -1, why: '', local: 'unopened' });
             this._changed();
             return [];
         }
@@ -438,6 +459,21 @@ export class HidPassthrough {
         keys.add(deviceKey(live));
         saveForwarded(keys, this._storage);
         await this._attach(live);
+        const entry = this._entries.get(live);
+        if (!entry || entry.state === 'refused') {
+            // Nothing was sent: the browser couldn't open it, or the host stopped being able to take it.
+            this._onWiimote?.(
+                entry
+                    ? { type: 'refused', slot: -1, why: entry.why, local: 'unopened' }
+                    : {
+                          type: 'refused',
+                          slot: -1,
+                          why: this._caps?.available ? '' : this._caps?.why || '',
+                      },
+            );
+            this._changed();
+            return [];
+        }
         this._changed();
         return [live];
     }
@@ -472,7 +508,10 @@ export class HidPassthrough {
                 }
             };
             for (const d of open) {
-                const listener = () => finish(d);
+                const listener = () => {
+                    this._answered.add(d);
+                    finish(d);
+                };
                 d.addEventListener('inputreport', listener);
                 listeners.set(d, listener);
                 // A live entry already streams; the status request only wakes a quiet-but-connected one.
@@ -580,7 +619,16 @@ export class HidPassthrough {
         const hidppIds = hasHidpp(device) ? hidppInputIds(device) : new Set();
         // A Wii Remote's answers: once each, on the reliable channel.
         const replyIds = isWiimote(device) ? WIIMOTE_REPLY_IDS : new Set();
+        // Whether the remote itself has spoken: a DolphinBar entry opens and attaches with no remote
+        // synced to it (the live-pick's fallback), and the page says so until one answers.
+        let heard = false;
+        const hear = () => {
+            if (heard || !isWiimote(device)) return;
+            heard = true;
+            this._onWiimote?.({ type: 'heard', slot });
+        };
         const listener = (e) => {
+            hear();
             if (hidppIds.has(e.reportId)) return;
             const bytes = new Uint8Array(e.data.buffer, e.data.byteOffset, e.data.byteLength);
             if (replyIds.has(e.reportId)) {
@@ -610,6 +658,7 @@ export class HidPassthrough {
         const ffb = await this._probeFfb(device);
         this._entries.set(device, { slot, state: 'pending', why: '', listener, ffb });
         this._send(attachMessage(slot, device, { forceFeedback: !!ffb }));
+        if (this._answered.has(device)) hear(); // it answered the live-pick already
         this._armTimer();
     }
 

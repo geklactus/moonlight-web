@@ -940,7 +940,13 @@
         "wiimoteConnectAction": "Connecter",
         "wiimoteConnected": "Wiimote connectée.",
         "wiimoteStatus": "Wiimote connectée — voyant {{light}}, batterie {{battery}} %{{ext}}",
-        "wiimoteExtension": " (avec une extension)"
+        "wiimoteExtension": " (avec une extension)",
+        "wiimoteUnavailable": "Votre Wiimote ne peut pas se connecter à ce jeu : {{why}}",
+        "wiimoteRefused": "Votre Wiimote ne s'est pas connectée : {{why}}",
+        "wiimoteNotOpened": "le navigateur n'a pas pu l'ouvrir. Un autre onglet ou une autre application l'utilise-t-il ?",
+        "wiimoteNoReason": "l'hôte n'a pas dit pourquoi.",
+        "wiimoteWaiting": "Connectée, mais aucune Wiimote n'a encore répondu : appuyez sur un bouton de la manette. Avec une DolphinBar, la Wiimote doit être synchronisée avec la barre (mode 4).",
+        "wiimoteNoWebHid": "Ce navigateur ne peut pas connecter de Wiimote. Chrome ou Edge sur un ordinateur le peuvent."
     },
     "transport": {
         "webrtcDcUdp": "WebRTC DataChannel (UDP)",

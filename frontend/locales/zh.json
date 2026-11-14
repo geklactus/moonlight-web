@@ -940,7 +940,13 @@
         "wiimoteConnectAction": "连接",
         "wiimoteConnected": "Wii 遥控器已连接。",
         "wiimoteStatus": "Wii 遥控器已连接 — 指示灯 {{light}}，电量 {{battery}}%{{ext}}",
-        "wiimoteExtension": "（带扩展）"
+        "wiimoteExtension": "（带扩展）",
+        "wiimoteUnavailable": "你的 Wii 遥控器无法连接到这个游戏：{{why}}",
+        "wiimoteRefused": "你的 Wii 遥控器没有连接上：{{why}}",
+        "wiimoteNotOpened": "浏览器无法打开它。是否有其他标签页或应用正在使用它？",
+        "wiimoteNoReason": "主机没有说明原因。",
+        "wiimoteWaiting": "已连接，但还没有 Wii 遥控器响应：请按遥控器上的一个按钮。使用 DolphinBar 时，遥控器必须与感应条配对（模式 4）。",
+        "wiimoteNoWebHid": "这个浏览器无法连接 Wii 遥控器。电脑上的 Chrome 或 Edge 可以。"
     },
     "transport": {
         "webrtcDcUdp": "WebRTC 数据通道（UDP）",
