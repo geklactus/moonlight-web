@@ -42,6 +42,7 @@ import { PeriodicStallDetector } from '../stream/PeriodicStallDetector.js';
 import { GamepadManager } from '../stream/GamepadManager.js';
 import { HidPassthrough } from '../hid/HidPassthrough.js';
 import { isWiimote } from '../hid/hidWire.js';
+import { WiimoteSpeakerOutput } from '../hid/wiimoteSpeaker.js';
 import { GamepadRemapDialog } from './GamepadRemapDialog.js';
 import { padKey, padName } from '../stream/gamepadMapping.js';
 import { armAudioPlayRetry } from '../util/audioAutoplay.js';
@@ -8124,6 +8125,8 @@ export class StreamView {
                 else Toast.warning(t('stream.hidRefused', { name, why }), { durationMs: 8000 });
             },
             onWiimote: (ev) => this._onWiimoteEvent(ev),
+            // A Wii Remote's speaker plays here, at the stream's own volume.
+            speaker: new WiimoteSpeakerOutput({ level: () => streamVolume.outputLevel() }),
         });
         // Chrome shows a pad once a button is pressed: offer it then too.
         this._onHidPadConnected = () => this._offerHid();
