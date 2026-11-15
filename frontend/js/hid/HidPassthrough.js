@@ -25,6 +25,7 @@ import { padKind, padName, parsePadId } from '../stream/gamepadMapping.js';
 import { HidppFfbPlayer, HidppTransport, findFfbFeature, hasHidpp } from './hidppFfb.js';
 import { PidFfbPlayer, hasNativePid } from './pidFfb.js';
 import { HidppRelay, hidppInputIds, isHidppReport } from './hidppRelay.js';
+import { SPEAKER_DATA, WiimoteSpeaker } from './wiimoteSpeaker.js';
 
 /**
  * The HID passthrough in the stream (plan « Passthrough HID », P2): the game
@@ -57,6 +58,12 @@ import { HidppRelay, hidppInputIds, isHidppReport } from './hidppRelay.js';
  * on this reliable channel; its data reports on 'hid' as any device's.
  * linkWiimote() opens Chrome's chooser for it.
  *
+ * Its speaker's sound is the one thing kept from it when the page was given
+ * somewhere to play it (`speaker`, wiimoteSpeaker.js): the data reports (0x18)
+ * are decoded and played on this computer, and the remote is sent only the
+ * rumble bit they carried. A remote plays that data badly even on the host's
+ * own Bluetooth, and worse through a stream.
+ *
  * Force feedback (P4) takes its own road, and only when the host says it can
  * (`hidcaps.ffb`): the host decodes what the game asks of the recreated wheel
  * into neutral operations (`hidffb`), and this page plays them through a
@@ -83,6 +90,11 @@ export const HOLD_MS = 3000;
 // skips the probe. Long enough for a streaming entry to speak, short enough not to stall the click.
 const WIIMOTE_PROBE_MS = 500;
 const WIIMOTE_STATUS = 0x15;
+const WIIMOTE_RUMBLE = 0x10;
+// What the game set each remote's speaker to, kept with the device rather than
+// with one stream: the host keeps the recreated remote from a stream to the
+// next, so the game does not set its speaker up again for the new one.
+const speakerStates = new WeakMap();
 
 /** `vid:pid` in lowercase hex: how a device is remembered. */
 export function deviceKey(device) {
@@ -199,6 +211,8 @@ export class HidPassthrough {
      *     extension, leds}, {type: 'detached', slot}, {type: 'cancelled'} (the chooser was closed
      *     with nothing picked), {type: 'refused', slot, why, local} (it didn't connect: `why` is the
      *     host's words when it gave them, `local` 'unopened' when the browser couldn't open it)
+     * @param {import('./wiimoteSpeaker.js').WiimoteSpeakerOutput} [o.speaker] where the Wii
+     *     Remotes' speakers play; without one their sound is left to the remotes
      */
     constructor({
         hid = globalThis.navigator?.hid,
@@ -214,9 +228,13 @@ export class HidPassthrough {
         onChange = null,
         onResult = null,
         onWiimote = null,
+        speaker = null,
     }) {
         this._hid = hid || null;
         this._onWiimote = onWiimote;
+        // Where the Wii Remotes' speakers play (a WiimoteSpeakerOutput), or null
+        // to leave the sound to the remotes.
+        this._speaker = speaker;
         this._send = send;
         this._sendFrame = sendFrame;
         this._storage = storage;
@@ -254,6 +272,11 @@ export class HidPassthrough {
     /** Host requests seen (output reports, features), for diagnostics. */
     get requests() {
         return this._requests;
+    }
+
+    /** The Wii Remotes' speakers played here: reports played, sounds, gaps, drops; null without. */
+    get speakerStats() {
+        return this._speaker ? { ...this._speaker.stats } : null;
     }
 
     /** Devices this page may open that are game devices, with their state. */
@@ -596,6 +619,7 @@ export class HidPassthrough {
         // feedback it set up. Only an unplug or a switch turned off detaches.
         this._dropAll('', false);
         if (this._hid) this._hid.removeEventListener('disconnect', this._onDisconnect);
+        if (this._speaker) this._speaker.close();
         this._changed();
     }
 
@@ -770,8 +794,30 @@ export class HidPassthrough {
     // and the memory writes depend on it), the bytes as they are — rumble is
     // bit 0 of every one, and the game sets it. Linux hands the report with its
     // id first; WebHID takes the id apart. A device let go stops the queue.
+    //
+    // With somewhere to play it, the speaker's sound stays here: every report
+    // is shown to the speaker's decoder (what the game set it to, then its
+    // data), and a data report is played by the page rather than written. The
+    // remote is told its rumble bit when that changed, as Dolphin does for a
+    // remote whose speaker is off (WiimoteReal.cpp, InterruptDataOutput).
     _writeWiimote(device, e, reportId, bytes) {
-        const payload = bytes[0] === reportId ? bytes.subarray(1) : bytes;
+        let payload = bytes[0] === reportId ? bytes.subarray(1) : bytes;
+        if (this._speaker) {
+            let state = speakerStates.get(device);
+            if (!state) speakerStates.set(device, (state = new WiimoteSpeaker()));
+            const samples = state.output(reportId, payload);
+            if (samples) {
+                if (!e.voice) e.voice = this._speaker.voice();
+                e.voice.push(samples, state.sampleRate, state.volume);
+            }
+            if (reportId === SPEAKER_DATA) {
+                const rumble = payload.length ? payload[0] & 0x01 : 0;
+                if (rumble === (e.rumble || 0)) return;
+                reportId = WIIMOTE_RUMBLE;
+                payload = new Uint8Array([rumble]);
+            }
+        }
+        if (payload.length) e.rumble = payload[0] & 0x01;
         const write = () =>
             e.slot >= 0 && e.state === 'on' && this._entries.get(device) === e
                 ? device.sendReport(reportId, payload)

@@ -93,7 +93,7 @@ function memoryStorage(initial = {}) {
     return { getItem: (k) => (m.has(k) ? m.get(k) : null), setItem: (k, v) => m.set(k, v) };
 }
 
-function setup(devices, wanted = []) {
+function setup(devices, wanted = [], extra = {}) {
     const hid = fakeHid(devices);
     const sent = [];
     const frames = [];
@@ -117,6 +117,7 @@ function setup(devices, wanted = []) {
         onChange,
         onResult,
         onWiimote: (e) => wiimote.push(e),
+        ...extra,
     });
     return {
         hp,
@@ -416,8 +417,8 @@ describe('HidPassthrough — a Wii Remote, for a GameStream host on its own mach
         data: b64(bytes),
     });
 
-    async function attached(remote, caps = { available: true, wiimote: true }) {
-        const t = setup([remote], [deviceKey(remote)]);
+    async function attached(remote, caps = { available: true, wiimote: true }, extra = {}) {
+        const t = setup([remote], [deviceKey(remote)], extra);
         t.hp.handleMessage({ type: 'hidcaps', ...caps });
         // A Wii Remote attaches through the live-pick, never applyWanted (a DolphinBar's four identical
         // entries share one key): StreamView calls this on the same hidcaps.
@@ -693,6 +694,137 @@ describe('HidPassthrough — a Wii Remote, for a GameStream host on its own mach
         const live = await t.hp.linkWiimoteRemembered();
         expect(live).toBeTruthy();
         await vi.waitFor(() => expect(t.sent).toHaveLength(1));
+    });
+});
+
+describe('HidPassthrough — a Wii Remote’s speaker, played by the page', () => {
+    const b64 = (bytes) => globalThis.btoa(String.fromCharCode(...bytes));
+    const output = (slot, reportId, bytes) => ({
+        type: 'hidrequest',
+        slot,
+        kind: 'output',
+        reportId,
+        data: b64(bytes),
+    });
+    const pad = (bytes, n) => [...bytes, ...new Array(n - bytes.length).fill(0)];
+    /** As Linux hands them: the report's id first. */
+    const write = (addr, ...data) =>
+        output(0, 0x16, [0x16, 0x04, 0xa2, 0x00, addr, data.length, ...pad(data, 16)]);
+    const sound = (bytes, rumble = 0) =>
+        output(0, 0x18, [0x18, (bytes.length << 3) | rumble, ...pad(bytes, 20)]);
+    const TURN_ON = [
+        output(0, 0x14, [0x14, 0x04]),
+        output(0, 0x19, [0x19, 0x04]),
+        write(0x09, 0x01),
+        write(0x01, 0x80),
+        write(0x01, 0x00, 0x00, 0xd0, 0x07, 0x40, 0x0c, 0x0e),
+        write(0x08, 0x01),
+        output(0, 0x19, [0x19, 0x00]),
+    ];
+
+    function fakeSpeaker() {
+        const pushed = [];
+        return {
+            pushed,
+            stats: { played: 0, sounds: 0, gaps: 0, dropped: 0 },
+            voice: vi.fn(() => ({
+                push: (samples, rate, volume) => pushed.push({ samples, rate, volume }),
+            })),
+            close: vi.fn(),
+        };
+    }
+
+    async function attached(remote, speaker) {
+        const t = setup([remote], [deviceKey(remote)], speaker ? { speaker } : {});
+        t.hp.handleMessage({ type: 'hidcaps', available: true, wiimote: true });
+        await t.hp.linkWiimoteRemembered();
+        await vi.waitFor(() => expect(t.sent).toHaveLength(1));
+        t.hp.handleMessage({ type: 'hidattached', slot: 0, ok: true });
+        return t;
+    }
+
+    it('plays the sound here and keeps it from the remote', async () => {
+        const remote = fakeWiimote();
+        const speaker = fakeSpeaker();
+        const t = await attached(remote, speaker);
+        for (const m of TURN_ON) t.hp.handleMessage(m);
+        t.hp.handleMessage(sound([117, 205, 37, 75]));
+        t.hp.handleMessage(sound([132, 226]));
+        await vi.waitFor(() => expect(remote.sent).toHaveLength(TURN_ON.length));
+        // The remote was sent the set-up as it came (it answers the game), never the data.
+        expect(remote.sent.map(([id]) => id)).toEqual([0x14, 0x19, 0x16, 0x16, 0x16, 0x16, 0x19]);
+        expect(remote.sent[4]).toEqual([
+            0x16,
+            [0x04, 0xa2, 0x00, 0x01, 7, ...pad([0x00, 0x00, 0xd0, 0x07, 0x40, 0x0c, 0x0e], 16)],
+        ]);
+        expect(speaker.voice).toHaveBeenCalledTimes(1); // one line for the remote
+        expect(speaker.pushed.map((p) => Array.from(p.samples))).toEqual([
+            [238, 656, 111, -687, -107, 1038, 2534, 1140],
+            [961, 2407, -98, 1829],
+        ]);
+        expect(speaker.pushed[0].rate).toBe(6000);
+        expect(speaker.pushed[0].volume).toBeCloseTo(0x40 / 0x7f);
+        expect(t.hp.speakerStats).toEqual({ played: 0, sounds: 0, gaps: 0, dropped: 0 });
+    });
+
+    it('still passes the rumble the sound reports carried, once a change', async () => {
+        const remote = fakeWiimote();
+        const t = await attached(remote, fakeSpeaker());
+        t.hp.handleMessage(output(0, 0x11, [0x11, 0x10])); // lights, no rumble
+        t.hp.handleMessage(sound([1, 2], 0)); // nothing new
+        t.hp.handleMessage(sound([1, 2], 1)); // rumble on, in a sound report
+        t.hp.handleMessage(sound([1, 2], 1));
+        t.hp.handleMessage(output(0, 0x11, [0x11, 0x11])); // still on
+        t.hp.handleMessage(sound([1, 2], 0)); // off
+        t.hp.handleMessage(sound([1, 2], 0));
+        await vi.waitFor(() => expect(remote.sent).toHaveLength(4));
+        expect(remote.sent).toEqual([
+            [0x11, [0x10]],
+            [0x10, [0x01]],
+            [0x11, [0x11]],
+            [0x10, [0x00]],
+        ]);
+    });
+
+    it('stays silent for a remote the game has not set up, and for one it muted', async () => {
+        const remote = fakeWiimote();
+        const speaker = fakeSpeaker();
+        const t = await attached(remote, speaker);
+        t.hp.handleMessage(sound([117, 205]));
+        for (const m of TURN_ON) t.hp.handleMessage(m);
+        t.hp.handleMessage(output(0, 0x19, [0x19, 0x04]));
+        t.hp.handleMessage(sound([117, 205]));
+        await vi.waitFor(() => expect(remote.sent).toHaveLength(TURN_ON.length + 1));
+        expect(speaker.pushed).toEqual([]);
+        expect(remote.sent.some(([id]) => id === 0x18)).toBe(false);
+    });
+
+    it('remembers what the game set from one stream to the next', async () => {
+        const remote = fakeWiimote();
+        const first = await attached(remote, fakeSpeaker());
+        for (const m of TURN_ON) first.hp.handleMessage(m);
+        first.hp.stop();
+        // The host kept the remote: the game does not set its speaker up again.
+        const speaker = fakeSpeaker();
+        const next = await attached(remote, speaker);
+        next.hp.handleMessage(sound([117, 205]));
+        expect(speaker.pushed.map((p) => Array.from(p.samples))).toEqual([[238, 656, 111, -687]]);
+    });
+
+    it('closes the speaker with the stream', async () => {
+        const speaker = fakeSpeaker();
+        const t = await attached(fakeWiimote(), speaker);
+        t.hp.stop();
+        expect(speaker.close).toHaveBeenCalledTimes(1);
+    });
+
+    it('leaves the sound to the remote when given nowhere to play it', async () => {
+        const remote = fakeWiimote();
+        const t = await attached(remote, null);
+        t.hp.handleMessage(sound([117, 205], 1));
+        await vi.waitFor(() => expect(remote.sent).toHaveLength(1));
+        expect(remote.sent[0]).toEqual([0x18, [(2 << 3) | 1, ...pad([117, 205], 20)]]);
+        expect(t.hp.speakerStats).toBeNull();
     });
 });
 
