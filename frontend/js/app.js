@@ -3509,6 +3509,16 @@ export const MoonlightApp = {
         // The degradation ladder stands down for the native host — see
         // _onStreamCongested.
         this._lastStreamNative = result.native === true;
+        // A Wolf seat keeps the display it was started with: a stream resumed
+        // at another size is that display, scaled. Wolf then scales the mouse's
+        // position to the NEW stream's size and places it by that on the OLD
+        // display (its mouse_move_abs reads session.display_mode, which a
+        // resume replaces, while the display is carried over). Measured on
+        // LOLA, 20/11/2026: 1080p stepped down to 720p by the ladder below, and
+        // from then on the pointer landed two thirds of the way to wherever
+        // the mouse was. So on a Wolf seat the ladder never touches the
+        // resolution — see _onStreamCongested.
+        this._lastStreamKeepsSize = host.backendType === 'wolf';
 
         return new StreamView(
             document.getElementById('app'),
@@ -4482,6 +4492,10 @@ export const MoonlightApp = {
      *   5+ bitrate −30% … floor at 2 Mbps, then remaining resolution rungs
      * Once every knob is at its floor, keep restarting the transport — a fresh
      * SCTP/ICE state is exactly what a manual stop/start fixes.
+     *
+     * A Wolf seat skips the resolution rungs (_lastStreamKeepsSize): its
+     * display cannot follow the stream, and its mouse goes wrong when the two
+     * differ. The other knobs apply as they are.
      */
     _onStreamCongested() {
         if (this._nav.overlay !== 'streaming') return;
@@ -4543,7 +4557,7 @@ export const MoonlightApp = {
         const factor = this._degradeLevel === 1 ? 0.5 : 0.7;
         let newBitrate = Math.max(2000, Math.round(curBitrate * factor));
 
-        if (curHeight > 720) {
+        if (curHeight > 720 && !this._lastStreamKeepsSize) {
             // Resolution one rung down alongside the bitrate cut, never below
             // 720p (the bitrate alone keeps descending once 720p is reached).
             const next = [2160, 1440, 1080, 720].find((r) => r < curHeight);
