@@ -14,6 +14,7 @@ import {
     HID_KINDS,
     HOLD_MS,
     HidPassthrough,
+    JOYCON_PAD_KEYS,
     deviceKey,
     hidHelpFor,
     hidModelOf,
@@ -203,6 +204,7 @@ describe('HidPassthrough (HID passthrough in the stream, P2)', () => {
             ffb: false,
             hidpp: false,
             wiimote: false,
+            joycon: false,
             why: 'needs the native host',
         });
 
@@ -934,5 +936,218 @@ describe('hidHelpFor (« As itself » on a host that cannot)', () => {
         expect(hidHelpFor([native('unsupported')])).toBe('macos');
         expect(hidHelpFor([sunshine])).toBe('none');
         expect(hidHelpFor([sunshine, native('driver_missing')])).toBe('windows');
+    });
+});
+
+/** A Joy-Con as WebHID shows it: its ids, a collection that says nothing of a game pad, what it was sent. */
+function fakeJoycon(side = 'left', { sendFails = false, openFails = false } = {}) {
+    const d = fakeDevice({
+        vendorId: 0x057e,
+        productId: side === 'left' ? 0x2006 : 0x2007,
+        usagePage: 0xff00,
+        usage: 1,
+        openFails,
+    });
+    d.productName = side === 'left' ? 'Joy-Con (L)' : 'Joy-Con (R)';
+    d.sent = [];
+    d.sendReport = vi.fn(async (id, data) => {
+        if (sendFails) throw new Error('NotAllowedError');
+        d.sent.push([id, Array.from(data)]);
+    });
+    return d;
+}
+
+describe('HidPassthrough: Joy-Cons sent as themselves', () => {
+    const b64 = (bytes) => globalThis.btoa(String.fromCharCode(...bytes));
+    // What Linux hands over: the report with its id first.
+    const output = (slot, reportId, afterId) => ({
+        type: 'hidrequest',
+        slot,
+        kind: 'output',
+        reportId,
+        data: b64([reportId, ...afterId]),
+    });
+    // After the id: counter, eight bytes of rumble, the subcommand, its arguments.
+    const subcommand = (sub, ...args) => [0x03, 0, 1, 0x40, 0x40, 0, 1, 0x40, 0x40, sub, ...args];
+    const events = [];
+    const start = (devices, caps = { joycon: true }) => {
+        events.length = 0;
+        const t = setup(devices, [], { onJoycon: (e) => events.push(e) });
+        t.hp.handleMessage({ type: 'hidcaps', available: true, ...caps });
+        return t;
+    };
+    const both = async () => {
+        const left = fakeJoycon('left');
+        const right = fakeJoycon('right');
+        const t = start([left, right]);
+        t.hid.requestDevice.mockResolvedValueOnce([left]).mockResolvedValueOnce([right]);
+        await t.hp.linkJoycon();
+        await t.hp.linkJoycon();
+        t.hp.handleMessage({ type: 'hidattached', slot: 0, ok: true });
+        t.hp.handleMessage({ type: 'hidattached', slot: 1, ok: true });
+        return { t, left, right };
+    };
+
+    it('links one half per click through a chooser narrowed to the two Joy-Cons', async () => {
+        const { t, left, right } = await both();
+        expect(t.hid.requestDevice).toHaveBeenCalledWith({
+            filters: [
+                { vendorId: 0x057e, productId: 0x2006 },
+                { vendorId: 0x057e, productId: 0x2007 },
+            ],
+        });
+        const attaches = t.sent.filter((m) => m.type === 'hidattach');
+        expect(attaches.map((m) => [m.slot, m.productId])).toEqual([
+            [0, 0x2006],
+            [1, 0x2007],
+        ]);
+        expect(left.opened && right.opened).toBe(true);
+        expect(Array.from(t.hp.joyconSides()).sort()).toEqual(['left', 'right']);
+        expect(events).toEqual([
+            { type: 'attached', slot: 0, side: 'left', name: 'Joy-Con (L)' },
+            { type: 'attached', slot: 1, side: 'right', name: 'Joy-Con (R)' },
+        ]);
+        // Not among the switched-on devices: nothing would send one to another game as itself.
+        expect(loadForwarded(t.storage).size).toBe(0);
+    });
+
+    it('opens no chooser for a host that does not take Joy-Cons, and says why', async () => {
+        const t = start([fakeJoycon()], { joycon: false, wiimote: true });
+        expect(await t.hp.linkJoycon()).toEqual([]);
+        expect(t.hid.requestDevice).not.toHaveBeenCalled();
+        expect(events).toEqual([{ type: 'refused', slot: -1, why: '' }]);
+        expect(await t.hp.linkJoyconsRemembered()).toEqual([]);
+        expect(t.sent).toEqual([]);
+    });
+
+    it('says a chooser closed with nothing picked, and a Joy-Con the browser cannot open', async () => {
+        const t = start([fakeJoycon()]);
+        t.hid.requestDevice.mockResolvedValueOnce([]);
+        expect(await t.hp.linkJoycon()).toEqual([]);
+        expect(events).toEqual([{ type: 'cancelled' }]);
+
+        const busy = fakeJoycon('left', { openFails: true });
+        const u = start([busy]);
+        expect(await u.hp.linkJoycon()).toEqual([]);
+        expect(events).toEqual([{ type: 'refused', slot: -1, why: 'busy', local: 'unopened' }]);
+        expect(u.sent).toEqual([]);
+    });
+
+    it('takes one of each half, and leaves a second left Joy-Con alone', async () => {
+        const left = fakeJoycon('left');
+        const other = fakeJoycon('left');
+        const t = start([left, other]);
+        t.hid.requestDevice.mockResolvedValueOnce([left]).mockResolvedValueOnce([other]);
+        await t.hp.linkJoycon();
+        expect(await t.hp.linkJoycon()).toEqual([]);
+        expect(t.sent.filter((m) => m.type === 'hidattach')).toHaveLength(1);
+        expect(other.opened).toBe(false);
+    });
+
+    it('sends the Joy-Cons already allowed with no click, and only when asked', async () => {
+        const left = fakeJoycon('left');
+        const right = fakeJoycon('right');
+        const t = start([left, right]);
+        // The host's word alone (applyWanted) sends neither.
+        await Promise.resolve();
+        expect(t.sent).toEqual([]);
+        expect(await t.hp.linkJoyconsRemembered()).toEqual([left, right]);
+        expect(t.hid.requestDevice).not.toHaveBeenCalled();
+        expect(t.sent.filter((m) => m.type === 'hidattach')).toHaveLength(2);
+    });
+
+    it("sends a subcommand's answer once on the reliable channel, and the states on hid", async () => {
+        const { t, left } = await both();
+        t.sent.length = 0;
+        left.report(0x21, [0x10, 0x8e, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x82, 0x02]);
+        expect(t.sent).toEqual([
+            {
+                type: 'hidreply',
+                slot: 0,
+                reportId: 0x21,
+                data: b64([0x10, 0x8e, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x82, 0x02]),
+            },
+        ]);
+        expect(t.frames).toHaveLength(0);
+        left.report(0x30, [0x11, 0x8e, 0, 0, 0]);
+        left.report(0x3f, [0, 0, 8]);
+        expect(t.frames.map((f) => decodeReportFrame(f).reportId)).toEqual([0x30, 0x3f]);
+        expect(t.sent).toHaveLength(1);
+    });
+
+    it('writes what the game sends to the real Joy-Con, in order, the id taken apart', async () => {
+        const { t, left, right } = await both();
+        t.hp.handleMessage(output(0, 0x01, subcommand(0x30, 0x01)));
+        t.hp.handleMessage(output(0, 0x10, [0x04, 0, 1, 0x40, 0x40, 0, 1, 0x40, 0x40]));
+        t.hp.handleMessage(output(1, 0x01, subcommand(0x10, 0x3d, 0x60, 0, 0, 9)));
+        await vi.waitFor(() => expect(left.sent).toHaveLength(2));
+        expect(left.sent).toEqual([
+            [0x01, subcommand(0x30, 0x01)],
+            [0x10, [0x04, 0, 1, 0x40, 0x40, 0, 1, 0x40, 0x40]],
+        ]);
+        await vi.waitFor(() => expect(right.sent).toHaveLength(1));
+        expect(right.sent[0]).toEqual([0x01, subcommand(0x10, 0x3d, 0x60, 0, 0, 9)]);
+        expect(t.hp.joyconRefused).toBe(0);
+    });
+
+    it('never writes a flash write, an erase, pairing, power, or a read of the pairing information', async () => {
+        const { t, left } = await both();
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+        for (const sub of [0x11, 0x12, 0x01, 0x06, 0x07, 0x20])
+            t.hp.handleMessage(output(0, 0x01, subcommand(sub, 0x00)));
+        t.hp.handleMessage(output(0, 0x01, subcommand(0x11, 0x00))); // again: said once
+        t.hp.handleMessage(output(0, 0x01, subcommand(0x08, 0x01)));
+        t.hp.handleMessage(output(0, 0x01, subcommand(0x10, 0x00, 0x20, 0, 0, 0x1d)));
+        t.hp.handleMessage(output(0, 0x03, [0, 0, 0])); // the firmware update's report
+        t.hp.handleMessage({ ...output(0, 0x01, subcommand(0x30, 0x01)), kind: 'setfeature' });
+        await Promise.resolve();
+        await Promise.resolve();
+        expect(left.sendReport).not.toHaveBeenCalled();
+        expect(t.hp.joyconRefused).toBe(10); // the feature isn't an output: not even looked at
+        expect(warn).toHaveBeenCalledTimes(9); // one for each kind, not one for each report
+        warn.mockRestore();
+    });
+
+    it('writes nothing for a host that did not say the game drives Joy-Cons, nor before it took one', async () => {
+        const left = fakeJoycon('left');
+        const t = start([left]);
+        await t.hp.linkJoycon();
+        t.hp.handleMessage(output(0, 0x01, subcommand(0x30, 0x01))); // still pending
+        await Promise.resolve();
+        expect(left.sendReport).not.toHaveBeenCalled();
+        t.hp.handleMessage({ type: 'hidattached', slot: 0, ok: true });
+        t.hp.handleMessage({ type: 'hidcaps', available: true, joycon: false });
+        t.hp.handleMessage(output(0, 0x01, subcommand(0x30, 0x01)));
+        await Promise.resolve();
+        expect(left.sendReport).not.toHaveBeenCalled();
+    });
+
+    it('keeps every pad the Joy-Cons show up as off the mapped pads while one is sent', async () => {
+        const { t, left, right } = await both();
+        for (const k of JOYCON_PAD_KEYS) expect(t.hp.excludedKeys()).toContain(k);
+        expect(JOYCON_PAD_KEYS).toContain('usb:057e:200e'); // the pair Chrome joins
+        expect(JOYCON_PAD_KEYS).toContain('name:joy-con (l/r)'); // the pair as macOS names it
+        t.hid.unplug(left);
+        expect(events.at(-1)).toEqual({ type: 'detached', slot: 0, side: 'left' });
+        expect(t.hp.excludedKeys()).toContain('usb:057e:200e'); // the right one is still sent
+        t.hid.unplug(right);
+        expect(t.hp.excludedKeys()).toEqual([]);
+        expect(t.hp.joyconSides().size).toBe(0);
+    });
+
+    it('says a Joy-Con the host refused', async () => {
+        const left = fakeJoycon('left');
+        const t = start([left]);
+        await t.hp.linkJoycon();
+        t.hp.handleMessage({
+            type: 'hidattached',
+            slot: 0,
+            ok: false,
+            why: 'Only Wii Remotes can be connected to this game.',
+        });
+        expect(events).toEqual([
+            { type: 'refused', slot: 0, why: 'Only Wii Remotes can be connected to this game.' },
+        ]);
+        expect(t.hp.joyconSides().size).toBe(0);
     });
 });
