@@ -946,7 +946,15 @@
         "wiimoteNotOpened": "the browser couldn't open it. Is another tab or app using it?",
         "wiimoteNoReason": "the host didn't say why.",
         "wiimoteWaiting": "Connected, but no Wii Remote has answered yet: press a button on the remote. Through a DolphinBar, the remote must be synced to the bar (mode 4).",
-        "wiimoteNoWebHid": "This browser can't connect a Wii Remote. Chrome or Edge on a computer can."
+        "wiimoteNoWebHid": "This browser can't connect a Wii Remote. Chrome or Edge on a computer can.",
+        "joyconConnect": "Connect your Joy-Cons: click, then pick one in the chooser. Then click again for the other.",
+        "joyconConnectLeft": "Right Joy-Con connected. Now the left one: click, then pick it in the chooser.",
+        "joyconConnectRight": "Left Joy-Con connected. Now the right one: click, then pick it in the chooser.",
+        "joyconBoth": "Both Joy-Cons connected.",
+        "joyconUnavailable": "Your Joy-Cons can't connect to this game: {{why}}",
+        "joyconNotTaken": "this host doesn't take Joy-Cons.",
+        "joyconRefused": "Your Joy-Con didn't connect: {{why}}",
+        "joyconNoWebHid": "This browser can't connect Joy-Cons. Chrome or Edge on a computer can."
     },
     "transport": {
         "webrtcDcUdp": "WebRTC DataChannel (UDP)",

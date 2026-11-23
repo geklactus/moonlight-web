@@ -12,11 +12,15 @@ import {
     GAME_FILTERS,
     HID_MAX_SLOTS,
     HidReportPump,
+    JOYCON_FILTERS,
+    JOYCON_REPLY_IDS,
     WIIMOTE_FILTERS,
     WIIMOTE_REPLY_IDS,
     attachMessage,
     detachMessage,
     isGameDevice,
+    isJoycon,
+    isJoyconOutput,
     isWiimote,
     isWiimoteOutput,
     modelFilters,
@@ -111,10 +115,29 @@ const fromBase64 = (text) => {
     }
 };
 
-/** A device this page may send: a game device, or a Wii Remote by its ids. */
+/** A device this page may send: a game device, or a Wii Remote or a Joy-Con by its ids. */
 function sendable(device) {
-    return isGameDevice(device.collections) || isWiimote(device);
+    return isGameDevice(device.collections) || isWiimote(device) || isJoycon(device);
 }
+
+/** Which half a Joy-Con is: 'left' or 'right'. */
+export function joyconSide(device) {
+    return device?.productId === 0x2006 ? 'left' : 'right';
+}
+
+// The pads a Joy-Con shows up as in the Gamepad API: each half, the pair Chrome
+// joins itself (057e:200e), and the names macOS gives them with no ids. While
+// one is sent as itself, all of them stay off the mapped pads, or the game
+// would get the Joy-Cons twice.
+export const JOYCON_PAD_KEYS = [
+    'usb:057e:2006',
+    'usb:057e:2007',
+    'usb:057e:200e',
+    'name:joy-con (l)',
+    'name:joy-con (r)',
+    'name:joy-con (l/r)',
+    'name:joy-con l+r',
+];
 
 /** The key GamepadManager knows the same device by. */
 export function padKeyOf(device) {
@@ -228,10 +251,15 @@ export class HidPassthrough {
         onChange = null,
         onResult = null,
         onWiimote = null,
+        onJoycon = null,
         speaker = null,
     }) {
         this._hid = hid || null;
         this._onWiimote = onWiimote;
+        // A Joy-Con's life, for the stream page to say: { type: 'attached', slot, side, name },
+        // { type: 'refused', slot, why, local? }, { type: 'cancelled' }, { type: 'detached', slot, side }.
+        this._onJoycon = onJoycon;
+        this._joyconRefused = 0; // output reports the allow-list kept from a Joy-Con
         // Where the Wii Remotes' speakers play (a WiimoteSpeakerOutput), or null
         // to leave the sound to the remotes.
         this._speaker = speaker;
@@ -274,6 +302,11 @@ export class HidPassthrough {
         return this._requests;
     }
 
+    /** Output reports the Joy-Con allow-list kept from a real Joy-Con, this stream. */
+    get joyconRefused() {
+        return this._joyconRefused;
+    }
+
     /** The Wii Remotes' speakers played here: reports played, sounds, gaps, drops; null without. */
     get speakerStats() {
         return this._speaker ? { ...this._speaker.stats } : null;
@@ -305,7 +338,10 @@ export class HidPassthrough {
         const out = new Set();
         if (this._holding) for (const k of loadForwarded(this._storage)) out.add(`usb:${k}`);
         for (const [d, e] of this._entries)
-            if (e.state === 'on' || e.state === 'pending') out.add(padKeyOf(d));
+            if (e.state === 'on' || e.state === 'pending') {
+                out.add(padKeyOf(d));
+                if (isJoycon(d)) for (const k of JOYCON_PAD_KEYS) out.add(k);
+            }
         return Array.from(out);
     }
 
@@ -321,6 +357,9 @@ export class HidPassthrough {
                 // GameStream host on its own machine, opted in): only then are
                 // its output reports written to it.
                 wiimote: !!msg.wiimote,
+                // The same for a Joy-Con: the host takes them, and the game's
+                // own driver writes to the real one (through isJoyconOutput).
+                joycon: !!msg.joycon,
                 why: String(msg.why || ''),
             };
             if (this._caps.available) {
@@ -349,6 +388,13 @@ export class HidPassthrough {
                             slot: e.slot,
                             name: device.productName || '',
                         });
+                    if (isJoycon(device))
+                        this._onJoycon?.({
+                            type: 'attached',
+                            slot: e.slot,
+                            side: joyconSide(device),
+                            name: device.productName || '',
+                        });
                     if (e.ffb) this._startFfb(e);
                     else if (this._caps?.hidpp && hasHidpp(device)) this._startRelay(device, e);
                 } else {
@@ -357,6 +403,8 @@ export class HidPassthrough {
                     e.why = String(msg.why || '');
                     if (isWiimote(device))
                         this._onWiimote?.({ type: 'refused', slot: msg.slot, why: e.why });
+                    if (isJoycon(device))
+                        this._onJoycon?.({ type: 'refused', slot: msg.slot, why: e.why });
                 }
                 if (this._onResult) this._onResult(device, !!msg.ok, e.why);
                 this._changed();
@@ -376,6 +424,14 @@ export class HidPassthrough {
                     isWiimoteOutput(msg.reportId)
                 )
                     this._writeWiimote(entry[0], entry[1], msg.reportId, fromBase64(msg.data));
+                return true;
+            }
+            if (entry && isJoycon(entry[0])) {
+                // As for the Wii Remote: only for a host that said the game
+                // drives it (hidcaps.joycon), once it took the device, and only
+                // what the allow-list lets through (_writeJoycon).
+                if (this._caps?.joycon && entry[1].state === 'on' && msg.kind === 'output')
+                    this._writeJoycon(entry[0], entry[1], msg.reportId, fromBase64(msg.data));
                 return true;
             }
             const relay = entry?.[1].relay;
@@ -419,7 +475,8 @@ export class HidPassthrough {
         if (!this._hid || !this._caps?.available) return;
         const keys = loadForwarded(this._storage);
         for (const d of await this._hid.getDevices()) {
-            if (keys.has(deviceKey(d)) && sendable(d) && !isWiimote(d)) await this._attach(d);
+            if (keys.has(deviceKey(d)) && sendable(d) && !isWiimote(d) && !isJoycon(d))
+                await this._attach(d);
         }
         this._changed();
     }
@@ -499,6 +556,86 @@ export class HidPassthrough {
         }
         this._changed();
         return [live];
+    }
+
+    /**
+     * Chrome's chooser for a Joy-Con, from a click, tap or key press: one half
+     * each time (the chooser grants one device), sent at once when the host can
+     * take it. A pair is two clicks. Not remembered among the switched-on
+     * devices: a Joy-Con is sent as itself only when the stream page asks
+     * (linkJoyconsRemembered), never to a game that wants it as a pad.
+     * @returns {Promise<HIDDevice[]>} the Joy-Cons picked and sent
+     */
+    async linkJoycon() {
+        if (!this._hid) return [];
+        if (!this._caps?.available || !this._caps?.joycon) {
+            this._onJoycon?.({ type: 'refused', slot: -1, why: this._caps?.why || '' });
+            return [];
+        }
+        let chosen = [];
+        try {
+            chosen = await this._hid.requestDevice({ filters: JOYCON_FILTERS });
+        } catch {
+            chosen = [];
+        }
+        chosen = chosen.filter(isJoycon);
+        if (!chosen.length) {
+            this._onJoycon?.({ type: 'cancelled' });
+            this._changed();
+            return [];
+        }
+        return this._attachJoycons(chosen);
+    }
+
+    /**
+     * Send the Joy-Cons the viewer already allowed, with no click: getDevices()
+     * needs no gesture, and lists the ones connected now.
+     * @returns {Promise<HIDDevice[]>} the Joy-Cons sent
+     */
+    async linkJoyconsRemembered() {
+        if (!this._hid || !this._caps?.available || !this._caps?.joycon) return [];
+        let remembered = [];
+        try {
+            remembered = (await this._hid.getDevices()).filter(isJoycon);
+        } catch {
+            return [];
+        }
+        return this._attachJoycons(remembered, { quiet: true });
+    }
+
+    /** The halves sent or being sent: 'left', 'right'. */
+    joyconSides() {
+        const out = new Set();
+        for (const [d, e] of this._entries)
+            if (isJoycon(d) && (e.state === 'on' || e.state === 'pending')) out.add(joyconSide(d));
+        return out;
+    }
+
+    // One of each half: a second left or right Joy-Con is left alone (a seat is
+    // one player's). `quiet`: one that can't be opened isn't an event (nobody
+    // asked for it just now).
+    async _attachJoycons(devices, { quiet = false } = {}) {
+        const sent = [];
+        for (const d of devices) {
+            const existing = this._entries.get(d);
+            const here = existing && (existing.state === 'on' || existing.state === 'pending');
+            if (!here && this.joyconSides().has(joyconSide(d))) continue;
+            if (!here) await this._attach(d);
+            const entry = this._entries.get(d);
+            if (entry && (entry.state === 'on' || entry.state === 'pending')) sent.push(d);
+            else if (!quiet)
+                this._onJoycon?.(
+                    entry
+                        ? { type: 'refused', slot: -1, why: entry.why, local: 'unopened' }
+                        : {
+                              type: 'refused',
+                              slot: -1,
+                              why: this._caps?.available ? '' : this._caps?.why || '',
+                          },
+                );
+        }
+        this._changed();
+        return sent;
     }
 
     /**
@@ -641,8 +778,12 @@ export class HidPassthrough {
             return;
         }
         const hidppIds = hasHidpp(device) ? hidppInputIds(device) : new Set();
-        // A Wii Remote's answers: once each, on the reliable channel.
-        const replyIds = isWiimote(device) ? WIIMOTE_REPLY_IDS : new Set();
+        // A Wii Remote's answers, and a Joy-Con's: once each, on the reliable channel.
+        const replyIds = isWiimote(device)
+            ? WIIMOTE_REPLY_IDS
+            : isJoycon(device)
+              ? JOYCON_REPLY_IDS
+              : new Set();
         // Whether the remote itself has spoken: a DolphinBar entry opens and attaches with no remote
         // synced to it (the live-pick's fallback), and the page says so until one answers.
         let heard = false;
@@ -701,6 +842,8 @@ export class HidPassthrough {
         if (!e) return;
         if (isWiimote(device) && (e.state === 'on' || e.state === 'pending'))
             this._onWiimote?.({ type: 'detached', slot: e.slot });
+        if (isJoycon(device) && (e.state === 'on' || e.state === 'pending'))
+            this._onJoycon?.({ type: 'detached', slot: e.slot, side: joyconSide(device) });
         if (tell && (e.state === 'on' || e.state === 'pending')) this._send(detachMessage(e.slot));
         this._release(device, e);
         this._entries.delete(device);
@@ -787,6 +930,38 @@ export class HidPassthrough {
     _entryBySlot(slot) {
         for (const pair of this._entries) if (pair[1].slot === slot) return pair;
         return null;
+    }
+
+    // What the game wrote to the recreated Joy-Con, to the real one: in the order
+    // it came, each write awaited before the next. Linux hands the report with
+    // its id first; WebHID takes the id apart. Only what the allow-list lets
+    // through is written (isJoyconOutput: what Eden's driver sends, never the
+    // flash write or erase, pairing or power); the rest is counted and dropped,
+    // and said once in the console for each kind.
+    _writeJoycon(device, e, reportId, bytes) {
+        const payload = bytes[0] === reportId ? bytes.subarray(1) : bytes;
+        if (!isJoyconOutput(reportId, payload)) {
+            this._joyconRefused++;
+            const kind = `${reportId}:${reportId === 0x01 && payload.length > 9 ? payload[9] : ''}`;
+            if (!e.refusedKinds) e.refusedKinds = new Set();
+            if (!e.refusedKinds.has(kind)) {
+                e.refusedKinds.add(kind);
+                console.warn(
+                    '[HID] Joy-Con write refused: report 0x' +
+                        reportId.toString(16) +
+                        (kind.endsWith(':') ? '' : ', subcommand 0x' + payload[9].toString(16)),
+                );
+            }
+            return;
+        }
+        const write = () =>
+            e.slot >= 0 && e.state === 'on' && this._entries.get(device) === e
+                ? device.sendReport(reportId, payload)
+                : undefined;
+        e.writes = (e.writes || Promise.resolve()).then(write).catch((err) => {
+            if (!e.writeFailed) console.warn('[HID] Joy-Con write:', err?.message || err);
+            e.writeFailed = true;
+        });
     }
 
     // What the game wrote to the recreated Wii Remote, to the real one: in the

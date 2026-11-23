@@ -437,6 +437,10 @@ public:
     /// real remote. Every other host's requests stay counted, never written.
     /// Announced in hidcaps as `wiimote`.
     virtual bool hidWritesWiimote() const { return false; }
+    /// The same for a Joy-Con the page sends: the game's own driver writes to
+    /// the real one, through the page's allow-list. Announced in hidcaps as
+    /// `joycon`, which also tells the page this host takes Joy-Cons at all.
+    virtual bool hidWritesJoycon() const { return false; }
     /// Whether a recreated device can carry force feedback back to the page
     /// (a PID block pid.dll drives on Windows, a uinput device whose effects
     /// the host services on Linux). Announced in hidcaps.

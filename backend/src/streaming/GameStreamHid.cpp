@@ -26,23 +26,36 @@ namespace {
 
 // What the page reads, in words a player understands (spec §7). The log gets
 // the technical reason beside them.
-const char* const kNotHere = "Wii Remotes can't be connected to this stream.";
-const char* const kNoBackend = "This host can't take a Wii Remote right now.";
-const char* const kNotReady = "The game isn't ready for a Wii Remote yet.";
-const char* const kNotAllowed = "Only Wii Remotes can be connected to this game.";
-const char* const kOneOnly = "This game takes one Wii Remote per player for now.";
+const char* const kNotHere = "A Wii Remote or Joy-Cons can't be connected to this stream.";
+const char* const kNoBackend = "This host can't take a Wii Remote or Joy-Cons right now.";
+const char* const kNotReady = "The game isn't ready for a Wii Remote or Joy-Cons yet.";
+const char* const kNotAllowed = "Only Wii Remotes and Joy-Cons can be connected to this game.";
+const char* const kOneOnly = "This game takes one Wii Remote or one pair of Joy-Cons per player.";
 
 } // namespace
 
 const std::vector<GameStreamHid::Model>& GameStreamHid::allowList()
 {
     // A Wii Remote reports only when something changes: never put to rest, a
-    // made-up report would be a false answer to the game (spec §4).
+    // made-up report would be a false answer to the game (spec §4). The same
+    // for a Joy-Con: its reports carry a counter and its motion, which the
+    // game's driver reads as the Joy-Con's own.
     static const std::vector<Model> kList = {
-        {0x057e, 0x0306, "Nintendo RVL-CNT-01 (Wii Remote)", false},
-        {0x057e, 0x0330, "Nintendo RVL-CNT-01-TR (Wii Remote Plus)", false},
+        {0x057e, 0x0306, "Nintendo RVL-CNT-01 (Wii Remote)", false, Kind::Wiimote},
+        {0x057e, 0x0330, "Nintendo RVL-CNT-01-TR (Wii Remote Plus)", false, Kind::Wiimote},
+        {0x057e, 0x2006, "Joy-Con (L)", false, Kind::JoyconLeft},
+        {0x057e, 0x2007, "Joy-Con (R)", false, Kind::JoyconRight},
     };
     return kList;
+}
+
+bool GameStreamHid::fits(Kind kind, const std::vector<Kind>& have)
+{
+    if (have.empty()) return true;
+    // A Wii Remote is alone; a Joy-Con joins only its other half.
+    if (kind == Kind::Wiimote || have.size() > 1) return false;
+    return (kind == Kind::JoyconLeft && have[0] == Kind::JoyconRight) ||
+           (kind == Kind::JoyconRight && have[0] == Kind::JoyconLeft);
 }
 
 const GameStreamHid::Model* GameStreamHid::allowed(uint16_t vendorId, uint16_t productId)
@@ -152,8 +165,12 @@ QString GameStreamHid::attach(int slot, const QJsonObject& message)
                              << "(not on the allow-list)";
         return QString::fromLatin1(kNotAllowed);
     }
-    const bool sameSlot = m_slots.count(slot) > 0;
-    if (!sameSlot && static_cast<int>(m_slots.size()) >= kMaxDevices)
+    // The slot's own device sent again is the same one; anything else must fit
+    // beside what the other slots hold.
+    std::vector<Kind> others;
+    for (const auto& [s, kind] : m_slots)
+        if (s != slot) others.push_back(kind);
+    if (static_cast<int>(others.size()) >= kMaxDevices || !fits(model->kind, others))
         return QString::fromLatin1(kOneOnly);
 
     QString error;
@@ -174,7 +191,7 @@ QString GameStreamHid::attach(int slot, const QJsonObject& message)
         qWarning().noquote() << "[GameStreamHid] device refused:" << QString::fromStdString(why);
         return QString::fromStdString(why);
     }
-    m_slots.insert(slot);
+    m_slots[slot] = model->kind;
     qInfo().noquote() << "[GameStreamHid] slot" << slot << QString::fromLatin1(model->name) << "as"
                       << QString::fromStdString(device.uniq);
     return {};

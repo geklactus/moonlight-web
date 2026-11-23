@@ -184,6 +184,8 @@ public:
     /// uhid, session id): the page may then write the game's reports to the
     /// real Wii Remote.
     bool hidWritesWiimote() const override;
+    /// The same passthrough takes Joy-Cons (GameStreamHid's allow-list).
+    bool hidWritesJoycon() const override;
 
     // ── Input watchdog (dead-man switch) ────────────────────────────────────
     //
