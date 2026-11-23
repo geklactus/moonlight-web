@@ -66,6 +66,95 @@ export function isWiimoteOutput(reportId) {
     return reportId >= 0x10 && reportId <= 0x1a;
 }
 
+// The Joy-Cons, by their ids: sent as themselves so the game's own Joy-Con
+// driver (Eden's, on Wolf on LOLA) runs them, with motion, rumble and lights.
+// The Pro Controller (057e:2009) is not here yet: the host's own kernel would
+// take a copy of it (geklactus/lola docs/joycon/plan.md).
+export const JOYCON_FILTERS = [
+    { vendorId: 0x057e, productId: 0x2006 }, // Joy-Con (L)
+    { vendorId: 0x057e, productId: 0x2007 }, // Joy-Con (R)
+];
+
+/** True for a Joy-Con (either half), from its ids. */
+export function isJoycon(device) {
+    return JOYCON_FILTERS.some(
+        (f) => f.vendorId === device?.vendorId && f.productId === device?.productId,
+    );
+}
+
+// A Joy-Con's answer to a subcommand (0x21), the one reply to one request: on
+// the reliable channel as hidreply. Its full reports (0x30, and 0x31 with the
+// MCU's data) and simple ones (0x3f) carry whole states and go on 'hid'.
+export const JOYCON_REPLY_IDS = new Set([0x21]);
+
+// What the game may write to a real Joy-Con: what Eden's driver sends and no
+// more (src/input_common/helpers/joycon_driver.cpp and joycon_protocol/,
+// aoede/eden a62f75a; the table is in geklactus/lola docs/joycon/plan.md).
+// Never the flash write or erase (0x11, 0x12), the pairing and power commands
+// (0x01, 0x06, 0x07), or anything else: a host that could write the flash
+// could rewrite a Joy-Con's calibration.
+const JOYCON_RUMBLE_AND_SUBCOMMAND = 0x01;
+const JOYCON_RUMBLE = 0x10;
+const JOYCON_MCU_DATA = 0x11;
+const JOYCON_SUBCOMMAND_AT = 9; // after the counter (1) and the rumble data (8)
+const JOYCON_LOW_POWER = 0x08;
+const JOYCON_FLASH_READ = 0x10;
+const JOYCON_SUBCOMMANDS = new Set([
+    0x02, // device info
+    0x03, // report mode
+    0x04, // how long the trigger buttons were held
+    JOYCON_LOW_POWER, // with the argument 00 only (below)
+    JOYCON_FLASH_READ, // in the factory and user ranges only (below)
+    0x21, // the MCU's configuration (NFC, the IR camera, the Ring-Con)
+    0x22, // the MCU's state
+    0x30, // the player lights
+    0x38, // the Home light
+    0x40, // motion on or off
+    0x41, // motion's sensitivity
+    0x48, // vibration on or off
+    0x59, // the Ring-Con: what is on the rail
+    0x5a, // the Ring-Con: polling
+    0x5c, // the Ring-Con: format
+]);
+// The flash a read may reach: the factory block (serial, device type, colours,
+// calibration) and the user's calibration. The pairing information (0x2000)
+// and everything else stay out of reach.
+const JOYCON_FLASH_RANGES = [
+    [0x6000, 0x60ff],
+    [0x8000, 0x80ff],
+];
+const JOYCON_FLASH_READ_MAX = 0x1d; // the most one read returns
+
+/**
+ * True when the game may write this output report to a real Joy-Con.
+ * @param {number} reportId
+ * @param {ArrayLike<number>} bytes the report after its id
+ */
+export function isJoyconOutput(reportId, bytes) {
+    if (reportId === JOYCON_RUMBLE || reportId === JOYCON_MCU_DATA) return true;
+    if (reportId !== JOYCON_RUMBLE_AND_SUBCOMMAND) return false;
+    if (!bytes || bytes.length <= JOYCON_SUBCOMMAND_AT) return false;
+    const sub = bytes[JOYCON_SUBCOMMAND_AT];
+    if (!JOYCON_SUBCOMMANDS.has(sub)) return false;
+    const arg = JOYCON_SUBCOMMAND_AT + 1;
+    if (sub === JOYCON_LOW_POWER) return bytes.length > arg && bytes[arg] === 0x00;
+    if (sub === JOYCON_FLASH_READ) {
+        if (bytes.length < arg + 5) return false;
+        // The address, 32 bits little-endian, then how many bytes.
+        const address =
+            bytes[arg] +
+            bytes[arg + 1] * 0x100 +
+            bytes[arg + 2] * 0x10000 +
+            bytes[arg + 3] * 0x1000000;
+        const size = bytes[arg + 4];
+        if (size < 1 || size > JOYCON_FLASH_READ_MAX) return false;
+        return JOYCON_FLASH_RANGES.some(
+            ([from, to]) => address >= from && address + size - 1 <= to,
+        );
+    }
+    return true;
+}
+
 const ITEM_FIELDS = [
     'isAbsolute',
     'isArray',

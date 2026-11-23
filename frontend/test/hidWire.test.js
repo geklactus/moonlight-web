@@ -17,9 +17,13 @@ import {
     detachMessage,
     encodeReportFrame,
     isGameDevice,
+    isJoycon,
+    isJoyconOutput,
     isWiimote,
     isWiimoteOutput,
     plainCollection,
+    JOYCON_FILTERS,
+    JOYCON_REPLY_IDS,
     WIIMOTE_FILTERS,
     WIIMOTE_REPLY_IDS,
 } from '../js/hid/hidWire.js';
@@ -101,6 +105,106 @@ describe('hidWire (HID passthrough, P2)', () => {
         expect(Array.from(WIIMOTE_REPLY_IDS)).toEqual([0x20, 0x21, 0x22]);
         expect(isWiimoteOutput(0x10) && isWiimoteOutput(0x1a)).toBe(true);
         expect(isWiimoteOutput(0x0f) || isWiimoteOutput(0x1b) || isWiimoteOutput(0x30)).toBe(false);
+    });
+
+    it('knows a Joy-Con by its ids, and its answers by report id', () => {
+        expect(JOYCON_FILTERS).toEqual([
+            { vendorId: 0x057e, productId: 0x2006 },
+            { vendorId: 0x057e, productId: 0x2007 },
+        ]);
+        expect(isJoycon({ vendorId: 0x057e, productId: 0x2006 })).toBe(true);
+        expect(isJoycon({ vendorId: 0x057e, productId: 0x2007 })).toBe(true);
+        expect(isJoycon({ vendorId: 0x057e, productId: 0x2009 })).toBe(false); // Switch Pro: not yet
+        expect(isJoycon({ vendorId: 0x057e, productId: 0x200e })).toBe(false); // Chrome's joined pad
+        expect(isJoycon({ vendorId: 0x057e, productId: 0x0306 })).toBe(false); // a Wii Remote
+        expect(isJoycon({ vendorId: 0x046d, productId: 0x2006 })).toBe(false);
+        expect(isJoycon(undefined)).toBe(false);
+        // Only the subcommand's answer is a reply; the states (0x30, 0x31, 0x3f) are not.
+        expect(Array.from(JOYCON_REPLY_IDS)).toEqual([0x21]);
+    });
+
+    // An output report 0x01 after its id: counter, eight bytes of rumble, the subcommand, its arguments.
+    const subcommand = (sub, ...args) =>
+        new Uint8Array([0x05, 0, 1, 0x40, 0x40, 0, 1, 0x40, 0x40, sub, ...args]);
+    const flashRead = (address, size) =>
+        subcommand(
+            0x10,
+            address & 0xff,
+            (address >> 8) & 0xff,
+            (address >> 16) & 0xff,
+            (address >>> 24) & 0xff,
+            size,
+        );
+
+    it('lets the game write to a Joy-Con what Eden sends, and no more', () => {
+        // Rumble alone, and data for the MCU (NFC, the IR camera).
+        expect(isJoyconOutput(0x10, new Uint8Array(9))).toBe(true);
+        expect(isJoyconOutput(0x11, new Uint8Array(47))).toBe(true);
+        // Every subcommand Eden's driver uses.
+        for (const sub of [
+            0x02, 0x03, 0x04, 0x21, 0x22, 0x30, 0x38, 0x40, 0x41, 0x48, 0x59, 0x5a, 0x5c,
+        ])
+            expect(isJoyconOutput(0x01, subcommand(sub, 0x01)), sub.toString(16)).toBe(true);
+        // The flash write and erase, pairing, power, the MCU's reset, and what Eden never sends.
+        for (const sub of [
+            0x00, 0x01, 0x05, 0x06, 0x07, 0x11, 0x12, 0x20, 0x31, 0x42, 0x43, 0x50, 0x58, 0x5b,
+            0xff,
+        ])
+            expect(isJoyconOutput(0x01, subcommand(sub, 0x00)), sub.toString(16)).toBe(false);
+        // Other reports: the firmware update's, the USB commands', anything else.
+        for (const id of [0x00, 0x02, 0x03, 0x12, 0x21, 0x30, 0x80])
+            expect(isJoyconOutput(id, subcommand(0x02)), id.toString(16)).toBe(false);
+        // A report too short to hold a subcommand, or none at all.
+        expect(isJoyconOutput(0x01, new Uint8Array(9))).toBe(false);
+        expect(isJoyconOutput(0x01, undefined)).toBe(false);
+        // A plain array reads the same as a Uint8Array.
+        expect(isJoyconOutput(0x01, Array.from(subcommand(0x30, 0x01)))).toBe(true);
+    });
+
+    it('lets "low power mode" through only as off', () => {
+        expect(isJoyconOutput(0x01, subcommand(0x08, 0x00))).toBe(true); // what Eden sends at set-up
+        expect(isJoyconOutput(0x01, subcommand(0x08, 0x01))).toBe(false);
+        expect(isJoyconOutput(0x01, subcommand(0x08))).toBe(false); // no argument: not known to be off
+    });
+
+    it('keeps flash reads to the factory block and the user calibration', () => {
+        // What Eden reads: serial, device type, motion and stick calibration, colours; the user's.
+        for (const [address, size] of [
+            [0x6000, 16],
+            [0x6012, 1],
+            [0x6020, 24],
+            [0x603d, 9],
+            [0x6046, 9],
+            [0x6050, 12],
+            [0x8010, 2],
+            [0x8012, 9],
+            [0x801b, 2],
+            [0x801d, 9],
+            [0x8026, 2],
+            [0x8028, 24],
+            [0x60e3, 0x1d], // the last 29 bytes of the factory block
+        ])
+            expect(isJoyconOutput(0x01, flashRead(address, size)), address.toString(16)).toBe(true);
+        for (const [address, size] of [
+            [0x2000, 0x1d], // the pairing information
+            [0x0000, 1],
+            [0x0015, 6],
+            [0x5000, 1],
+            [0x5fff, 2], // starts before the block
+            [0x60e4, 0x1d], // runs past its end
+            [0x6100, 1],
+            [0x7fff, 1],
+            [0x8100, 1],
+            [0x00016000, 16], // the same low half, another address
+            [0x80006000, 16],
+            [0x6000, 0], // nothing asked for
+            [0x6000, 0x1e], // more than one read returns
+        ])
+            expect(isJoyconOutput(0x01, flashRead(address, size)), address.toString(16)).toBe(
+                false,
+            );
+        // A read cut short of its size.
+        expect(isJoyconOutput(0x01, subcommand(0x10, 0x00, 0x60, 0x00, 0x00))).toBe(false);
     });
 
     it('writes the attach and detach messages', () => {
