@@ -23,9 +23,9 @@
 #include <QString>
 
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <mutex>
-#include <set>
 #include <string>
 #include <vector>
 
@@ -60,6 +60,15 @@
 class GameStreamHid
 {
 public:
+    /// What a model is to the player holding it: a Wii Remote is one whole
+    /// controller; a Joy-Con is one half of a pair.
+    enum class Kind
+    {
+        Wiimote,
+        JoyconLeft,
+        JoyconRight
+    };
+
     /// A device model this passthrough recreates.
     struct Model
     {
@@ -68,9 +77,13 @@ public:
         const char* name;
         /// Whether a silence puts it back to rest (HidDeviceInfo::restWhenSilent).
         bool restWhenSilent;
+        Kind kind;
     };
 
-    /// What it recreates, and nothing else: Wii Remotes for now.
+    /// What it recreates, and nothing else: Wii Remotes and Joy-Cons. Not the
+    /// Switch Pro Controller: this machine's own kernel driver (hid-nintendo)
+    /// would take a copy of it on any bus it matches (geklactus/lola
+    /// docs/joycon/plan.md).
     static const std::vector<Model>& allowList();
     static const Model* allowed(uint16_t vendorId, uint16_t productId);
 
@@ -78,8 +91,11 @@ public:
     static constexpr const char* kPhys = "moonlightweb/wolf";
     static std::string uniqFor(const QString& sessionId, int slot);
 
-    /// One device per stream for now (spec §2.1); four with lobbies, later.
-    static constexpr int kMaxDevices = 1;
+    /// What one player holds (spec §2.1): one Wii Remote, or one pair of
+    /// Joy-Cons, a left and a right. Four players with lobbies, later.
+    static constexpr int kMaxDevices = 2;
+    /// Whether a device of `kind` may join the ones a stream already has.
+    static bool fits(Kind kind, const std::vector<Kind>& have);
 
     using Factory = mw::native::HidPassthrough::Factory;
     using RequestSink = mw::native::HidPassthrough::RequestSink;
@@ -132,6 +148,7 @@ private:
     bool m_enabled = false;
     bool m_hostIsSelf = false;
     QString m_sessionId;
-    std::set<int> m_slots;
+    // Each slot in use, and what is in it.
+    std::map<int, Kind> m_slots;
     std::unique_ptr<mw::native::HidPassthrough> m_hid; // made at the first attach
 };

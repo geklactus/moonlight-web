@@ -193,7 +193,7 @@ void run_gamestream_hid_tests()
         r.backendWhy = "/dev/uhid is not writable by this user (udev rule missing)";
         r.ready();
         CHECK(r.hid.unavailableReason() ==
-              QStringLiteral("This host can't take a Wii Remote right now."));
+              QStringLiteral("This host can't take a Wii Remote or Joy-Cons right now."));
         CHECK(!r.hid.attach(0, kWiimote).isEmpty());
         CHECK(r.log.created.empty());
     }
@@ -212,10 +212,13 @@ void run_gamestream_hid_tests()
         CHECK(r.hid.attach(0, kWiimote).isEmpty());
     }
 
-    SECTION("GameStreamHid — the allow-list: Wii Remotes only");
+    SECTION("GameStreamHid — the allow-list: Wii Remotes and Joy-Cons only");
     {
         CHECK(GameStreamHid::allowed(0x057e, 0x0306) != nullptr);
         CHECK(GameStreamHid::allowed(0x057e, 0x0330) != nullptr);
+        CHECK(GameStreamHid::allowed(0x057e, 0x2006) != nullptr); // Joy-Con (L)
+        CHECK(GameStreamHid::allowed(0x057e, 0x2007) != nullptr); // Joy-Con (R)
+        CHECK(GameStreamHid::allowed(0x057e, 0x200e) == nullptr); // the charging grip's ids
         CHECK(GameStreamHid::allowed(0x045e, 0x028e) == nullptr); // an Xbox 360 pad
         CHECK(GameStreamHid::allowed(0x057e, 0x2009) == nullptr); // a Switch Pro Controller
         for (const GameStreamHid::Model& m : GameStreamHid::allowList())
@@ -224,10 +227,62 @@ void run_gamestream_hid_tests()
         Rig r;
         r.ready();
         CHECK(r.hid.attach(0, attachMessage(0x045e, 0x028e)) ==
-              QStringLiteral("Only Wii Remotes can be connected to this game."));
+              QStringLiteral("Only Wii Remotes and Joy-Cons can be connected to this game."));
         CHECK(r.log.created.empty());
         CHECK(r.hid.attach(0, attachMessage(0x057e, 0x0330)).isEmpty());
         CHECK_EQ(r.log.created.size(), static_cast<size_t>(1));
+    }
+
+    SECTION("GameStreamHid — a pair of Joy-Cons: one of each half, and nothing beside them");
+    {
+        using Kind = GameStreamHid::Kind;
+        CHECK(GameStreamHid::fits(Kind::Wiimote, {}));
+        CHECK(GameStreamHid::fits(Kind::JoyconLeft, {}));
+        CHECK(GameStreamHid::fits(Kind::JoyconLeft, {Kind::JoyconRight}));
+        CHECK(GameStreamHid::fits(Kind::JoyconRight, {Kind::JoyconLeft}));
+        CHECK(!GameStreamHid::fits(Kind::JoyconLeft, {Kind::JoyconLeft}));
+        CHECK(!GameStreamHid::fits(Kind::JoyconRight, {Kind::JoyconRight}));
+        CHECK(!GameStreamHid::fits(Kind::Wiimote, {Kind::Wiimote}));
+        CHECK(!GameStreamHid::fits(Kind::Wiimote, {Kind::JoyconLeft}));
+        CHECK(!GameStreamHid::fits(Kind::JoyconLeft, {Kind::Wiimote}));
+        CHECK(!GameStreamHid::fits(Kind::JoyconLeft, {Kind::JoyconLeft, Kind::JoyconRight}));
+
+        const QString oneOnly =
+            QStringLiteral("This game takes one Wii Remote or one pair of Joy-Cons per player.");
+        const QJsonObject left = attachMessage(0x057e, 0x2006);
+        const QJsonObject right = attachMessage(0x057e, 0x2007);
+        Rig r;
+        r.ready(QStringLiteral("12345678901234567890"));
+        CHECK(r.hid.attach(0, left).isEmpty());
+        CHECK(r.hid.attach(1, right).isEmpty());
+        CHECK_EQ(r.log.created.size(), static_cast<size_t>(2));
+        CHECK(r.log.created[0].uniq == "wolf:12345678901234567890:0");
+        CHECK(r.log.created[1].uniq == "wolf:12345678901234567890:1");
+        CHECK_EQ(r.log.created[0].productId, static_cast<uint16_t>(0x2006));
+        CHECK_EQ(r.log.created[1].productId, static_cast<uint16_t>(0x2007));
+        CHECK(r.log.created[1].phys == "moonlightweb/wolf");
+
+        // A second left one, a third device, a Wii Remote: none fits.
+        CHECK(r.hid.attach(2, left) == oneOnly);
+        CHECK(r.hid.attach(2, right) == oneOnly);
+        CHECK(r.hid.attach(2, kWiimote) == oneOnly);
+        CHECK_EQ(r.log.created.size(), static_cast<size_t>(2));
+
+        // The left one sent again on its own slot is the same one.
+        CHECK(r.hid.attach(0, left).isEmpty());
+        CHECK_EQ(r.log.created.size(), static_cast<size_t>(2));
+        CHECK_EQ(r.log.destroyed, 0);
+
+        // It goes: another left one may take its place, on any slot; a second right one may not.
+        r.hid.detach(0);
+        CHECK_EQ(r.log.destroyed, 1);
+        CHECK(r.hid.attach(2, right) == oneOnly);
+        CHECK(r.hid.attach(2, left).isEmpty());
+        CHECK_EQ(r.log.created.size(), static_cast<size_t>(3));
+        CHECK(r.log.created[2].uniq == "wolf:12345678901234567890:2");
+
+        r.hid.detachAll();
+        CHECK_EQ(r.log.destroyed, 3);
     }
 
     SECTION("GameStreamHid — the device is tagged with the host's session and its slot");
@@ -279,9 +334,12 @@ void run_gamestream_hid_tests()
         CHECK_EQ(r.log.created.size(), static_cast<size_t>(1));
         CHECK_EQ(r.log.destroyed, 0);
 
-        // One device per stream: a second one on another slot is refused.
-        CHECK(r.hid.attach(1, kWiimote) ==
-              QStringLiteral("This game takes one Wii Remote per player for now."));
+        // One Wii Remote per stream: a second one on another slot is refused,
+        // and so is a Joy-Con beside it.
+        const QString oneOnly =
+            QStringLiteral("This game takes one Wii Remote or one pair of Joy-Cons per player.");
+        CHECK(r.hid.attach(1, kWiimote) == oneOnly);
+        CHECK(r.hid.attach(1, attachMessage(0x057e, 0x2006)) == oneOnly);
         CHECK_EQ(r.log.created.size(), static_cast<size_t>(1));
 
         // Detached: removed, and the slot is free again.
