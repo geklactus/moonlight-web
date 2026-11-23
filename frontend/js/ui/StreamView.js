@@ -41,7 +41,7 @@ import { devicePixelSize } from '../util/StreamResolution.js';
 import { PeriodicStallDetector } from '../stream/PeriodicStallDetector.js';
 import { GamepadManager } from '../stream/GamepadManager.js';
 import { HidPassthrough } from '../hid/HidPassthrough.js';
-import { isWiimote } from '../hid/hidWire.js';
+import { isJoycon, isWiimote } from '../hid/hidWire.js';
 import { WiimoteSpeakerOutput } from '../hid/wiimoteSpeaker.js';
 import { GamepadRemapDialog } from './GamepadRemapDialog.js';
 import { padKey, padName } from '../stream/gamepadMapping.js';
@@ -176,6 +176,7 @@ import { UltraPlayer, presentMode, ultraPlayerSupported } from '../stream/ultra/
 
 // How long the connected remote's line shows before it fades.
 const WIIMOTE_STATUS_TOAST_MS = 6000;
+const JOYCON_STATUS_TOAST_MS = 6000;
 // The remote's state, told to the page around the stream (see _tellWiimote).
 export const WIIMOTE_EVENT = 'mw-wiimote';
 
@@ -191,6 +192,14 @@ export const WIIMOTE_EVENT = 'mw-wiimote';
 const LAUNCH_WIIMOTE_HERE = (() => {
     try {
         return new URLSearchParams(location.search).get('wiimote') === 'here';
+    } catch {
+        return false;
+    }
+})();
+// The same for "Joy-Cons at this computer" (?joycon=here), read as early.
+const LAUNCH_JOYCON_HERE = (() => {
+    try {
+        return new URLSearchParams(location.search).get('joycon') === 'here';
     } catch {
         return false;
     }
@@ -8120,11 +8129,13 @@ export class StreamView {
                 this._gamepadManager?.setExcluded(this._hidPassthrough?.excludedKeys() || []),
             onResult: (device, ok, why) => {
                 if (isWiimote(device)) return; // the Wii Remote's own line says it (_onWiimoteEvent)
+                if (isJoycon(device)) return; // and the Joy-Cons' (_onJoyconEvent)
                 const name = device.productName || '';
                 if (ok) Toast.info(t('stream.hidForwarded', { name }), { durationMs: 5000 });
                 else Toast.warning(t('stream.hidRefused', { name, why }), { durationMs: 8000 });
             },
             onWiimote: (ev) => this._onWiimoteEvent(ev),
+            onJoycon: (ev) => this._onJoyconEvent(ev),
             // A Wii Remote's speaker plays here, at the stream's own volume.
             speaker: new WiimoteSpeakerOutput({ level: () => streamVolume.outputLevel() }),
         });
@@ -8219,6 +8230,116 @@ export class StreamView {
                 },
             },
         });
+    }
+
+    /** The launcher asked for Joy-Cons at this computer (lola play.js passes ?joycon=here). */
+    _joyconLocalPick() {
+        if (LAUNCH_JOYCON_HERE) return true;
+        try {
+            return new URLSearchParams(location.search).get('joycon') === 'here';
+        } catch {
+            return false;
+        }
+    }
+
+    /**
+     * When the player chose "Joy-Cons at this computer" in the launcher, offer to connect them here,
+     * as a Wii Remote is offered (_offerWiimote). The Joy-Cons already allowed are sent with no click;
+     * for a half still missing, a sticky banner's one button opens Chrome's chooser, one half a click,
+     * and the banner says which half is still to come.
+     */
+    async _offerJoycon() {
+        if (this._quitting || !this._joyconLocalPick()) return;
+        if (!navigator.hid) {
+            this._sayJoycon(t('stream.joyconNoWebHid'), 'unavailable');
+            return;
+        }
+        const hp = this._hidPassthrough;
+        if (!hp) return;
+        const caps = hp.caps;
+        if (!caps) return; // the host hasn't said yet: its hidcaps calls this again
+        if (!caps.available || !caps.joycon) {
+            this._joyconConnectToast?.dismiss();
+            this._joyconConnectToast = null;
+            this._joyconOffered = false;
+            const why = caps.available
+                ? t('stream.joyconNotTaken')
+                : caps.why || t('stream.wiimoteNoReason');
+            this._sayJoycon(t('stream.joyconUnavailable', { why }), 'unavailable');
+            return;
+        }
+        if (this._joyconWhyKind === 'unavailable') this._sayJoycon(null);
+        if (hp.joyconSides().size >= 2) {
+            // Nothing is missing: the banner for the second half goes.
+            this._joyconConnectToast?.dismiss();
+            this._joyconConnectToast = null;
+            return;
+        }
+        if (this._joyconOffered) return;
+        this._joyconOffered = true;
+        await hp.linkJoyconsRemembered(); // each one sent says so through onJoycon('attached')
+        if (hp !== this._hidPassthrough) return;
+        const have = hp.joyconSides();
+        this._joyconConnectToast?.dismiss();
+        this._joyconConnectToast = null;
+        if (have.size >= 2) {
+            this._joyconOffered = false;
+            return;
+        }
+        const words = !have.size
+            ? 'stream.joyconConnect'
+            : have.has('left')
+              ? 'stream.joyconConnectRight'
+              : 'stream.joyconConnectLeft';
+        this._joyconConnectToast = Toast.info(t(words), {
+            sticky: true,
+            action: {
+                label: t('stream.wiimoteConnectAction'),
+                onClick: () => {
+                    this._joyconOffered = false;
+                    this._sayJoycon(null);
+                    // A pick that didn't connect, or none, comes back as 'refused' or 'cancelled',
+                    // which say so and offer Connect again.
+                    hp.linkJoycon();
+                },
+            },
+        });
+    }
+
+    /** The Joy-Cons' one line of trouble, replaced each time; null clears it (as _sayWiimote). */
+    _sayJoycon(message, kind = 'refused') {
+        if (message === this._joyconWhyText) return;
+        this._joyconWhyToast?.dismiss();
+        this._joyconWhyToast = message ? Toast.warning(message, { sticky: true }) : null;
+        this._joyconWhyText = message || null;
+        this._joyconWhyKind = message ? kind : null;
+    }
+
+    /** Attach / refusal / detach from the passthrough, turned into the banner's state. */
+    _onJoyconEvent(ev) {
+        const sides = this._hidPassthrough?.joyconSides() || new Set();
+        if (ev.type === 'attached') {
+            this._sayJoycon(null);
+            this._joyconStatusToast?.dismiss();
+            this._joyconStatusToast =
+                sides.size >= 2
+                    ? Toast.info(t('stream.joyconBoth'), { durationMs: JOYCON_STATUS_TOAST_MS })
+                    : null;
+        } else if (ev.type === 'refused') {
+            const why =
+                ev.local === 'unopened'
+                    ? t('stream.wiimoteNotOpened')
+                    : ev.why || t('stream.wiimoteNoReason');
+            this._sayJoycon(t('stream.joyconRefused', { why }), 'refused');
+        } else if (ev.type === 'detached') {
+            this._joyconStatusToast?.dismiss();
+            this._joyconStatusToast = null;
+        } else if (ev.type !== 'cancelled') {
+            return;
+        }
+        // Whatever happened, the banner is drawn again for what is still missing.
+        this._joyconOffered = false;
+        this._offerJoycon();
     }
 
     /**
@@ -8344,6 +8465,7 @@ export class StreamView {
                 // Without WebHID there is no passthrough object; _offerWiimote still says so.
                 this._offerHid();
                 this._offerWiimote();
+                this._offerJoycon();
             }
             return;
         }
@@ -10376,6 +10498,12 @@ export class StreamView {
         this._wiimoteConnectToast = this._wiimoteStatusToast = this._wiimoteWhyToast = null;
         this._wiimoteWhyText = this._wiimoteWhyKind = null;
         this._wiimoteConnected = this._wiimoteOffered = this._wiimoteHeard = false;
+        this._joyconConnectToast?.dismiss();
+        this._joyconStatusToast?.dismiss();
+        this._joyconWhyToast?.dismiss();
+        this._joyconConnectToast = this._joyconStatusToast = this._joyconWhyToast = null;
+        this._joyconWhyText = this._joyconWhyKind = null;
+        this._joyconOffered = false;
         document.removeEventListener('keydown', this._onKeyDown);
         if (this._onNetworkChange) {
             window.removeEventListener('online', this._onNetworkChange);

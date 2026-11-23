@@ -946,7 +946,15 @@
         "wiimoteNotOpened": "le navigateur n'a pas pu l'ouvrir. Un autre onglet ou une autre application l'utilise-t-il ?",
         "wiimoteNoReason": "l'hôte n'a pas dit pourquoi.",
         "wiimoteWaiting": "Connectée, mais aucune Wiimote n'a encore répondu : appuyez sur un bouton de la manette. Avec une DolphinBar, la Wiimote doit être synchronisée avec la barre (mode 4).",
-        "wiimoteNoWebHid": "Ce navigateur ne peut pas connecter de Wiimote. Chrome ou Edge sur un ordinateur le peuvent."
+        "wiimoteNoWebHid": "Ce navigateur ne peut pas connecter de Wiimote. Chrome ou Edge sur un ordinateur le peuvent.",
+        "joyconConnect": "Connectez vos Joy-Con : cliquez, puis choisissez-en un. Cliquez ensuite à nouveau pour l'autre.",
+        "joyconConnectLeft": "Joy-Con droit connecté. Au tour du gauche : cliquez, puis choisissez-le.",
+        "joyconConnectRight": "Joy-Con gauche connecté. Au tour du droit : cliquez, puis choisissez-le.",
+        "joyconBoth": "Les deux Joy-Con sont connectés.",
+        "joyconUnavailable": "Vos Joy-Con ne peuvent pas se connecter à ce jeu : {{why}}",
+        "joyconNotTaken": "cet hôte ne prend pas les Joy-Con.",
+        "joyconRefused": "Votre Joy-Con ne s'est pas connecté : {{why}}",
+        "joyconNoWebHid": "Ce navigateur ne peut pas connecter de Joy-Con. Chrome ou Edge sur un ordinateur le peuvent."
     },
     "transport": {
         "webrtcDcUdp": "WebRTC DataChannel (UDP)",
