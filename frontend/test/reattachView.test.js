@@ -69,6 +69,7 @@ function reattachView(overrides = {}) {
         _firstFrameRendered: true,
         _quitting: false,
         _manualQuitting: false,
+        _leaving: false,
         _takenOver: false,
         _standby: false,
         _playerMode: false,
@@ -388,6 +389,25 @@ describe('StreamView: a link that goes on the DataChannel transport', () => {
         sv.handleVideoFrame(new Uint8Array(4), true, 0, 9001);
         expect(sv.setStatus).toHaveBeenLastCalledWith('live', 'Live');
         expect(sv._reattachPictureBack).toBe(null);
+    });
+
+    it('lets the link go once the page is leaving: its quit beacon ended the stream', () => {
+        const sv = dcView({ _leaving: true });
+        loseLink(sv.webrtc);
+        vi.advanceTimersByTime(REATTACH_WINDOW_MS * 2);
+        expect(built).toHaveLength(0);
+        expect(sv._reattaching).toBe(false);
+        expect(sv.setStatus).not.toHaveBeenCalled();
+        expect(sv.onLinkLost).not.toHaveBeenCalled();
+        expect(sv.quit).not.toHaveBeenCalled();
+    });
+
+    it('builds no new transport when the page starts leaving mid-reattach', () => {
+        const sv = dcView();
+        loseLink(sv.webrtc);
+        sv._leaving = true; // beforeunload, before the build's turn came
+        vi.advanceTimersByTime(0);
+        expect(built).toHaveLength(0);
     });
 
     it('never reattaches the wss transport', () => {
