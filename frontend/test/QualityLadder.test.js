@@ -15,10 +15,12 @@
 import { describe, it, expect } from 'vitest';
 import {
     degradeRung,
-    pagePolicy,
-    flapVerdict,
     deviceRelief,
+    farBelowCap,
     FLAP_WINDOW_MS,
+    flapVerdict,
+    pagePolicy,
+    UNDER_CAP_SHARE,
 } from '../js/stream/QualityLadder.js';
 
 const base = {
@@ -128,5 +130,25 @@ describe('deviceRelief', () => {
 
     it('has nothing left at 720p and 30 fps', () => {
         expect(deviceRelief({ curFps: 30, curHeight: 720, keepsSize: false })).toBe(null);
+    });
+});
+
+describe('farBelowCap', () => {
+    it('is a stream sending under a quarter of its cap', () => {
+        // 24/11/2026, 00:16: a paused game at ~20 kbit/s of a 20 Mbit/s cap.
+        expect(farBelowCap(20, 20000)).toBe(true);
+        expect(farBelowCap(20000 * UNDER_CAP_SHARE - 1, 20000)).toBe(true);
+    });
+
+    it('is not a stream at a quarter of its cap or more', () => {
+        expect(farBelowCap(20000 * UNDER_CAP_SHARE, 20000)).toBe(false);
+        expect(farBelowCap(14000, 20000)).toBe(false); // that session, in play
+    });
+
+    it('is not a stream nobody measured', () => {
+        for (const sent of [null, undefined, NaN, -1, Infinity]) {
+            expect(farBelowCap(sent, 20000), String(sent)).toBe(false);
+        }
+        expect(farBelowCap(20, 0)).toBe(false);
     });
 });

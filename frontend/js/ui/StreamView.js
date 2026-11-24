@@ -172,7 +172,12 @@ import { StreamViewKeyboard } from './StreamViewKeyboard.js';
 import { StreamViewTouch } from './StreamViewTouch.js';
 import { StreamViewFullscreen, EXIT_FULLSCREEN_EVENT } from './StreamViewFullscreen.js';
 import { flushClientLog, serverDiag } from '../util/ClientLog.js';
-import { CongestionMonitor, isDeviceReason, lossEvidence } from '../stream/CongestionMonitor.js';
+import {
+    CongestionMonitor,
+    EncoderRate,
+    isDeviceReason,
+    lossEvidence,
+} from '../stream/CongestionMonitor.js';
 import { UltraPlayer, presentMode, ultraPlayerSupported } from '../stream/ultra/UltraPlayer.js';
 
 // How long the connected remote's line shows before it fades.
@@ -1110,6 +1115,12 @@ export class StreamView {
         // loss, decoder strain apart — see CongestionMonitor and
         // _recordCongestionEvent().
         this._congestion = new CongestionMonitor();
+        // What the host's encoder sends, from the size of the frames that
+        // arrive (EncoderRate): the app's ladder takes no step for a stream
+        // far below its cap (QualityLadder.farBelowCap).
+        this._encoderRate = new EncoderRate();
+        this._rateLastBytes = -1;
+        this._rateLastFrames = -1;
         /** @type {{packetsLost: number, packetsReceived: number, totalFreezesDuration: number, at: number} | null} */
         this._lastLossSample = null;
         this._lastBpDrops = 0; // cumulative backend backpressure drops (stats msg)
@@ -3237,6 +3248,42 @@ export class StreamView {
             console.warn('[StreamView] Sustained congestion detected (last: ' + reason + ')');
             this.onCongestion();
         }
+    }
+
+    /**
+     * What the host's encoder sends right now, in kbps, estimated from the
+     * size of the frames arriving (EncoderRate); null until enough came.
+     * @returns {number|null}
+     */
+    encoderKbps() {
+        if (!this._encoderRate) return null;
+        const fps = this._streamFps || Math.round(this._peakArrivalFps) || 60;
+        return this._encoderRate.kbps(performance.now(), fps);
+    }
+
+    /**
+     * Media transport: feed EncoderRate from an inbound-rtp video report, the
+     * bytes and frames since the last one. A counter that went back (a new
+     * PeerConnection) starts the deltas over.
+     * @param {{bytesReceived?: number, framesReceived?: number, framesDecoded?: number}} inbound
+     * @param {number} now
+     */
+    _noteInboundRate(inbound, now) {
+        if (!this._encoderRate) return;
+        const bytes = inbound.bytesReceived;
+        const frames =
+            typeof inbound.framesReceived === 'number'
+                ? inbound.framesReceived
+                : inbound.framesDecoded;
+        if (typeof bytes !== 'number' || typeof frames !== 'number') return;
+        if (
+            this._rateLastBytes >= 0 &&
+            bytes >= this._rateLastBytes &&
+            frames >= this._rateLastFrames
+        )
+            this._encoderRate.note(bytes - this._rateLastBytes, frames - this._rateLastFrames, now);
+        this._rateLastBytes = bytes;
+        this._rateLastFrames = frames;
     }
 
     configureDecoder() {
@@ -6247,6 +6294,7 @@ export class StreamView {
                 }
                 if (this._checkMediaNeverDecoded(inbound)) return;
 
+                this._noteInboundRate(inbound, now);
                 this._lastInboundBytes = inbound.bytesReceived || 0;
                 this._lastInboundFrames = inbound.framesDecoded || 0;
                 this._lastInboundStatsTime = now;
@@ -8797,6 +8845,7 @@ export class StreamView {
             console.warn('[StreamView] Video frame too small:', data.length);
             return;
         }
+        if (this._encoderRate) this._encoderRate.note(data.length, 1, performance.now());
         // Received, against painted: the detection's share of frames shown.
         if (this._stepper) this._stepper.noteReceived(performance.now());
 

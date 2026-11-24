@@ -164,3 +164,38 @@ describe('the ladder after the review', () => {
         expect(MoonlightApp._degradeOverrides).toEqual({ stream_fps: 30 });
     });
 });
+
+describe('a stream far below its cap', () => {
+    it('takes no step: a lower cap would change nothing (24/11/2026, 00:16)', () => {
+        // The paused Switch game: ~20 kbit/s sent, 36 Mbit/s cap here.
+        MoonlightApp.streamView.encoderKbps = () => 20;
+        MoonlightApp._onStreamCongested();
+        expect(relaunch).not.toHaveBeenCalled();
+        expect(MoonlightApp._degradeLevel).toBe(0);
+        expect(MoonlightApp._degradeOverrides).toEqual({});
+        // Not a step: no 15 s floor started, no flap counted.
+        expect(MoonlightApp._lastDegradeTime).toBe(0);
+        expect(MoonlightApp._flapCount).toBe(0);
+    });
+
+    it('still steps a stream that fills its cap, or one not measured yet', () => {
+        MoonlightApp.streamView.encoderKbps = () => 30000;
+        MoonlightApp._onStreamCongested();
+        expect(relaunch).toHaveBeenCalledTimes(1);
+        now += 20000;
+        MoonlightApp.streamView.encoderKbps = () => null;
+        MoonlightApp._onStreamCongested();
+        expect(relaunch).toHaveBeenCalledTimes(2);
+    });
+
+    it('measures against the cap the ladder already lowered', () => {
+        // Down once to 18 Mbit/s; a stream then at 5 Mbit/s is over a quarter
+        // of that, and steps again.
+        MoonlightApp._onStreamCongested();
+        now += 20000;
+        expect(MoonlightApp._degradeOverrides.stream_bitrate).toBe(18000);
+        MoonlightApp.streamView.encoderKbps = () => 5000;
+        MoonlightApp._onStreamCongested();
+        expect(relaunch).toHaveBeenCalledTimes(2);
+    });
+});
