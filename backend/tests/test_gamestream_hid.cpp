@@ -192,8 +192,9 @@ void run_gamestream_hid_tests()
         Rig r;
         r.backendWhy = "/dev/uhid is not writable by this user (udev rule missing)";
         r.ready();
-        CHECK(r.hid.unavailableReason() ==
-              QStringLiteral("This host can't take a Wii Remote or Joy-Cons right now."));
+        CHECK(
+            r.hid.unavailableReason() ==
+            QStringLiteral("This host can't take a Wii Remote or a Switch controller right now."));
         CHECK(!r.hid.attach(0, kWiimote).isEmpty());
         CHECK(r.log.created.empty());
     }
@@ -212,7 +213,7 @@ void run_gamestream_hid_tests()
         CHECK(r.hid.attach(0, kWiimote).isEmpty());
     }
 
-    SECTION("GameStreamHid — the allow-list: Wii Remotes and Joy-Cons only");
+    SECTION("GameStreamHid — the allow-list: Wii Remotes, Joy-Cons and the Pro Controller only");
     {
         CHECK(GameStreamHid::allowed(0x057e, 0x0306) != nullptr);
         CHECK(GameStreamHid::allowed(0x057e, 0x0330) != nullptr);
@@ -220,14 +221,15 @@ void run_gamestream_hid_tests()
         CHECK(GameStreamHid::allowed(0x057e, 0x2007) != nullptr); // Joy-Con (R)
         CHECK(GameStreamHid::allowed(0x057e, 0x200e) == nullptr); // the charging grip's ids
         CHECK(GameStreamHid::allowed(0x045e, 0x028e) == nullptr); // an Xbox 360 pad
-        CHECK(GameStreamHid::allowed(0x057e, 0x2009) == nullptr); // a Switch Pro Controller
+        CHECK(GameStreamHid::allowed(0x057e, 0x2009) != nullptr); // a Switch Pro Controller
         for (const GameStreamHid::Model& m : GameStreamHid::allowList())
             CHECK(!m.restWhenSilent); // quiet on purpose: never put to rest
 
         Rig r;
         r.ready();
         CHECK(r.hid.attach(0, attachMessage(0x045e, 0x028e)) ==
-              QStringLiteral("Only Wii Remotes and Joy-Cons can be connected to this game."));
+              QStringLiteral(
+                  "Only Wii Remotes, Joy-Cons and Pro Controllers can be connected to this game."));
         CHECK(r.log.created.empty());
         CHECK(r.hid.attach(0, attachMessage(0x057e, 0x0330)).isEmpty());
         CHECK_EQ(r.log.created.size(), static_cast<size_t>(1));
@@ -247,8 +249,8 @@ void run_gamestream_hid_tests()
         CHECK(!GameStreamHid::fits(Kind::JoyconLeft, {Kind::Wiimote}));
         CHECK(!GameStreamHid::fits(Kind::JoyconLeft, {Kind::JoyconLeft, Kind::JoyconRight}));
 
-        const QString oneOnly =
-            QStringLiteral("This game takes one Wii Remote or one pair of Joy-Cons per player.");
+        const QString oneOnly = QStringLiteral("This game takes one Wii Remote, one pair of "
+                                               "Joy-Cons or one Pro Controller per player.");
         const QJsonObject left = attachMessage(0x057e, 0x2006);
         const QJsonObject right = attachMessage(0x057e, 0x2007);
         Rig r;
@@ -336,8 +338,8 @@ void run_gamestream_hid_tests()
 
         // One Wii Remote per stream: a second one on another slot is refused,
         // and so is a Joy-Con beside it.
-        const QString oneOnly =
-            QStringLiteral("This game takes one Wii Remote or one pair of Joy-Cons per player.");
+        const QString oneOnly = QStringLiteral("This game takes one Wii Remote, one pair of "
+                                               "Joy-Cons or one Pro Controller per player.");
         CHECK(r.hid.attach(1, kWiimote) == oneOnly);
         CHECK(r.hid.attach(1, attachMessage(0x057e, 0x2006)) == oneOnly);
         CHECK_EQ(r.log.created.size(), static_cast<size_t>(1));
@@ -355,6 +357,40 @@ void run_gamestream_hid_tests()
         CHECK_EQ(r.log.destroyed, 2);
         r.hid.detachAll(); // twice: no harm
         CHECK_EQ(r.log.destroyed, 2);
+    }
+
+    SECTION("GameStreamHid — a Pro Controller: alone, its copy on the I2C bus, a Joy-Con's on USB");
+    {
+        using Kind = GameStreamHid::Kind;
+        CHECK(GameStreamHid::fits(Kind::ProController, {}));
+        CHECK(!GameStreamHid::fits(Kind::ProController, {Kind::JoyconLeft}));
+        CHECK(!GameStreamHid::fits(Kind::JoyconLeft, {Kind::ProController}));
+        CHECK(!GameStreamHid::fits(Kind::ProController, {Kind::ProController}));
+        CHECK(!GameStreamHid::fits(Kind::Wiimote, {Kind::ProController}));
+
+        const QString oneOnly = QStringLiteral("This game takes one Wii Remote, one pair of "
+                                               "Joy-Cons or one Pro Controller per player.");
+        Rig r;
+        r.ready(QStringLiteral("12345678901234567890"));
+        CHECK(r.hid.attach(0, attachMessage(0x057e, 0x2009)).isEmpty());
+        CHECK_EQ(r.log.created.size(), static_cast<size_t>(1));
+        CHECK_EQ(r.log.created[0].productId, static_cast<uint16_t>(0x2009));
+        CHECK_EQ(r.log.created[0].bus, static_cast<uint16_t>(0x18)); // BUS_I2C: not hid-nintendo's
+        CHECK(r.log.created[0].uniq == "wolf:12345678901234567890:0");
+        CHECK(r.log.created[0].phys == "moonlightweb/wolf");
+        CHECK(r.hid.attach(1, attachMessage(0x057e, 0x2006)) == oneOnly);
+        CHECK(r.hid.attach(1, attachMessage(0x057e, 0x2009)) == oneOnly);
+        CHECK(r.hid.attach(1, kWiimote) == oneOnly);
+        CHECK_EQ(r.log.created.size(), static_cast<size_t>(1));
+        // Sent again on its own slot (the page reattached): the same one, kept.
+        CHECK(r.hid.attach(0, attachMessage(0x057e, 0x2009)).isEmpty());
+        CHECK_EQ(r.log.created.size(), static_cast<size_t>(1));
+        CHECK_EQ(r.log.destroyed, 0);
+
+        Rig j;
+        j.ready();
+        CHECK(j.hid.attach(0, attachMessage(0x057e, 0x2006)).isEmpty());
+        CHECK_EQ(j.log.created[0].bus, static_cast<uint16_t>(0)); // the backend's default: USB
     }
 
     SECTION("GameStreamHid — the stream's end removes what is left, with the object");

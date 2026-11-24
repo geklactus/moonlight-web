@@ -954,7 +954,13 @@
         "joyconUnavailable": "Your Joy-Cons can't connect to this game: {{why}}",
         "joyconNotTaken": "this host doesn't take Joy-Cons.",
         "joyconRefused": "Your Joy-Con didn't connect: {{why}}",
-        "joyconNoWebHid": "This browser can't connect Joy-Cons. Chrome or Edge on a computer can."
+        "joyconNoWebHid": "This browser can't connect Joy-Cons. Chrome or Edge on a computer can.",
+        "proConnect": "Connect your Pro Controller: click, then pick it in the chooser.",
+        "proConnected": "Pro Controller connected.",
+        "proUnavailable": "Your Pro Controller can't connect to this game: {{why}}",
+        "proNotTaken": "this host doesn't take a Pro Controller.",
+        "proRefused": "Your Pro Controller didn't connect: {{why}}",
+        "proNoWebHid": "This browser can't connect a Pro Controller. Chrome or Edge on a computer can."
     },
     "transport": {
         "webrtcDcUdp": "WebRTC DataChannel (UDP)",

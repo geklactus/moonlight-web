@@ -41,7 +41,7 @@ function view(caps, { picked = true } = {}) {
     return {
         _quitting: false,
         _hidPassthrough: hp,
-        _joyconLocalPick: () => picked,
+        _joyconLocalPick: () => (picked === true ? 'joycon' : picked || null),
         _offerJoycon: P._offerJoycon,
         _sayJoycon: P._sayJoycon,
         _onJoyconEvent: P._onJoyconEvent,
@@ -177,5 +177,72 @@ describe('StreamView — Joy-Cons at this computer', () => {
         await v._offerJoycon();
         expect(said(Toast.warning, 'stream.joyconNoWebHid')).toHaveLength(1);
         expect(v._hidPassthrough.linkJoyconsRemembered).not.toHaveBeenCalled();
+    });
+});
+
+describe('StreamView — a Pro Controller at this computer', () => {
+    let hid;
+    beforeEach(() => {
+        hid = Object.getOwnPropertyDescriptor(globalThis.navigator, 'hid');
+        Object.defineProperty(globalThis.navigator, 'hid', { value: {}, configurable: true });
+        vi.clearAllMocks();
+    });
+    afterEach(() => {
+        if (hid) Object.defineProperty(globalThis.navigator, 'hid', hid);
+        else delete globalThis.navigator.hid;
+    });
+
+    it('reads which controller the launcher asked for from the address', () => {
+        const before = globalThis.location.href;
+        globalThis.history.replaceState(null, '', '?play=x&joycon=pro');
+        expect(P._joyconLocalPick.call({})).toBe('pro');
+        globalThis.history.replaceState(null, '', '?play=x&joycon=here');
+        expect(P._joyconLocalPick.call({})).toBe('joycon');
+        globalThis.history.replaceState(null, '', '?play=x&joycon=yes');
+        expect(P._joyconLocalPick.call({})).toBeNull();
+        globalThis.history.replaceState(null, '', before);
+    });
+
+    it('tries the one already allowed, then offers Connect for it, and connects only a Pro', async () => {
+        const v = view(TAKES, { picked: 'pro' });
+        await v._offerJoycon();
+        expect(v._hidPassthrough.linkJoyconsRemembered).toHaveBeenCalledWith('pro');
+        const [[text, options]] = offers('stream.proConnect');
+        expect(text).toBe('stream.proConnect');
+        expect(offers('stream.joyconConnect')).toHaveLength(0);
+        options.action.onClick();
+        expect(v._hidPassthrough.linkJoycon).toHaveBeenCalledWith('pro');
+    });
+
+    it('says it is connected, and offers nothing more', async () => {
+        const v = view(TAKES, { picked: 'pro' });
+        await v._offerJoycon();
+        v._hidPassthrough.sides.add('left').add('right');
+        v._onJoyconEvent({ type: 'attached', slot: 0, side: 'both', name: 'Pro Controller' });
+        await Promise.resolve();
+        expect(said(Toast.info, 'stream.proConnected')).toHaveLength(1);
+        expect(said(Toast.info, 'stream.joyconBoth')).toHaveLength(0);
+        expect(v._joyconConnectToast).toBeNull();
+    });
+
+    it("says why in a Pro Controller's own words", async () => {
+        const v = view(TAKES, { picked: 'pro' });
+        await v._offerJoycon();
+        v._onJoyconEvent({ type: 'refused', slot: 0, why: 'busy' });
+        expect(said(Toast.warning, 'stream.proRefused')[0][0]).toContain('busy');
+
+        vi.clearAllMocks();
+        const w = view({ available: true, joycon: false, why: '' }, { picked: 'pro' });
+        await w._offerJoycon();
+        expect(said(Toast.warning, 'stream.proUnavailable')[0][0]).toContain('stream.proNotTaken');
+
+        vi.clearAllMocks();
+        Object.defineProperty(globalThis.navigator, 'hid', {
+            value: undefined,
+            configurable: true,
+        });
+        const x = view(TAKES, { picked: 'pro' });
+        await x._offerJoycon();
+        expect(said(Toast.warning, 'stream.proNoWebHid')).toHaveLength(1);
     });
 });

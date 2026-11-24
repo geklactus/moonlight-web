@@ -954,7 +954,13 @@
         "joyconUnavailable": "你的 Joy-Con 无法连接到这个游戏：{{why}}",
         "joyconNotTaken": "这台主机不接受 Joy-Con。",
         "joyconRefused": "你的 Joy-Con 没有连接上：{{why}}",
-        "joyconNoWebHid": "这个浏览器无法连接 Joy-Con。电脑上的 Chrome 或 Edge 可以。"
+        "joyconNoWebHid": "这个浏览器无法连接 Joy-Con。电脑上的 Chrome 或 Edge 可以。",
+        "proConnect": "连接你的 Pro 手柄：点击，然后在选择框中选中它。",
+        "proConnected": "Pro 手柄已连接。",
+        "proUnavailable": "你的 Pro 手柄无法连接到这个游戏：{{why}}",
+        "proNotTaken": "这台主机不接受 Pro 手柄。",
+        "proRefused": "你的 Pro 手柄没有连接上：{{why}}",
+        "proNoWebHid": "这个浏览器无法连接 Pro 手柄。电脑上的 Chrome 或 Edge 可以。"
     },
     "transport": {
         "webrtcDcUdp": "WebRTC 数据通道（UDP）",
