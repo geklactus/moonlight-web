@@ -675,8 +675,12 @@ void MoonlightShim::clLogMessage(const char* format, ...)
 {
     // A line logged once per packet or frame while the stream is in trouble
     // ("Waiting for IDR frame", "Failed to decrypt control packet") is held
-    // back past a few per 10 s, and the count is written with the next one
-    // that prints (LogRepeatLimiter).
+    // back past a few per 10 s, and the count is written after the next one
+    // that prints (LogRepeatLimiter). A line written in two pieces, a stage
+    // then "done\n", is kept whole: the count waits for the line to end.
+    const size_t formatLength = std::strlen(format);
+    if (formatLength == 0) return;
+    const bool endsLine = format[formatLength - 1] == '\n';
     static std::mutex limiterLock;
     static LogRepeatLimiter limiter;
     LogRepeatLimiter::Verdict verdict;
@@ -685,7 +689,7 @@ void MoonlightShim::clLogMessage(const char* format, ...)
                                   std::chrono::steady_clock::now().time_since_epoch())
                                   .count();
         std::lock_guard<std::mutex> guard(limiterLock);
-        verdict = limiter.admit(format, nowMs);
+        verdict = limiter.admit(format, nowMs, endsLine);
     }
     if (!verdict.print) return;
 
@@ -695,10 +699,10 @@ void MoonlightShim::clLogMessage(const char* format, ...)
     vsnprintf(buffer, sizeof(buffer), format, args);
     va_end(args);
     // No fflush: stderr is unbuffered by default and this path can be hot.
-    if (verdict.heldBack > 0)
-        fprintf(stderr, "[moonlight] (%d more lines like the next one were held back)\n",
-                verdict.heldBack);
     fprintf(stderr, "[moonlight] %s", buffer);
+    if (verdict.heldBack > 0)
+        fprintf(stderr, "[moonlight] (%d more lines like the one above were held back)\n",
+                verdict.heldBack);
 }
 
 void MoonlightShim::clRumble(unsigned short controller, unsigned short low, unsigned short high)
