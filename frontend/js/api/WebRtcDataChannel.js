@@ -30,6 +30,13 @@ import {
 } from '../util/pairingCrypto.js';
 import { defaultIceServers } from './IceServers.js';
 import {
+    SIGNALING_ERROR,
+    SIGNALING_LOST,
+    SIGNALING_TLS_FAILED,
+    SIGNALING_UNREACHABLE,
+    WEBRTC_UNREACHABLE,
+} from './transportErrors.js';
+import {
     CHUNK_FLAG_KEYFRAME,
     CHUNK_FLAG_SIDE_BLOCK,
     readMwsrZoneBlock,
@@ -401,13 +408,9 @@ export class WebRtcDataChannel {
                 this._wsHadError = true;
                 if (!this._stopping) {
                     if (!this._wsHadOpen) {
-                        this._onError(
-                            'Connexion au serveur de streaming impossible. ' +
-                                'Verifiez votre pare-feu, antivirus (HTTPS Scanning), ' +
-                                'ou proxy.',
-                        );
+                        this._onError(SIGNALING_UNREACHABLE);
                     } else {
-                        this._onError('Erreur de connexion au serveur de streaming');
+                        this._onError(SIGNALING_ERROR);
                     }
                 }
             };
@@ -425,17 +428,11 @@ export class WebRtcDataChannel {
                 if (!this._stopping && !this._wsHadError) {
                     // onerror may have already triggered — only act if it didn't.
                     if (evt.code === 1015) {
-                        this._onError(
-                            'Erreur de securite TLS. ' + "Verifiez la date et l'heure du systeme.",
-                        );
+                        this._onError(SIGNALING_TLS_FAILED);
                     } else if (this.connected) {
-                        this._onError('Connexion au serveur de streaming interrompue');
+                        this._onError(SIGNALING_LOST);
                     } else {
-                        this._onError(
-                            'Connexion au serveur de streaming impossible. ' +
-                                'Verifiez votre pare-feu, antivirus (HTTPS Scanning), ' +
-                                'ou proxy.',
-                        );
+                        this._onError(SIGNALING_UNREACHABLE);
                     }
                 }
             };
@@ -481,7 +478,7 @@ export class WebRtcDataChannel {
                     // Let onclose handle the user-facing error (it has the code).
                     // Only trigger now if we were already connected (runtime error).
                     if (this._wsHadOpen) {
-                        this._onError('Erreur de connexion au serveur de streaming');
+                        this._onError(SIGNALING_ERROR);
                     }
                 }
             };
@@ -519,17 +516,11 @@ export class WebRtcDataChannel {
                         // own signature here (see IDENTITY_REFUSED).
                         this._onError(IDENTITY_REFUSED);
                     } else if (evt.code === 1015) {
-                        this._onError(
-                            'Erreur de securite TLS. ' + "Verifiez la date et l'heure du systeme.",
-                        );
+                        this._onError(SIGNALING_TLS_FAILED);
                     } else if (evt.code === 1006 || !this._wsHadOpen) {
-                        this._onError(
-                            'Connexion au serveur de streaming impossible. ' +
-                                'Verifiez votre pare-feu, antivirus (HTTPS Scanning), ' +
-                                'ou proxy.',
-                        );
+                        this._onError(SIGNALING_UNREACHABLE);
                     } else {
-                        this._onError('Connexion au serveur de streaming interrompue');
+                        this._onError(SIGNALING_LOST);
                     }
                 }
             };
@@ -706,10 +697,7 @@ export class WebRtcDataChannel {
             this._requestWsFallback('timeout');
         } else {
             // WS is gone — no fallback possible, display error
-            this._onError(
-                "La connexion WebRTC n'a pas pu être établie. " +
-                    "Vérifiez que votre réseau autorise l'UDP sortant.",
-            );
+            this._onError(WEBRTC_UNREACHABLE);
         }
     }
 
@@ -736,10 +724,7 @@ export class WebRtcDataChannel {
         this._fallbackRequestTimer = setTimeout(() => {
             if (!this._wsFallback && !this._stopping) {
                 console.error('[WebRTC] WS fallback response not received within 5s — error');
-                this._onError(
-                    "La connexion WebRTC n'a pas pu être établie. " +
-                        "Vérifiez que votre réseau autorise l'UDP sortant.",
-                );
+                this._onError(WEBRTC_UNREACHABLE);
             }
         }, 5000);
 
