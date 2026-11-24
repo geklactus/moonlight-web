@@ -253,11 +253,12 @@ QVector<NvApp> NvHTTP::parseAppList(const QString& xml)
 }
 
 // A launch or resume URL fit for the log: rikey is the key every keystroke and
-// click of the session is encrypted with, and a log ends up attached to issues.
+// click of the session is encrypted with, rikeyid its IV, and a log ends up
+// attached to issues.
 static QString loggableUrl(const QUrl& url)
 {
-    static const QRegularExpression rikey(QStringLiteral("rikey=[0-9A-Fa-f]*"));
-    return url.toString().replace(rikey, QStringLiteral("rikey=(hidden)"));
+    static const QRegularExpression secret(QStringLiteral("(rikey|rikeyid)=[^&]*"));
+    return url.toString().replace(secret, QStringLiteral("\\1=(hidden)"));
 }
 
 QNetworkReply* NvHTTP::launchAppAsync(const NvAddress& address, quint16 httpsPort, int appId,

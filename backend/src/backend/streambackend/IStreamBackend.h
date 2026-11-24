@@ -22,6 +22,7 @@
 
 #include <QJsonArray>
 #include <QJsonObject>
+#include <QRegularExpression>
 #include <QString>
 #include <QVector>
 #include <functional>
@@ -167,9 +168,22 @@ struct BackendError
     int httpStatus = 0; // upstream status when there was one, else 0
     QString message;    // user-facing
 
+    // Qt's network error strings quote the whole request URL ("Error
+    // transferring https://host:47984/resume?...&rikey=...&rikeyid=..."), and a
+    // /launch or /resume URL carries rikey, the AES key every input packet of
+    // the session is encrypted with, and rikeyid, its IV. The message is logged
+    // ("[Session] Launch failed: ...") and handed to the browser in the 502, so
+    // neither value may survive in it.
+    static QString withoutLaunchSecrets(QString msg)
+    {
+        static const QRegularExpression secret(
+            QStringLiteral(R"((?<![A-Za-z0-9_-])(rikey|rikeyid)=[^&\s"'#<>]*)"));
+        return msg.replace(secret, QStringLiteral("\\1=(hidden)"));
+    }
+
     static BackendError make(Kind k, const QString& msg, int status = 0)
     {
-        return BackendError{k, status, msg};
+        return BackendError{k, status, withoutLaunchSecrets(msg)};
     }
 };
 
