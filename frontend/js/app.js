@@ -136,7 +136,13 @@ import { probeUdp } from './api/UdpProbe.js';
 import { InstanceMenu } from './ui/InstanceMenu.js';
 import { currentInstanceRef, importInstances, rememberInstance } from './util/instances.js';
 import { bootMark } from './util/bootTiming.js';
-import { degradeRung, deviceRelief, flapVerdict, pagePolicy } from './stream/QualityLadder.js';
+import {
+    degradeRung,
+    deviceRelief,
+    farBelowCap,
+    flapVerdict,
+    pagePolicy,
+} from './stream/QualityLadder.js';
 
 // Every module above arrived and ran: the boot watchdog (bootWatch.js) stands down.
 window.mwBooted = true;
@@ -4545,6 +4551,26 @@ export const MoonlightApp = {
                 '[MW] Sustained congestion — the page allows ' +
                     policy.maxDegradeSteps +
                     ' step(s) down, staying here',
+            );
+            return;
+        }
+        // A stream sending far less than its cap is not what fills its link:
+        // a step would lower a cap it does not reach, after a relaunch's pause
+        // (24/11/2026: a paused game on a Wolf seat at 0.02 Mbit/s of 20,
+        // stepped down by two link stalls, then back up, ~3 s of black each).
+        // Not a step, so it neither starts the 15 s floor nor counts as a flap.
+        const capNow = { ...this._lastStreamingSettings, ...(this._degradeOverrides || {}) }
+            .stream_bitrate;
+        const cap = capNow > 0 ? capNow : 20000;
+        const sv = this.streamView;
+        const sent = sv && typeof sv.encoderKbps === 'function' ? sv.encoderKbps() : null;
+        if (farBelowCap(sent, cap)) {
+            console.warn(
+                '[MW] Sustained congestion signals, but the stream sends ~' +
+                    sent +
+                    ' of its ' +
+                    cap +
+                    ' kbps cap — a lower cap would change nothing, no step',
             );
             return;
         }

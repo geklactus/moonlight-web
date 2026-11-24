@@ -15,6 +15,9 @@
 import { describe, it, expect } from 'vitest';
 import {
     CongestionMonitor,
+    EncoderRate,
+    RATE_MIN_FRAMES,
+    RATE_WINDOW_MS,
     EPISODE_MS,
     COOLDOWN_MS,
     WINDOW_MS,
@@ -165,5 +168,70 @@ describe('lossEvidence', () => {
     it('caps frozen time at the whole poll', () => {
         const e = lossEvidence({ totalFreezesDuration: 0 }, { totalFreezesDuration: 5 }, 1);
         expect(e.frozenFraction).toBe(1);
+    });
+});
+
+describe('EncoderRate', () => {
+    // A stream's frames, `size` bytes each at `fps`, from `from` for `ms`;
+    // `stalls` are [start, length] spans in which nothing arrives.
+    function feed(r, { from = 0, ms, fps = 60, size, stalls = [] }) {
+        for (let t = from; t < from + ms; t += 1000 / fps) {
+            if (stalls.some(([s, len]) => t >= s && t < s + len)) continue;
+            r.note(size, 1, t);
+        }
+    }
+
+    it('says nothing before enough frames came', () => {
+        const r = new EncoderRate();
+        feed(r, { ms: (RATE_MIN_FRAMES - 1) * (1000 / 60), size: 40000 });
+        expect(r.kbps(1000, 60)).toBe(null);
+    });
+
+    it('reads a paused game as the few kbps it is (24/11/2026, 00:16)', () => {
+        // ~40-byte frames of a still screen, a 5 kB keyframe after each of the
+        // two stalls, as the Wolf seat sent them.
+        const r = new EncoderRate();
+        feed(r, {
+            ms: 10000,
+            size: 40,
+            stalls: [
+                [2000, 1836],
+                [6000, 2590],
+            ],
+        });
+        r.note(5016, 1, 3900);
+        r.note(5016, 1, 8600);
+        const kbps = r.kbps(10000, 60);
+        expect(kbps).toBeGreaterThan(10);
+        expect(kbps).toBeLessThan(100);
+    });
+
+    it('reads a full stream as full, even through its stalls', () => {
+        // 20 Mbit/s at 60 fps: frames of ~41.7 kB. Stalls take frames away,
+        // not size: the estimate stays at the encoder's rate.
+        const r = new EncoderRate();
+        feed(r, { ms: 10000, size: 41667, stalls: [[3000, 2500]] });
+        expect(r.kbps(10000, 60)).toBeCloseTo(20000, -2);
+    });
+
+    it('catches up within seconds when a paused game resumes', () => {
+        const r = new EncoderRate();
+        feed(r, { ms: 15000, size: 40 });
+        feed(r, { from: 15000, ms: 5000, size: 41667 });
+        // Half the window at full size: well over a quarter of a 20 Mbit/s cap.
+        expect(r.kbps(20000, 60)).toBeGreaterThan(20000 * 0.25);
+    });
+
+    it('forgets what left the window, and takes counts from a stats poll', () => {
+        const r = new EncoderRate();
+        feed(r, { ms: 5000, size: 41667 });
+        feed(r, { from: 5000 + RATE_WINDOW_MS, ms: 2000, size: 40 });
+        expect(r.kbps(7000 + RATE_WINDOW_MS, 60)).toBeLessThan(100);
+        // Media transport: bytes and frames since the last inbound-rtp report.
+        const m = new EncoderRate();
+        m.note(1_000_000, 120, 2000);
+        expect(m.kbps(2000, 60)).toBe(4000);
+        m.note(500, 0, 2500); // no frames: nothing to divide by, ignored
+        expect(m.kbps(2500, 60)).toBe(4000);
     });
 });

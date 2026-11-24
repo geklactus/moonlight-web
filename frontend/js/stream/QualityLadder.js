@@ -35,12 +35,34 @@
  *   which picks an outside player's plan for their network, allows one step.
  * - A decoder that can't keep up gets a lower frame rate or size, never a
  *   lower bitrate or another transport (deviceRelief).
+ * - A stream sending far less than its cap takes no step (farBelowCap): the
+ *   stalls it sees are not this stream filling the link (24/11/2026).
  */
 
 /** Falling again this soon after coming back up is a flap. */
 export const FLAP_WINDOW_MS = 300000;
 /** Flaps in one session after which the ladder stops trying to come back up. */
 export const FLAPS_TO_HOLD = 2;
+
+/** Below this share of its cap, a stream is not what fills its link. */
+export const UNDER_CAP_SHARE = 0.25;
+
+/**
+ * Whether a stream is sending so far below its bitrate cap that a step down
+ * cannot help it. The first step halves the cap: at under a quarter of it,
+ * the stream is still under half the new one, and sends just what it sent
+ * before, after a relaunch's pause. A stalling link with that little on it
+ * is not congested by this stream (a radio busy elsewhere, a scan, another
+ * device); the next step, if the stream does fill up, is still there.
+ * Unknown (null: too few frames measured) is not far below.
+ * @param {number|null|undefined} sentKbps what the encoder sends (EncoderRate)
+ * @param {number} capKbps the stream's bitrate cap
+ */
+export function farBelowCap(sentKbps, capKbps) {
+    if (typeof sentKbps !== 'number' || !Number.isFinite(sentKbps) || sentKbps < 0) return false;
+    if (!(capKbps > 0)) return false;
+    return sentKbps < capKbps * UNDER_CAP_SHARE;
+}
 
 /**
  * Which knob the next step down turns.

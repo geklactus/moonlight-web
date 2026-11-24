@@ -157,3 +157,80 @@ export class CongestionMonitor {
         return { counted: r.counted, congested: r.fired, deviceStrained: false };
     }
 }
+
+/**
+ * How far back EncoderRate looks. Shorter than WINDOW_MS: a game resumed
+ * after a pause should count at its new size within seconds, not after
+ * twenty seconds of a still screen have left the average.
+ */
+export const RATE_WINDOW_MS = 10000;
+/** Frames the estimate needs in its window before it says anything. */
+export const RATE_MIN_FRAMES = 30;
+
+/**
+ * What the host's encoder is sending, estimated from the frames that arrive:
+ * their mean size over the last RATE_WINDOW_MS, times the stream's frame rate.
+ *
+ * Not the rate received: a link that stalls delivers nothing for a moment,
+ * so the received rate falls to zero on a link that is full and on one that
+ * is idle alike. The frames that do arrive are the size the encoder made
+ * them either way. A still screen is sent as frames of a few dozen bytes; on
+ * 24/11/2026 a Switch game left paused on LOLA's Wolf seat came in at
+ * 0.02 Mbit/s against its 20 Mbit/s cap, and two link stalls then stepped
+ * that stream down a rung that could not lower anything.
+ *
+ * Kept as one-second buckets, so a frame costs an addition. When the link
+ * is so slow that fewer than RATE_MIN_FRAMES arrive in the window, it says
+ * nothing (null), and the ladder steps as it always did.
+ */
+export class EncoderRate {
+    constructor() {
+        /** @type {{s: number, bytes: number, frames: number}[]} */
+        this._buckets = [];
+    }
+
+    /** Forget what was measured (a new stream). */
+    reset() {
+        this._buckets.length = 0;
+    }
+
+    /**
+     * @param {number} bytes video payload that arrived
+     * @param {number} frames how many frames it made
+     * @param {number} now ms, monotonic
+     */
+    note(bytes, frames, now) {
+        if (!(bytes >= 0) || !(frames > 0)) return;
+        const s = Math.floor(now / 1000);
+        const last = this._buckets[this._buckets.length - 1];
+        if (last && last.s === s) {
+            last.bytes += bytes;
+            last.frames += frames;
+        } else {
+            this._buckets.push({ s, bytes, frames });
+        }
+        this._prune(now);
+    }
+
+    /**
+     * @param {number} now ms, monotonic
+     * @param {number} fps the stream's frame rate
+     * @returns {number|null} kbps, or null when too few frames came to tell
+     */
+    kbps(now, fps) {
+        this._prune(now);
+        let bytes = 0;
+        let frames = 0;
+        for (const b of this._buckets) {
+            bytes += b.bytes;
+            frames += b.frames;
+        }
+        if (frames < RATE_MIN_FRAMES || !(fps > 0)) return null;
+        return Math.round(((bytes / frames) * 8 * fps) / 1000);
+    }
+
+    _prune(now) {
+        const oldest = Math.floor((now - RATE_WINDOW_MS) / 1000);
+        while (this._buckets.length > 0 && this._buckets[0].s < oldest) this._buckets.shift();
+    }
+}
