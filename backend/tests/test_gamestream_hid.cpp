@@ -192,8 +192,9 @@ void run_gamestream_hid_tests()
         Rig r;
         r.backendWhy = "/dev/uhid is not writable by this user (udev rule missing)";
         r.ready();
-        CHECK(r.hid.unavailableReason() ==
-              QStringLiteral("This host can't take a Wii Remote or a Switch controller right now."));
+        CHECK(
+            r.hid.unavailableReason() ==
+            QStringLiteral("This host can't take a Wii Remote or a Switch controller right now."));
         CHECK(!r.hid.attach(0, kWiimote).isEmpty());
         CHECK(r.log.created.empty());
     }
@@ -227,7 +228,8 @@ void run_gamestream_hid_tests()
         Rig r;
         r.ready();
         CHECK(r.hid.attach(0, attachMessage(0x045e, 0x028e)) ==
-              QStringLiteral("Only Wii Remotes, Joy-Cons and Pro Controllers can be connected to this game."));
+              QStringLiteral(
+                  "Only Wii Remotes, Joy-Cons and Pro Controllers can be connected to this game."));
         CHECK(r.log.created.empty());
         CHECK(r.hid.attach(0, attachMessage(0x057e, 0x0330)).isEmpty());
         CHECK_EQ(r.log.created.size(), static_cast<size_t>(1));
@@ -247,8 +249,8 @@ void run_gamestream_hid_tests()
         CHECK(!GameStreamHid::fits(Kind::JoyconLeft, {Kind::Wiimote}));
         CHECK(!GameStreamHid::fits(Kind::JoyconLeft, {Kind::JoyconLeft, Kind::JoyconRight}));
 
-        const QString oneOnly =
-            QStringLiteral("This game takes one Wii Remote, one pair of Joy-Cons or one Pro Controller per player.");
+        const QString oneOnly = QStringLiteral("This game takes one Wii Remote, one pair of "
+                                               "Joy-Cons or one Pro Controller per player.");
         const QJsonObject left = attachMessage(0x057e, 0x2006);
         const QJsonObject right = attachMessage(0x057e, 0x2007);
         Rig r;
@@ -336,8 +338,8 @@ void run_gamestream_hid_tests()
 
         // One Wii Remote per stream: a second one on another slot is refused,
         // and so is a Joy-Con beside it.
-        const QString oneOnly =
-            QStringLiteral("This game takes one Wii Remote, one pair of Joy-Cons or one Pro Controller per player.");
+        const QString oneOnly = QStringLiteral("This game takes one Wii Remote, one pair of "
+                                               "Joy-Cons or one Pro Controller per player.");
         CHECK(r.hid.attach(1, kWiimote) == oneOnly);
         CHECK(r.hid.attach(1, attachMessage(0x057e, 0x2006)) == oneOnly);
         CHECK_EQ(r.log.created.size(), static_cast<size_t>(1));
@@ -366,8 +368,8 @@ void run_gamestream_hid_tests()
         CHECK(!GameStreamHid::fits(Kind::ProController, {Kind::ProController}));
         CHECK(!GameStreamHid::fits(Kind::Wiimote, {Kind::ProController}));
 
-        const QString oneOnly = QStringLiteral(
-            "This game takes one Wii Remote, one pair of Joy-Cons or one Pro Controller per player.");
+        const QString oneOnly = QStringLiteral("This game takes one Wii Remote, one pair of "
+                                               "Joy-Cons or one Pro Controller per player.");
         Rig r;
         r.ready(QStringLiteral("12345678901234567890"));
         CHECK(r.hid.attach(0, attachMessage(0x057e, 0x2009)).isEmpty());

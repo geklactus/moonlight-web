@@ -26,8 +26,10 @@ namespace {
 
 // What the page reads, in words a player understands (spec §7). The log gets
 // the technical reason beside them.
-const char* const kNotHere = "A Wii Remote or a Switch controller can't be connected to this stream.";
-const char* const kNoBackend = "This host can't take a Wii Remote or a Switch controller right now.";
+const char* const kNotHere =
+    "A Wii Remote or a Switch controller can't be connected to this stream.";
+const char* const kNoBackend =
+    "This host can't take a Wii Remote or a Switch controller right now.";
 const char* const kNotReady = "The game isn't ready for a Wii Remote or a Switch controller yet.";
 const char* const kNotAllowed =
     "Only Wii Remotes, Joy-Cons and Pro Controllers can be connected to this game.";
