@@ -1934,8 +1934,17 @@ export class StreamView {
             }
         };
 
+        // Set once the page starts to go (close, reload, navigation): the quit
+        // beacon below ends the stream, and the host then closes this link.
+        // That close is the page's own doing, not a loss to reattach or report:
+        // on 24/11/2026 the channel closed 170 ms after the beacon, the view
+        // tried to reattach to a worker already gone, and pagehide fired only
+        // after (beforeunload comes first).
+        this._leaving = false;
+
         // beforeunload: fire-and-forget quit when tab/window is closed
         this._onBeforeUnload = () => {
+            this._leaving = true;
             if (this._quitting) return;
             // A player closing their tab only frees their own slot — the
             // owner's game and their invitation both survive it.
@@ -5664,7 +5673,7 @@ export class StreamView {
 
     /** One attempt: a new transport to the same worker, with the token. */
     _buildReattachTransport() {
-        if (!this._reattaching || this._quitting || this._manualQuitting) return;
+        if (!this._reattaching || this._quitting || this._manualQuitting || this._leaving) return;
         this._reattachTries++;
         const old = this._reattachFrom;
         const Transport = this._transport === 'webrtc-media' ? WebRtcMedia : WebRtcDataChannel;
@@ -6075,7 +6084,8 @@ export class StreamView {
         this.webrtc.onClose = () => {
             // _manualQuitting: Stop pressed, exit animation running — quit() is
             // already scheduled, don't treat the close as a disconnect.
-            if (this._quitting || this._manualQuitting) return;
+            // _leaving: the page is going and its quit beacon ended the stream.
+            if (this._quitting || this._manualQuitting || this._leaving) return;
             // Taken over by another device — _handleTakeover() drives the exit.
             if (this._takenOver) return;
             // Standby leg (not promoted yet) — even one that already opened its
@@ -6100,7 +6110,7 @@ export class StreamView {
             this._linkLostDefault();
         };
         this.webrtc.onError = (err) => {
-            if (this._quitting || this._manualQuitting) return;
+            if (this._quitting || this._manualQuitting || this._leaving) return;
             console.error('[StreamView] WebRTC error:', err.message);
             // Standby leg: same routing as onClose — a hidden leg never toasts
             // and never reaches the live-disconnect flow.
