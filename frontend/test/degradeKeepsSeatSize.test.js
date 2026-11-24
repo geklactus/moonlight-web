@@ -39,6 +39,7 @@ beforeEach(() => {
     };
     vi.spyOn(globalThis.console, 'warn').mockImplementation(() => {});
     vi.spyOn(Toast, 'warning').mockImplementation(() => {});
+    vi.spyOn(Toast, 'info').mockImplementation(() => {});
 });
 
 afterEach(() => {
@@ -83,9 +84,10 @@ describe('the congestion ladder and the size of the picture', () => {
         expect(MoonlightApp._degradeOverrides.stream_height).toBeUndefined();
         expect(MoonlightApp._originalStreamHeight).toBeUndefined();
         expect(MoonlightApp._degradeOverrides.stream_bitrate).toBe(10000);
-        // The next knob in the ladder instead: the media transport.
-        expect(MoonlightApp._degradeOverrides.transport_mode).toBe('webrtc-media-udp');
-        expect(relaunch).toHaveBeenCalledWith(0);
+        // Nor its transport: on the LAN the media transport ran slower than the
+        // DataChannel it replaced (review of 23/11/2026). Bitrate only.
+        expect(MoonlightApp._degradeOverrides.transport_mode).toBeUndefined();
+        expect(relaunch).toHaveBeenCalledTimes(1);
     });
 
     it('never reaches the resolution on a Wolf seat, however long the link stays bad', () => {

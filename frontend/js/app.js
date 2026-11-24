@@ -136,6 +136,7 @@ import { probeUdp } from './api/UdpProbe.js';
 import { InstanceMenu } from './ui/InstanceMenu.js';
 import { currentInstanceRef, importInstances, rememberInstance } from './util/instances.js';
 import { bootMark } from './util/bootTiming.js';
+import { degradeRung, deviceRelief, flapVerdict, pagePolicy } from './stream/QualityLadder.js';
 
 // Every module above arrived and ran: the boot watchdog (bootWatch.js) stands down.
 window.mwBooted = true;
@@ -1978,6 +1979,12 @@ export const MoonlightApp = {
             this._lastUpgradeTime = 0;
             this._upgradeStableMs = 75000;
             this._originalStreamHeight = undefined;
+            // Flap guard and toasts (see _onStreamCongested), and what this
+            // device's decoder needed (see _onDeviceStrained).
+            this._flapCount = 0;
+            this._upgradeHeld = false;
+            this._degradeToldPlayer = false;
+            this._deviceHold = {};
             // Aspect probe: one bar measurement per user-initiated launch,
             // and a watch on the host's own shape for as long as the stream
             // lasts (see _startAspectProbe). A relaunch inside the same session
@@ -3342,11 +3349,14 @@ export const MoonlightApp = {
         // a degraded session-only profile (bitrate −30% steps, resolution rungs,
         // media transport, 60 fps cap). See _onStreamCongested().
         sv.onCongestion = () => this._onStreamCongested();
-        // onCongestionSignal: every individual congestion hint (IDR/PLI/drops).
-        // Tracks quiet time for the automatic quality upgrade.
+        // onCongestionSignal: every counted congestion event (one per loss
+        // episode). Tracks quiet time for the automatic quality upgrade.
         sv.onCongestionSignal = () => {
             this._lastCongSignal = performance.now();
         };
+        // onDeviceStrain: this device's decoder keeps falling behind → a lower
+        // frame rate or size, never the network ladder. See _onDeviceStrained().
+        sv.onDeviceStrain = () => this._onDeviceStrained();
         sv.onHostDisplayFormat = (msg) => this._onHostDisplayFormat(msg);
         sv.onClientScreenChanged = (device) => this._onClientScreenChanged(device);
     },
@@ -3940,6 +3950,7 @@ export const MoonlightApp = {
             sv.onConnectionFailed = null;
             sv.onCongestion = null;
             sv.onCongestionSignal = null;
+            sv.onDeviceStrain = null;
             try {
                 await sv.quit({ silent: true });
             } catch (e) {
@@ -4075,6 +4086,7 @@ export const MoonlightApp = {
             sv.onConnectionFailed = null;
             sv.onCongestion = null;
             sv.onCongestionSignal = null;
+            sv.onDeviceStrain = null;
             sv._manualQuitting = true;
         }
 
@@ -4249,6 +4261,16 @@ export const MoonlightApp = {
      * @param {{hostChange?: boolean}} [opts] hostChange: the native host's
      *   display moved — the one reason a share does not pin the stream
      */
+    /** Whether a quality change can swap streams without a visible pause. */
+    _canSeamlessRelaunch() {
+        return !!(
+            this._dualSupported !== false &&
+            this.streamView &&
+            this.streamView._firstFrameRendered &&
+            !this._standbyView
+        );
+    },
+
     _qualityRelaunch(relaunchIndex, opts = {}) {
         // Belt and braces: the entry points already bail out, but nothing else
         // should be able to relaunch a shared stream by accident.
@@ -4256,12 +4278,7 @@ export const MoonlightApp = {
             console.log('[MW] Quality transition skipped: a share is active');
             return;
         }
-        const canSeamless =
-            this._dualSupported !== false &&
-            this.streamView &&
-            this.streamView._firstFrameRendered &&
-            !this._standbyView;
-        if (canSeamless) this._seamlessRelaunch(relaunchIndex);
+        if (this._canSeamlessRelaunch()) this._seamlessRelaunch(relaunchIndex);
         else this._relaunchTransport(relaunchIndex);
     },
 
@@ -4374,6 +4391,7 @@ export const MoonlightApp = {
                 : this._degradeOverrides,
             level: this._degradeLevel,
             originalHeight: this._originalStreamHeight,
+            deviceHold: { ...(this._deviceHold || {}) },
         };
     },
 
@@ -4389,6 +4407,7 @@ export const MoonlightApp = {
         this._degradeOverrides = q.overrides ? { ...q.overrides } : q.overrides;
         this._degradeLevel = q.level;
         this._originalStreamHeight = q.originalHeight;
+        if (q.deviceHold) this._deviceHold = { ...q.deviceHold };
     },
 
     /** First decoded frame on the standby: swap the display, hand over input
@@ -4439,6 +4458,7 @@ export const MoonlightApp = {
             oldView.onConnectionFailed = null;
             oldView.onCongestion = null;
             oldView.onCongestionSignal = null;
+            oldView.onDeviceStrain = null;
             oldView.quit({ silent: true, retire: true }).catch(() => {});
         }
     },
@@ -4481,21 +4501,22 @@ export const MoonlightApp = {
      * with a degraded, session-only profile. The user's settings in the UI are
      * never touched — a fresh launch starts from them again.
      *
-     * Escalation ladder — one knob per congestion event, in order (state-based,
-     * so a knob that is already at its floor is skipped naturally):
-     *   1. bitrate −30%
-     *   2. resolution one rung down (2160→1440→1080→720), bitrate aligned to
-     *      the new height; the upscaler is auto-enabled when the user streams
-     *      without video enhancement so the drop stays visually discreet
-     *   3. switch to the native media transport (RTP: no SCTP queueing/cwnd)
-     *   4. cap at 60 fps (+ bitrate −30%)
-     *   5+ bitrate −30% … floor at 2 Mbps, then remaining resolution rungs
-     * Once every knob is at its floor, keep restarting the transport — a fresh
-     * SCTP/ICE state is exactly what a manual stop/start fixes.
+     * One knob per detection, chosen by QualityLadder.degradeRung (state-based,
+     * so a knob already at its floor is skipped naturally): resolution one rung
+     * down (2160→1440→1080→720, the upscaler auto-enabled), then the media
+     * transport, then a 60 fps cap, then bitrate alone down to 2 Mbps; once
+     * every knob is at its floor, a transport restart. Every rung cuts the
+     * bitrate too: −50 % on the first, −30 % after.
      *
-     * A Wolf seat skips the resolution rungs (_lastStreamKeepsSize): its
+     * A Wolf seat (_lastStreamKeepsSize) skips the resolution rungs (its
      * display cannot follow the stream, and its mouse goes wrong when the two
-     * differ. The other knobs apply as they are.
+     * differ) and the transport rung (on the LAN the media transport ran
+     * slower than the DataChannel it replaced; outside it is the first choice
+     * already). The page can cap how many steps a session takes (pagePolicy).
+     *
+     * Toasts (review of 23/11/2026): a seamless step says nothing — the player
+     * sees no change they can act on. A step with a visible pause says the
+     * picture quality was lowered, once, in the player's terms.
      */
     _onStreamCongested() {
         if (this._nav.overlay !== 'streaming') return;
@@ -4515,6 +4536,18 @@ export const MoonlightApp = {
         // Sharing pins the stream: see _qualityRelaunch. Bail out here rather
         // than at the relaunch, so no toast promises a step that never happens.
         if (this._sharePinsQuality()) return;
+        // The page may own the plan: LOLA's play page picks an outside
+        // player's size and bitrate for their network and allows one step
+        // below it. Past the cap, the stream stays where it is.
+        const policy = pagePolicy();
+        if ((this._degradeLevel || 0) >= policy.maxDegradeSteps) {
+            console.warn(
+                '[MW] Sustained congestion — the page allows ' +
+                    policy.maxDegradeSteps +
+                    ' step(s) down, staying here',
+            );
+            return;
+        }
         const now = performance.now();
         // 15s floor between two ladder steps: enough for the relaunched stream
         // to show whether the previous step fixed the congestion, short enough
@@ -4522,15 +4555,28 @@ export const MoonlightApp = {
         if (this._lastDegradeTime && now - this._lastDegradeTime < 15000) return;
         this._lastDegradeTime = now;
 
-        // Flap guard: congestion soon after an automatic upgrade means the
-        // network hadn't really recovered — require a longer stable period
-        // before the next upgrade attempt (backoff, capped at 10 min).
-        if (this._lastUpgradeTime && now - this._lastUpgradeTime < 60000) {
-            this._upgradeStableMs = Math.min(600000, (this._upgradeStableMs || 75000) * 2);
+        // Flap guard: falling again within 5 minutes of coming back up means
+        // the network hadn't really recovered. The first time, ask for twice
+        // the quiet before the next try; the second time, stop trying for
+        // this session (21/11/2026: a 36 Mbps LAN stream fell, came back, fell
+        // again 134 s later — 8 relaunches in 11 minutes).
+        const fv = flapVerdict({
+            now,
+            lastUpgradeAt: this._lastUpgradeTime || 0,
+            flaps: this._flapCount || 0,
+            stableMs: this._upgradeStableMs || 75000,
+        });
+        if (fv.flap) {
+            this._flapCount = fv.flaps;
+            this._upgradeStableMs = fv.stableMs;
+            if (fv.hold) this._upgradeHeld = true;
             console.warn(
-                '[MW] Congestion right after an upgrade — stable period now ' +
-                    Math.round(this._upgradeStableMs / 1000) +
-                    's',
+                '[MW] Congestion within 5 min of an upgrade (' +
+                    fv.flaps +
+                    ') — ' +
+                    (fv.hold
+                        ? 'staying at this level for the session'
+                        : 'stable period now ' + Math.round(fv.stableMs / 1000) + 's'),
             );
         }
 
@@ -4547,8 +4593,6 @@ export const MoonlightApp = {
         this._degradeLevel = (this._degradeLevel || 0) + 1;
 
         let relaunchIndex = this._transportIndex || 0;
-        let toastKey;
-        const toastParams = {};
 
         // Every rung cuts the bitrate — dropping resolution without the
         // bitrate following barely shrinks the encoded bandwidth. First rung
@@ -4557,7 +4601,17 @@ export const MoonlightApp = {
         const factor = this._degradeLevel === 1 ? 0.5 : 0.7;
         let newBitrate = Math.max(2000, Math.round(curBitrate * factor));
 
-        if (curHeight > 720 && !this._lastStreamKeepsSize) {
+        const rung = degradeRung({
+            curHeight,
+            keepsSize: this._lastStreamKeepsSize === true,
+            onMedia,
+            transportForced: !!o.transport_mode,
+            curFps,
+            fpsCapped: o.stream_fps !== undefined,
+            bitrateCanDrop: newBitrate < curBitrate,
+        });
+
+        if (rung === 'resolution') {
             // Resolution one rung down alongside the bitrate cut, never below
             // 720p (the bitrate alone keeps descending once 720p is reached).
             const next = [2160, 1440, 1080, 720].find((r) => r < curHeight);
@@ -4576,8 +4630,6 @@ export const MoonlightApp = {
                     IS_HANDHELD,
                 ) * 1000;
             newBitrate = Math.max(2000, Math.min(newBitrate, autoKbps));
-            toastKey = 'stream.degradeResolution';
-            toastParams.res = String(next);
             // Upscaler auto-enable: scale the reduced stream back to the
             // display size so the drop stays visually discreet. Session-only
             // override — the user's Settings checkbox is never touched. Not
@@ -4601,32 +4653,70 @@ export const MoonlightApp = {
                 o.video_enhancement = 'on';
                 o.video_enhancement_algo = 'auto';
                 this._enhancementAutoForced = true;
-                toastKey = 'stream.degradeResolutionUpscale';
             }
-        } else if (!onMedia && !o.transport_mode) {
+        } else if (rung === 'transport') {
             o.transport_mode = 'webrtc-media-udp';
             relaunchIndex = 0; // forced mode is first in the recomputed chain
-            toastKey = 'stream.degradeMedia';
-        } else if (o.stream_fps === undefined && curFps > 60) {
+        } else if (rung === 'fps') {
             o.stream_fps = 60;
-            toastParams.mbps = (newBitrate / 1000).toFixed(1);
-            toastKey = 'stream.degradeBitrateFps';
-        } else if (newBitrate < curBitrate) {
-            toastKey = 'stream.degradeBitrate';
-            toastParams.mbps = (newBitrate / 1000).toFixed(1);
-        } else {
-            // Every knob at its floor: plain transport restart (fresh
-            // SCTP/ICE state, same effect as a manual stop/start).
-            toastKey = 'stream.degradeRestart';
         }
+        // 'bitrate' and 'restart' turn no other knob; 'restart' is a plain
+        // transport restart (fresh SCTP/ICE state, same as a manual stop/start).
         if (newBitrate < curBitrate) o.stream_bitrate = newBitrate;
 
         console.warn(
-            '[MW] Sustained congestion — degrade step ' + this._degradeLevel + ':',
+            '[MW] Sustained congestion — degrade step ' + this._degradeLevel + ' (' + rung + '):',
             JSON.stringify(o),
         );
-        Toast.warning(t(toastKey, toastParams));
+        if (rung === 'restart') {
+            Toast.info(t('stream.reconnectingStream'));
+        } else if (!this._canSeamlessRelaunch()) {
+            Toast.info(t('stream.qualityLowered'), { durationMs: 3000 });
+            this._degradeToldPlayer = true;
+        }
         this._qualityRelaunch(relaunchIndex);
+    },
+
+    /**
+     * This device's decoder keeps falling behind (StreamView.onDeviceStrain,
+     * decode queue overflow): a lower bitrate or another transport would not
+     * help it, a lower frame rate or size does (QualityLadder.deviceRelief).
+     * What is lowered here stays for the session — the device does not get
+     * faster — and is kept when the network ladder comes back up.
+     */
+    _onDeviceStrained() {
+        if (this._nav.overlay !== 'streaming') return;
+        if (this._standbyView) return;
+        if (this._lastStreamNative) return; // the native host's own governor
+        if (this._sharePinsQuality()) return;
+        const now = performance.now();
+        if (this._lastDegradeTime && now - this._lastDegradeTime < 15000) return;
+        this._degradeOverrides = this._degradeOverrides || {};
+        const o = this._degradeOverrides;
+        const effective = { ...this._lastStreamingSettings, ...o };
+        const relief = deviceRelief({
+            curFps: effective.stream_fps > 0 ? effective.stream_fps : 60,
+            curHeight: this._effectiveStreamHeight(effective),
+            keepsSize: this._lastStreamKeepsSize === true,
+        });
+        if (!relief) {
+            console.warn('[MW] Decoder falling behind — nothing left to lower');
+            return;
+        }
+        this._lastDegradeTime = now;
+        if ('stream_height' in relief && this._originalStreamHeight === undefined) {
+            this._originalStreamHeight = this._effectiveStreamHeight(effective);
+        }
+        Object.assign(o, relief);
+        this._deviceHold = { ...(this._deviceHold || {}), ...relief };
+        console.warn(
+            '[MW] Decoder falling behind — lowered for this device:',
+            JSON.stringify(relief),
+        );
+        if (!this._canSeamlessRelaunch()) {
+            Toast.info(t('stream.deviceStrained'), { durationMs: 3000 });
+        }
+        this._qualityRelaunch(this._transportIndex || 0);
     },
 
     // ── Automatic quality upgrade ─────────────────────────────────────────
@@ -4646,12 +4736,12 @@ export const MoonlightApp = {
     },
 
     /**
-     * Step the degraded session-only profile back toward the user's settings
-     * once the network has been quiet long enough (no congestion signal for
-     * _upgradeStableMs, default 75s — doubled every time an upgrade flaps,
-     * see _onStreamCongested). One knob per step, reverse of the degradation
-     * ladder: fps → preferred transport → resolution (one rung up, restoring
-     * the user's enhancement setting with the final rung) → bitrate.
+     * Restore the session's own settings once the network has been quiet long
+     * enough (no counted congestion event for _upgradeStableMs, default 75 s —
+     * doubled on a flap, see _onStreamCongested), in ONE relaunch. It used to
+     * take one knob per step, each 75 s apart and each its own relaunch, so
+     * one step down cost up to three back up (review of 23/11/2026). What the
+     * device needed (_deviceHold) stays. After two flaps the session holds.
      */
     _maybeUpgradeQuality() {
         if (this._nav.overlay !== 'streaming') return;
@@ -4659,11 +4749,14 @@ export const MoonlightApp = {
         if (this._standbyView) return;
         // Sharing pins the stream: see _qualityRelaunch.
         if (this._sharePinsQuality()) return;
+        if (this._upgradeHeld) return;
         const sv = this.streamView;
         if (!sv || !sv._firstFrameRendered || sv._quitting || sv._manualQuitting) return;
         const o = this._degradeOverrides;
         if (!o || Object.keys(o).length === 0) return;
-        const base = this._lastStreamingSettings || {};
+        const hold = this._deviceHold || {};
+        const networkKeys = Object.keys(o).filter((k) => !(k in hold) || o[k] !== hold[k]);
+        if (networkKeys.length === 0) return; // only the device's own relief left
 
         const now = performance.now();
         const quietSince = Math.max(
@@ -4673,58 +4766,28 @@ export const MoonlightApp = {
         );
         if (!quietSince || now - quietSince < (this._upgradeStableMs || 75000)) return;
 
-        let relaunchIndex = this._transportIndex || 0;
-        let toastKey;
-        const toastParams = {};
-
-        if (o.stream_fps !== undefined) {
-            delete o.stream_fps;
-            toastKey = 'stream.upgradeFps';
-        } else if (o.transport_mode !== undefined) {
-            delete o.transport_mode;
-            relaunchIndex = 0; // back to the preferred entry of the natural chain
-            toastKey = 'stream.upgradeTransport';
-        } else if (o.stream_height !== undefined) {
-            const userHeight = base.stream_height > 0 ? base.stream_height : 0;
-            const target = userHeight > 0 ? userHeight : this._originalStreamHeight || 1080;
-            const next = [1080, 1440, 2160].find((r) => r > o.stream_height);
-            if (!next || next >= target) {
-                delete o.stream_height;
-                toastParams.res = String(target);
-                // The reduced resolution goes away — the auto-forced upscaler
-                // override goes with it (the user's own setting applies again).
-                if (this._enhancementAutoForced) {
-                    delete o.video_enhancement;
-                    delete o.video_enhancement_algo;
-                    this._enhancementAutoForced = false;
-                }
-            } else {
-                o.stream_height = next;
-                toastParams.res = String(next);
-            }
-            toastKey = 'stream.upgradeResolution';
-        } else if (o.stream_bitrate !== undefined) {
-            const userBitrate = base.stream_bitrate > 0 ? base.stream_bitrate : 20000;
-            const next = Math.round(o.stream_bitrate / 0.7);
-            if (next >= userBitrate) {
-                delete o.stream_bitrate;
-                toastParams.mbps = (userBitrate / 1000).toFixed(1);
-            } else {
-                o.stream_bitrate = next;
-                toastParams.mbps = (next / 1000).toFixed(1);
-            }
-            toastKey = 'stream.upgradeBitrate';
-        } else {
-            // Leftover overrides only (no user-visible knob) — clear them.
-            for (const k of Object.keys(o)) delete o[k];
-        }
-
+        const transportRestored = o.transport_mode !== undefined && !('transport_mode' in hold);
+        for (const k of Object.keys(o)) delete o[k];
+        Object.assign(o, hold);
+        // The reduced resolution goes away — the auto-forced upscaler override
+        // goes with it (the user's own setting applies again).
+        this._enhancementAutoForced = false;
+        if (!('stream_height' in hold)) this._originalStreamHeight = undefined;
         this._lastUpgradeTime = now;
-        if (Object.keys(o).length === 0) this._degradeLevel = 0;
-        if (!toastKey) return; // nothing user-visible changed — no relaunch
+        this._degradeLevel = 0;
+        // Back to the preferred entry of the natural chain when the forced
+        // transport goes away.
+        const relaunchIndex = transportRestored ? 0 : this._transportIndex || 0;
 
-        console.log('[MW] Network stable — upgrade step, remaining overrides:', JSON.stringify(o));
-        Toast.info(t(toastKey, toastParams));
+        console.log(
+            '[MW] Network stable — back to the session settings in one step, kept:',
+            JSON.stringify(o),
+        );
+        // One message closes the episode, and only one the player was told of.
+        if (this._degradeToldPlayer) {
+            Toast.info(t('stream.qualityRestored'), { durationMs: 3000 });
+            this._degradeToldPlayer = false;
+        }
         this._qualityRelaunch(relaunchIndex);
     },
 
