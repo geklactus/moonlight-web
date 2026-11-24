@@ -29,8 +29,17 @@
  * the lines that explain a session (review, 23/11/2026). Each line is keyed by
  * its format string — moonlight-common-c passes literals, so the pointer is
  * stable and free to compare. The first kBurst lines of a key in a window
- * print; the rest are counted, and the count rides on the next line of that
- * key to print, in the next window.
+ * print; the rest are counted, and the count is noted after the next line of
+ * that key to print, in the next window.
+ *
+ * moonlight-common-c also writes one line in two pieces: a stage, with no
+ * newline ("Stopping input stream..."), then "done\n" once it is over. About
+ * eleven stages run at each start and each stop, so "done\n", counted on its
+ * own, used up its allowance at the start and was held back for the rest of
+ * it and most of the stop, and the count note landed inside the next stage's
+ * line (Switch session, 24/11/2026). The rest of a line now goes with its
+ * start: it prints when the start printed, is not counted, and a count note
+ * waits for the line to end.
  *
  * Not thread-safe: the caller holds a lock.
  */
@@ -42,27 +51,44 @@ public:
 
     struct Verdict
     {
-        bool print = true; // write this line
-        int heldBack = 0;  // lines of this key held back in the window that just closed
+        bool print = true; // write this piece
+        int heldBack = 0;  // after writing it, note this many lines held back
     };
 
-    Verdict admit(const void* key, int64_t nowMs)
+    /**
+     * @param endsLine whether this piece ends its line (its format ends in a
+     *        newline); a piece that does not leaves the next one to finish it.
+     */
+    Verdict admit(const void* key, int64_t nowMs, bool endsLine = true)
     {
-        State& s = m_State[key];
         Verdict v;
-        if (!s.started || nowMs - s.windowStart >= kWindowMs) {
-            v.heldBack = s.heldBack;
-            s.started = true;
-            s.windowStart = nowMs;
-            s.count = 0;
-            s.heldBack = 0;
-        }
-        if (s.count < kBurst) {
-            ++s.count;
-            v.print = true;
+        if (m_MidLine) {
+            // The rest of a line already started: it goes with its start.
+            v.print = m_LinePrinted;
         } else {
-            ++s.heldBack;
-            v.print = false;
+            State& s = m_State[key];
+            if (!s.started || nowMs - s.windowStart >= kWindowMs) {
+                // The first line of a window always prints (count is reset
+                // below), so the note is never lost with a held line.
+                m_Note = s.heldBack;
+                s.started = true;
+                s.windowStart = nowMs;
+                s.count = 0;
+                s.heldBack = 0;
+            }
+            if (s.count < kBurst) {
+                ++s.count;
+                v.print = true;
+            } else {
+                ++s.heldBack;
+                v.print = false;
+            }
+            m_LinePrinted = v.print;
+        }
+        m_MidLine = !endsLine;
+        if (endsLine && m_LinePrinted) {
+            v.heldBack = m_Note;
+            m_Note = 0;
         }
         return v;
     }
@@ -76,4 +102,7 @@ private:
         int heldBack = 0;
     };
     std::unordered_map<const void*, State> m_State;
+    bool m_MidLine = false;     // the last piece did not end its line
+    bool m_LinePrinted = false; // that line's start was written
+    int m_Note = 0;             // held-back count to note once the line ends
 };
