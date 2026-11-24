@@ -176,8 +176,10 @@ struct BackendError
     // neither value may survive in it.
     static QString withoutLaunchSecrets(QString msg)
     {
+        // A plain string, not a raw one: moc reads this header, and its
+        // preprocessor takes the quotes inside a raw string for real ones.
         static const QRegularExpression secret(
-            QStringLiteral(R"((?<![A-Za-z0-9_-])(rikey|rikeyid)=[^&\s"'#<>]*)"));
+            QStringLiteral("(?<![A-Za-z0-9_-])(rikey|rikeyid)=[^&\\s\"'#<>]*"));
         return msg.replace(secret, QStringLiteral("\\1=(hidden)"));
     }
 
