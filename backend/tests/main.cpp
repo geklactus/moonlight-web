@@ -21,6 +21,7 @@ void run_launcher_detect_tests();
 void run_host_app_image_tests();
 void run_log_archive_tests();
 void run_backend_error_tests();
+void run_log_repeat_limiter_tests();
 void run_auth_manager_tests();
 void run_connection_guard_tests();
 void run_static_files_tests();
@@ -101,6 +102,7 @@ int main(int argc, char** argv)
     run_host_app_image_tests();
     run_log_archive_tests();
     run_backend_error_tests();
+    run_log_repeat_limiter_tests();
     run_auth_manager_tests();
     run_connection_guard_tests();
     run_static_files_tests();

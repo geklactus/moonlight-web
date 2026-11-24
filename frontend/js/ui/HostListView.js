@@ -133,6 +133,8 @@ export class HostListView {
         this._deviceRunning = new Map();
         this._deviceRunningAt = new Map();
         this.pollTimer = null;
+        // The host poll stopped while the tab was hidden (scheduleNextPoll).
+        this._pollPausedHidden = false;
         this.eventsBound = false;
         this.onLaunchApp = null; // called with (host, app) when an app card is clicked
         // Per-host app state. `apps` is what the grid paints, and it can be on
@@ -177,6 +179,11 @@ export class HostListView {
             if (document.hidden || this._destroyed) return;
             this._autoScan();
             this._checkForUpdate();
+            // The host poll paused while the tab was hidden: ask again now.
+            if (this._pollPausedHidden && this._active && !this.pollTimer) {
+                this._pollPausedHidden = false;
+                this.scheduleNextPoll(0);
+            }
         };
         document.addEventListener('visibilitychange', this._visibilityHandler);
 
@@ -762,7 +769,17 @@ export class HostListView {
     scheduleNextPoll(delay = 3000) {
         if (!this._active || this._destroyed) return;
         this.pollTimer = setTimeout(async () => {
+            this.pollTimer = null;
             if (!this._active || this._destroyed) return;
+            // A hidden tab asks nothing: nobody is looking at the cards, and
+            // coming back to the tab asks at once (_visibilityHandler). One
+            // host-list tab left open on LOLA's own desktop sent 14,838 of the
+            // 19,432 /api/hosts requests stream-front logged from 13 to 23 Nov
+            // 2026, one every 3 s.
+            if (document.hidden) {
+                this._pollPausedHidden = true;
+                return;
+            }
             await this.refresh();
             // Don't re-schedule if stop() was called during refresh
             if (this._active && !this._destroyed) this.scheduleNextPoll();

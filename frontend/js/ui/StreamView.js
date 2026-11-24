@@ -172,6 +172,7 @@ import { StreamViewKeyboard } from './StreamViewKeyboard.js';
 import { StreamViewTouch } from './StreamViewTouch.js';
 import { StreamViewFullscreen, EXIT_FULLSCREEN_EVENT } from './StreamViewFullscreen.js';
 import { flushClientLog, serverDiag } from '../util/ClientLog.js';
+import { CongestionMonitor, isDeviceReason, lossEvidence } from '../stream/CongestionMonitor.js';
 import { UltraPlayer, presentMode, ultraPlayerSupported } from '../stream/ultra/UltraPlayer.js';
 
 // How long the connected remote's line shows before it fades.
@@ -1101,10 +1102,16 @@ export class StreamView {
          *  relaunching the stream with a degraded session-only profile
          *  (bitrate −30% steps, media transport, 60 fps cap). */
         this.onCongestion = null;
-        // Congestion monitor: sliding window of congestion signals — see
+        /** Callback invoked when THIS DEVICE's decoder keeps falling behind
+         *  (decode queue overflow): a lower frame rate or size helps it, a
+         *  lower bitrate or another transport does not. Unset = ignored. */
+        this.onDeviceStrain = null;
+        // Congestion monitor: one event per loss episode, PLIs only with real
+        // loss, decoder strain apart — see CongestionMonitor and
         // _recordCongestionEvent().
-        this._congEvents = [];
-        this._congFiredAt = 0;
+        this._congestion = new CongestionMonitor();
+        /** @type {{packetsLost: number, packetsReceived: number, totalFreezesDuration: number, at: number} | null} */
+        this._lastLossSample = null;
         this._lastBpDrops = 0; // cumulative backend backpressure drops (stats msg)
         /** @type {{n: number, maxMs: number, lastMs: number} | null} link freezes the host saw (stats msg) */
         this._linkFreezes = null;
@@ -3137,8 +3144,14 @@ export class StreamView {
         }
         this.setupDecoder();
 
-        // 6. Request an IDR so Sunshine sends a clean keyframe
-        this._requestIdr('decoder error');
+        // 6. Request an IDR so Sunshine sends a clean keyframe. A decode
+        //    queue that stalled until the reset is this device falling
+        //    behind, not a loss on the link (CongestionMonitor).
+        this._requestIdr(
+            err && err.message === 'Decode queue stalled'
+                ? 'decode queue stalled'
+                : 'decoder error',
+        );
 
         this.setStatus('connecting', 'Recovering...');
 
@@ -3161,20 +3174,26 @@ export class StreamView {
         // is otherwise a list of requests with no why (12/10, an H.264 guest
         // of the shared feed asking every second).
         this.webrtc.send({ type: 'requestidr', reason });
-        this._recordCongestionEvent('sv:' + reason);
+        this._recordCongestionEvent(isDeviceReason(reason) ? 'device' : 'idr', 'sv:' + reason);
     }
 
     /**
-     * Congestion monitor. Records one congestion signal — an IDR request
-     * actually sent, a batch of backend backpressure drops, or receiver PLIs —
-     * and fires onCongestion() when signals are SUSTAINED: ≥4 events within a
-     * 20s window. The first 10s of the stream are ignored (startup recovery
-     * traffic), and a 15s cooldown separates two detections — long enough for
-     * the relaunched degraded stream to prove itself, short enough that a
-     * still-congested stream escalates to the next ladder step quickly.
+     * Congestion monitor. Records one signal — an IDR request actually sent
+     * (`idr`), a batch of backend backpressure drops (`drops`), receiver PLIs
+     * with the loss seen over the same poll (`pli`), or this device's decoder
+     * falling behind (`device`) — and fires onCongestion() when the link's
+     * signals are SUSTAINED, onDeviceStrain() when the decoder's are. What
+     * counts, and how often, is CongestionMonitor's: one event per loss
+     * episode, ≥4 in 20 s, 15 s between detections. The first 10 s of the
+     * stream are ignored (startup recovery traffic).
+     *
+     * @param {'idr'|'drops'|'pli'|'device'} kind
+     * @param {string} reason for the log
+     * @param {{lossFraction: number, frozenFraction: number}} [evidence] with `pli`
      */
-    _recordCongestionEvent(reason) {
-        if (!this.onCongestion || this._quitting || this._manualQuitting) return;
+    _recordCongestionEvent(kind, reason, evidence) {
+        if (this._quitting || this._manualQuitting) return;
+        if (!this.onCongestion && !this.onDeviceStrain) return;
         // A hidden page is not a congested link: a phone in the background
         // freezes the page, frames wait in the channel and land in one burst
         // on thaw, as frame gaps, backend drops and reference-invalid retries
@@ -3193,16 +3212,19 @@ export class StreamView {
         // what stalls while it is down, and for a while after, is the outage,
         // not congestion — a relaunch one rung down would not help it.
         if (this.webrtc && now < (this.webrtc.linkQuietUntil || 0)) return;
-        // Every recorded signal (not just sustained detections) is reported so
+        const r = this._congestion.record(kind, now, evidence);
+        if (kind === 'device') {
+            if (r.deviceStrained && typeof this.onDeviceStrain === 'function') {
+                console.warn('[StreamView] Decoder falling behind (last: ' + reason + ')');
+                this.onDeviceStrain();
+            }
+            return;
+        }
+        if (!r.counted) return;
+        // Every counted signal (not just sustained detections) is reported so
         // the app can measure quiet time for the automatic quality upgrade.
         if (typeof this.onCongestionSignal === 'function') this.onCongestionSignal();
-        this._congEvents.push(now);
-        while (this._congEvents.length > 0 && now - this._congEvents[0] > 20000) {
-            this._congEvents.shift();
-        }
-        if (this._congEvents.length >= 4 && now - this._congFiredAt > 15000) {
-            this._congFiredAt = now;
-            this._congEvents.length = 0;
+        if (r.congested && typeof this.onCongestion === 'function') {
             console.warn('[StreamView] Sustained congestion detected (last: ' + reason + ')');
             this.onCongestion();
         }
@@ -4085,6 +4107,7 @@ export class StreamView {
                 this._referenceValid = true;
                 this._idrRequested = false;
                 this._queueStallStart = 0;
+                this._congestion.keyframe();
             }
         } catch (err) {
             console.error('[StreamView] decode() error:', err.message, err);
@@ -6115,7 +6138,8 @@ export class StreamView {
             };
             // IDR requests actually sent by the transport feed the congestion
             // monitor (loss/starvation-driven — a storm means a saturated link).
-            this.webrtc.onIdrRequested = (reason) => this._recordCongestionEvent('dc:' + reason);
+            this.webrtc.onIdrRequested = (reason) =>
+                this._recordCongestionEvent('idr', 'dc:' + reason);
         }
         // Audio: WSS feeds Opus packets to the AudioPipeline. WebRTC transports
         // use a native RTP Opus track (rendered via the <audio> element), so no
@@ -6218,12 +6242,38 @@ export class StreamView {
                 this._lastInboundStatsTime = now;
 
                 // PLIs sent by the receiver = the media-mode equivalent of IDR
-                // requests: each one means the decoder lost its reference.
+                // requests: each one means the decoder lost its reference. They
+                // count toward the ladder only with real loss or frozen time
+                // over the same poll (CongestionMonitor): a PLI with nothing
+                // lost is not the link's doing.
                 const pliCount = inbound.pliCount || 0;
+                const lossNow = {
+                    packetsLost: inbound.packetsLost || 0,
+                    packetsReceived: inbound.packetsReceived || 0,
+                    totalFreezesDuration: inbound.totalFreezesDuration || 0,
+                    at: now,
+                };
+                const prevLoss = this._lastLossSample;
                 if (pliCount > this._lastPliCount) {
-                    this._recordCongestionEvent('pli +' + (pliCount - this._lastPliCount));
+                    const evidence = lossEvidence(
+                        prevLoss,
+                        lossNow,
+                        prevLoss ? (now - prevLoss.at) / 1000 : 0,
+                    );
+                    this._recordCongestionEvent(
+                        'pli',
+                        'pli +' +
+                            (pliCount - this._lastPliCount) +
+                            ' (loss ' +
+                            (evidence.lossFraction * 100).toFixed(1) +
+                            '%, frozen ' +
+                            (evidence.frozenFraction * 100).toFixed(0) +
+                            '%)',
+                        evidence,
+                    );
                 }
                 this._lastPliCount = pliCount;
+                this._lastLossSample = lossNow;
 
                 // Report the receiver's counters to the host, which cannot see
                 // any of them: on this transport the backend can send every
@@ -6492,7 +6542,7 @@ export class StreamView {
         console.log('[StreamView] Back from the background — timing re-primed, pads repeated');
         // What the congestion monitor counted while we were away was the
         // freeze, not the link (see _recordCongestionEvent).
-        this._congEvents.length = 0;
+        this._congestion.reset();
         this._resumedAt = performance.now();
         this._stallDetector.reset();
         this._clearPacingTimer();
@@ -8653,6 +8703,7 @@ export class StreamView {
             if (typeof msg.bpDrops === 'number') {
                 if (msg.bpDrops > this._lastBpDrops) {
                     this._recordCongestionEvent(
+                        'drops',
                         'backend drops +' + (msg.bpDrops - this._lastBpDrops),
                     );
                 }
