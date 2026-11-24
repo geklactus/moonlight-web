@@ -62,6 +62,7 @@ add_executable(run_tests
     test_launcher_detect.cpp
     test_host_app_image.cpp
     test_log_archive.cpp
+    test_backend_error.cpp
     test_log_repeat_limiter.cpp
     test_auth_manager.cpp
     test_connection_guard.cpp
