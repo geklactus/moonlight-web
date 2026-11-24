@@ -20,6 +20,7 @@ const LIVE_CALLBACKS = [
     'onConnectionFailed',
     'onCongestion',
     'onCongestionSignal',
+    'onDeviceStrain',
     'onHostDisplayFormat',
     'onClientScreenChanged',
 ];
