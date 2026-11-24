@@ -954,7 +954,13 @@
         "joyconUnavailable": "Vos Joy-Con ne peuvent pas se connecter à ce jeu : {{why}}",
         "joyconNotTaken": "cet hôte ne prend pas les Joy-Con.",
         "joyconRefused": "Votre Joy-Con ne s'est pas connecté : {{why}}",
-        "joyconNoWebHid": "Ce navigateur ne peut pas connecter de Joy-Con. Chrome ou Edge sur un ordinateur le peuvent."
+        "joyconNoWebHid": "Ce navigateur ne peut pas connecter de Joy-Con. Chrome ou Edge sur un ordinateur le peuvent.",
+        "proConnect": "Connectez votre manette Pro : cliquez, puis choisissez-la dans la liste.",
+        "proConnected": "Manette Pro connectée.",
+        "proUnavailable": "Votre manette Pro ne peut pas se connecter à ce jeu : {{why}}",
+        "proNotTaken": "cet hôte ne prend pas de manette Pro.",
+        "proRefused": "Votre manette Pro ne s'est pas connectée : {{why}}",
+        "proNoWebHid": "Ce navigateur ne peut pas connecter de manette Pro. Chrome ou Edge sur un ordinateur le peuvent."
     },
     "transport": {
         "webrtcDcUdp": "WebRTC DataChannel (UDP)",

@@ -14,6 +14,7 @@ import {
     HidReportPump,
     JOYCON_FILTERS,
     JOYCON_REPLY_IDS,
+    PRO_FILTERS,
     WIIMOTE_FILTERS,
     WIIMOTE_REPLY_IDS,
     attachMessage,
@@ -21,6 +22,8 @@ import {
     isGameDevice,
     isJoycon,
     isJoyconOutput,
+    isProController,
+    isSwitchHid,
     isWiimote,
     isWiimoteOutput,
     modelFilters,
@@ -115,14 +118,32 @@ const fromBase64 = (text) => {
     }
 };
 
-/** A device this page may send: a game device, or a Wii Remote or a Joy-Con by its ids. */
+/** A device this page may send: a game device, or a Wii Remote or a Switch controller by its ids. */
 function sendable(device) {
-    return isGameDevice(device.collections) || isWiimote(device) || isJoycon(device);
+    return isGameDevice(device.collections) || isWiimote(device) || isSwitchHid(device);
 }
 
-/** Which half a Joy-Con is: 'left' or 'right'. */
+/** Which half a Joy-Con is: 'left' or 'right'; a Pro Controller is 'both'. */
 export function joyconSide(device) {
+    if (isProController(device)) return 'both';
     return device?.productId === 0x2006 ? 'left' : 'right';
+}
+
+/** The halves a Switch controller holds: one for a Joy-Con, both for a Pro Controller. */
+export function switchSides(device) {
+    const side = joyconSide(device);
+    return side === 'both' ? ['left', 'right'] : [side];
+}
+
+/**
+ * Which Switch controller a stream page offers: 'joycon' (a pair) or 'pro'.
+ * Its chooser's filters, and which granted devices are that kind.
+ */
+export function switchKindFilters(kind) {
+    return kind === 'pro' ? PRO_FILTERS : JOYCON_FILTERS;
+}
+export function isSwitchKind(device, kind) {
+    return kind === 'pro' ? isProController(device) : isJoycon(device);
 }
 
 // The pads a Joy-Con shows up as in the Gamepad API: each half, the pair Chrome
@@ -138,6 +159,9 @@ export const JOYCON_PAD_KEYS = [
     'name:joy-con (l/r)',
     'name:joy-con l+r',
 ];
+
+// The pads a Pro Controller shows up as: its ids, and the name macOS gives it.
+export const PRO_PAD_KEYS = ['usb:057e:2009', 'name:pro controller'];
 
 /** The key GamepadManager knows the same device by. */
 export function padKeyOf(device) {
@@ -341,6 +365,7 @@ export class HidPassthrough {
             if (e.state === 'on' || e.state === 'pending') {
                 out.add(padKeyOf(d));
                 if (isJoycon(d)) for (const k of JOYCON_PAD_KEYS) out.add(k);
+                if (isProController(d)) for (const k of PRO_PAD_KEYS) out.add(k);
             }
         return Array.from(out);
     }
@@ -388,7 +413,7 @@ export class HidPassthrough {
                             slot: e.slot,
                             name: device.productName || '',
                         });
-                    if (isJoycon(device))
+                    if (isSwitchHid(device))
                         this._onJoycon?.({
                             type: 'attached',
                             slot: e.slot,
@@ -403,7 +428,7 @@ export class HidPassthrough {
                     e.why = String(msg.why || '');
                     if (isWiimote(device))
                         this._onWiimote?.({ type: 'refused', slot: msg.slot, why: e.why });
-                    if (isJoycon(device))
+                    if (isSwitchHid(device))
                         this._onJoycon?.({ type: 'refused', slot: msg.slot, why: e.why });
                 }
                 if (this._onResult) this._onResult(device, !!msg.ok, e.why);
@@ -426,7 +451,7 @@ export class HidPassthrough {
                     this._writeWiimote(entry[0], entry[1], msg.reportId, fromBase64(msg.data));
                 return true;
             }
-            if (entry && isJoycon(entry[0])) {
+            if (entry && isSwitchHid(entry[0])) {
                 // As for the Wii Remote: only for a host that said the game
                 // drives it (hidcaps.joycon), once it took the device, and only
                 // what the allow-list lets through (_writeJoycon).
@@ -475,7 +500,7 @@ export class HidPassthrough {
         if (!this._hid || !this._caps?.available) return;
         const keys = loadForwarded(this._storage);
         for (const d of await this._hid.getDevices()) {
-            if (keys.has(deviceKey(d)) && sendable(d) && !isWiimote(d) && !isJoycon(d))
+            if (keys.has(deviceKey(d)) && sendable(d) && !isWiimote(d) && !isSwitchHid(d))
                 await this._attach(d);
         }
         this._changed();
@@ -566,7 +591,7 @@ export class HidPassthrough {
      * (linkJoyconsRemembered), never to a game that wants it as a pad.
      * @returns {Promise<HIDDevice[]>} the Joy-Cons picked and sent
      */
-    async linkJoycon() {
+    async linkJoycon(kind = 'joycon') {
         if (!this._hid) return [];
         if (!this._caps?.available || !this._caps?.joycon) {
             this._onJoycon?.({ type: 'refused', slot: -1, why: this._caps?.why || '' });
@@ -574,11 +599,11 @@ export class HidPassthrough {
         }
         let chosen = [];
         try {
-            chosen = await this._hid.requestDevice({ filters: JOYCON_FILTERS });
+            chosen = await this._hid.requestDevice({ filters: switchKindFilters(kind) });
         } catch {
             chosen = [];
         }
-        chosen = chosen.filter(isJoycon);
+        chosen = chosen.filter((d) => isSwitchKind(d, kind));
         if (!chosen.length) {
             this._onJoycon?.({ type: 'cancelled' });
             this._changed();
@@ -592,34 +617,37 @@ export class HidPassthrough {
      * needs no gesture, and lists the ones connected now.
      * @returns {Promise<HIDDevice[]>} the Joy-Cons sent
      */
-    async linkJoyconsRemembered() {
+    async linkJoyconsRemembered(kind = 'joycon') {
         if (!this._hid || !this._caps?.available || !this._caps?.joycon) return [];
         let remembered = [];
         try {
-            remembered = (await this._hid.getDevices()).filter(isJoycon);
+            remembered = (await this._hid.getDevices()).filter((d) => isSwitchKind(d, kind));
         } catch {
             return [];
         }
         return this._attachJoycons(remembered, { quiet: true });
     }
 
-    /** The halves sent or being sent: 'left', 'right'. */
+    /** The halves sent or being sent: 'left', 'right' (a Pro Controller holds both). */
     joyconSides() {
         const out = new Set();
         for (const [d, e] of this._entries)
-            if (isJoycon(d) && (e.state === 'on' || e.state === 'pending')) out.add(joyconSide(d));
+            if (isSwitchHid(d) && (e.state === 'on' || e.state === 'pending'))
+                for (const side of switchSides(d)) out.add(side);
         return out;
     }
 
     // One of each half: a second left or right Joy-Con is left alone (a seat is
-    // one player's). `quiet`: one that can't be opened isn't an event (nobody
-    // asked for it just now).
+    // one player's), and so is anything beside a Pro Controller, which holds
+    // both. `quiet`: one that can't be opened isn't an event (nobody asked for
+    // it just now).
     async _attachJoycons(devices, { quiet = false } = {}) {
         const sent = [];
         for (const d of devices) {
             const existing = this._entries.get(d);
             const here = existing && (existing.state === 'on' || existing.state === 'pending');
-            if (!here && this.joyconSides().has(joyconSide(d))) continue;
+            const have = this.joyconSides();
+            if (!here && switchSides(d).some((side) => have.has(side))) continue;
             if (!here) await this._attach(d);
             const entry = this._entries.get(d);
             if (entry && (entry.state === 'on' || entry.state === 'pending')) sent.push(d);
@@ -781,7 +809,7 @@ export class HidPassthrough {
         // A Wii Remote's answers, and a Joy-Con's: once each, on the reliable channel.
         const replyIds = isWiimote(device)
             ? WIIMOTE_REPLY_IDS
-            : isJoycon(device)
+            : isSwitchHid(device)
               ? JOYCON_REPLY_IDS
               : new Set();
         // Whether the remote itself has spoken: a DolphinBar entry opens and attaches with no remote
@@ -842,7 +870,7 @@ export class HidPassthrough {
         if (!e) return;
         if (isWiimote(device) && (e.state === 'on' || e.state === 'pending'))
             this._onWiimote?.({ type: 'detached', slot: e.slot });
-        if (isJoycon(device) && (e.state === 'on' || e.state === 'pending'))
+        if (isSwitchHid(device) && (e.state === 'on' || e.state === 'pending'))
             this._onJoycon?.({ type: 'detached', slot: e.slot, side: joyconSide(device) });
         if (tell && (e.state === 'on' || e.state === 'pending')) this._send(detachMessage(e.slot));
         this._release(device, e);

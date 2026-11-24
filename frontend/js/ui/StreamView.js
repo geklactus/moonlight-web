@@ -196,14 +196,17 @@ const LAUNCH_WIIMOTE_HERE = (() => {
         return false;
     }
 })();
-// The same for "Joy-Cons at this computer" (?joycon=here), read as early.
-const LAUNCH_JOYCON_HERE = (() => {
+// The same for a Switch controller at this computer, read as early: "Joy-Cons"
+// (?joycon=here) or "Pro Controller" (?joycon=pro). The kind, or null.
+const switchKindOf = (search) => {
     try {
-        return new URLSearchParams(location.search).get('joycon') === 'here';
+        const v = new URLSearchParams(search).get('joycon');
+        return v === 'here' ? 'joycon' : v === 'pro' ? 'pro' : null;
     } catch {
-        return false;
+        return null;
     }
-})();
+};
+const LAUNCH_SWITCH_KIND = switchKindOf(globalThis.location?.search || '');
 
 /**
  * Lane name → the i18n key the card already uses for that value. The graph
@@ -8232,14 +8235,12 @@ export class StreamView {
         });
     }
 
-    /** The launcher asked for Joy-Cons at this computer (lola play.js passes ?joycon=here). */
+    /**
+     * The Switch controller the launcher asked for at this computer: 'joycon' (lola play.js passes
+     * ?joycon=here) or 'pro' (?joycon=pro); null for none.
+     */
     _joyconLocalPick() {
-        if (LAUNCH_JOYCON_HERE) return true;
-        try {
-            return new URLSearchParams(location.search).get('joycon') === 'here';
-        } catch {
-            return false;
-        }
+        return LAUNCH_SWITCH_KIND || switchKindOf(globalThis.location?.search || '');
     }
 
     /**
@@ -8249,9 +8250,11 @@ export class StreamView {
      * and the banner says which half is still to come.
      */
     async _offerJoycon() {
-        if (this._quitting || !this._joyconLocalPick()) return;
+        const kind = this._quitting ? null : this._joyconLocalPick();
+        if (!kind) return;
+        const pro = kind === 'pro';
         if (!navigator.hid) {
-            this._sayJoycon(t('stream.joyconNoWebHid'), 'unavailable');
+            this._sayJoycon(t(pro ? 'stream.proNoWebHid' : 'stream.joyconNoWebHid'), 'unavailable');
             return;
         }
         const hp = this._hidPassthrough;
@@ -8263,9 +8266,12 @@ export class StreamView {
             this._joyconConnectToast = null;
             this._joyconOffered = false;
             const why = caps.available
-                ? t('stream.joyconNotTaken')
+                ? t(pro ? 'stream.proNotTaken' : 'stream.joyconNotTaken')
                 : caps.why || t('stream.wiimoteNoReason');
-            this._sayJoycon(t('stream.joyconUnavailable', { why }), 'unavailable');
+            this._sayJoycon(
+                t(pro ? 'stream.proUnavailable' : 'stream.joyconUnavailable', { why }),
+                'unavailable',
+            );
             return;
         }
         if (this._joyconWhyKind === 'unavailable') this._sayJoycon(null);
@@ -8277,7 +8283,7 @@ export class StreamView {
         }
         if (this._joyconOffered) return;
         this._joyconOffered = true;
-        await hp.linkJoyconsRemembered(); // each one sent says so through onJoycon('attached')
+        await hp.linkJoyconsRemembered(kind); // each one sent says so through onJoycon('attached')
         if (hp !== this._hidPassthrough) return;
         const have = hp.joyconSides();
         this._joyconConnectToast?.dismiss();
@@ -8286,11 +8292,13 @@ export class StreamView {
             this._joyconOffered = false;
             return;
         }
-        const words = !have.size
-            ? 'stream.joyconConnect'
-            : have.has('left')
-              ? 'stream.joyconConnectRight'
-              : 'stream.joyconConnectLeft';
+        const words = pro
+            ? 'stream.proConnect'
+            : !have.size
+              ? 'stream.joyconConnect'
+              : have.has('left')
+                ? 'stream.joyconConnectRight'
+                : 'stream.joyconConnectLeft';
         this._joyconConnectToast = Toast.info(t(words), {
             sticky: true,
             action: {
@@ -8300,7 +8308,7 @@ export class StreamView {
                     this._sayJoycon(null);
                     // A pick that didn't connect, or none, comes back as 'refused' or 'cancelled',
                     // which say so and offer Connect again.
-                    hp.linkJoycon();
+                    hp.linkJoycon(kind);
                 },
             },
         });
@@ -8323,14 +8331,21 @@ export class StreamView {
             this._joyconStatusToast?.dismiss();
             this._joyconStatusToast =
                 sides.size >= 2
-                    ? Toast.info(t('stream.joyconBoth'), { durationMs: JOYCON_STATUS_TOAST_MS })
+                    ? Toast.info(
+                          t(ev.side === 'both' ? 'stream.proConnected' : 'stream.joyconBoth'),
+                          { durationMs: JOYCON_STATUS_TOAST_MS },
+                      )
                     : null;
         } else if (ev.type === 'refused') {
             const why =
                 ev.local === 'unopened'
                     ? t('stream.wiimoteNotOpened')
                     : ev.why || t('stream.wiimoteNoReason');
-            this._sayJoycon(t('stream.joyconRefused', { why }), 'refused');
+            const pro = this._joyconLocalPick() === 'pro';
+            this._sayJoycon(
+                t(pro ? 'stream.proRefused' : 'stream.joyconRefused', { why }),
+                'refused',
+            );
         } else if (ev.type === 'detached') {
             this._joyconStatusToast?.dismiss();
             this._joyconStatusToast = null;

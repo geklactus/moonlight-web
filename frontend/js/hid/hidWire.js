@@ -68,12 +68,16 @@ export function isWiimoteOutput(reportId) {
 
 // The Joy-Cons, by their ids: sent as themselves so the game's own Joy-Con
 // driver (Eden's, on Wolf on LOLA) runs them, with motion, rumble and lights.
-// The Pro Controller (057e:2009) is not here yet: the host's own kernel would
-// take a copy of it (geklactus/lola docs/joycon/plan.md).
 export const JOYCON_FILTERS = [
     { vendorId: 0x057e, productId: 0x2006 }, // Joy-Con (L)
     { vendorId: 0x057e, productId: 0x2007 }, // Joy-Con (R)
 ];
+
+// The Pro Controller: the Joy-Con's protocol (the same reports, the same
+// writes), both halves in one device, sent as the Joy-Cons are. Its copy goes
+// on a bus the host's own kernel driver doesn't match (the host's
+// GameStreamHid; geklactus/lola docs/joycon/plan.md).
+export const PRO_FILTERS = [{ vendorId: 0x057e, productId: 0x2009 }];
 
 /** True for a Joy-Con (either half), from its ids. */
 export function isJoycon(device) {
@@ -82,7 +86,17 @@ export function isJoycon(device) {
     );
 }
 
-// A Joy-Con's answer to a subcommand (0x21), the one reply to one request: on
+/** True for a Switch Pro Controller, from its ids. */
+export function isProController(device) {
+    return device?.vendorId === 0x057e && device?.productId === 0x2009;
+}
+
+/** A Joy-Con or a Pro Controller: a Switch controller the game's own driver runs. */
+export function isSwitchHid(device) {
+    return isJoycon(device) || isProController(device);
+}
+
+// A Joy-Con's (or a Pro Controller's) answer to a subcommand (0x21), the one reply to one request: on
 // the reliable channel as hidreply. Its full reports (0x30, and 0x31 with the
 // MCU's data) and simple ones (0x3f) carry whole states and go on 'hid'.
 export const JOYCON_REPLY_IDS = new Set([0x21]);

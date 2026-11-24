@@ -15,6 +15,7 @@ import {
     HOLD_MS,
     HidPassthrough,
     JOYCON_PAD_KEYS,
+    PRO_PAD_KEYS,
     deviceKey,
     hidHelpFor,
     hidModelOf,
@@ -1149,5 +1150,100 @@ describe('HidPassthrough: Joy-Cons sent as themselves', () => {
             { type: 'refused', slot: 0, why: 'Only Wii Remotes can be connected to this game.' },
         ]);
         expect(t.hp.joyconSides().size).toBe(0);
+    });
+});
+
+/** A Switch Pro Controller as WebHID shows it over Bluetooth: its ids, vendor collections. */
+function fakePro({ openFails = false } = {}) {
+    const d = fakeDevice({
+        vendorId: 0x057e,
+        productId: 0x2009,
+        usagePage: 0xff00,
+        usage: 1,
+        openFails,
+    });
+    d.productName = 'Pro Controller';
+    d.sent = [];
+    d.sendReport = vi.fn(async (id, data) => {
+        d.sent.push([id, Array.from(data)]);
+    });
+    return d;
+}
+
+describe('HidPassthrough: a Pro Controller sent as itself', () => {
+    const b64 = (bytes) => globalThis.btoa(String.fromCharCode(...bytes));
+    const events = [];
+    const start = (devices, caps = { joycon: true }) => {
+        events.length = 0;
+        const t = setup(devices, [], { onJoycon: (e) => events.push(e) });
+        t.hp.handleMessage({ type: 'hidcaps', available: true, ...caps });
+        return t;
+    };
+
+    it('links it through a chooser narrowed to the Pro Controller, both halves in one', async () => {
+        const pro = fakePro();
+        const t = start([pro]);
+        t.hid.requestDevice.mockResolvedValueOnce([pro]);
+        expect(await t.hp.linkJoycon('pro')).toEqual([pro]);
+        expect(t.hid.requestDevice).toHaveBeenCalledWith({
+            filters: [{ vendorId: 0x057e, productId: 0x2009 }],
+        });
+        expect(t.sent.filter((m) => m.type === 'hidattach').map((m) => m.productId)).toEqual([
+            0x2009,
+        ]);
+        t.hp.handleMessage({ type: 'hidattached', slot: 0, ok: true });
+        expect(Array.from(t.hp.joyconSides()).sort()).toEqual(['left', 'right']);
+        expect(events).toEqual([
+            { type: 'attached', slot: 0, side: 'both', name: 'Pro Controller' },
+        ]);
+        expect(loadForwarded(t.storage).size).toBe(0);
+    });
+
+    it('sends the one already allowed with no click, and leaves Joy-Cons alone when asked for a Pro', async () => {
+        const pro = fakePro();
+        const left = fakeJoycon('left');
+        const t = start([left, pro]);
+        expect(await t.hp.linkJoyconsRemembered('pro')).toEqual([pro]);
+        expect(t.sent.filter((m) => m.type === 'hidattach').map((m) => m.productId)).toEqual([
+            0x2009,
+        ]);
+        expect(left.opened).toBe(false);
+        // Asked for Joy-Cons, nothing goes beside the Pro Controller: it holds both halves.
+        expect(await t.hp.linkJoyconsRemembered('joycon')).toEqual([]);
+        expect(left.opened).toBe(false);
+    });
+
+    it("writes the game's subcommands to it through the Joy-Con's allow-list, and never a flash write", async () => {
+        const pro = fakePro();
+        const t = start([pro]);
+        await t.hp.linkJoyconsRemembered('pro');
+        t.hp.handleMessage({ type: 'hidattached', slot: 0, ok: true });
+        const sub = (s, ...args) => [0x03, 0, 1, 0x40, 0x40, 0, 1, 0x40, 0x40, s, ...args];
+        const out = (bytes) => ({
+            type: 'hidrequest',
+            slot: 0,
+            kind: 'output',
+            reportId: 0x01,
+            data: b64([0x01, ...bytes]),
+        });
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+        t.hp.handleMessage(out(sub(0x30, 0x01))); // the player light
+        t.hp.handleMessage(out(sub(0x11, 0x00))); // a flash write: refused
+        await vi.waitFor(() => expect(pro.sent).toHaveLength(1));
+        expect(pro.sent[0]).toEqual([0x01, sub(0x30, 0x01)]);
+        expect(t.hp.joyconRefused).toBe(1);
+        warn.mockRestore();
+    });
+
+    it('keeps the pads it shows up as off the mapped pads while it is sent', async () => {
+        const pro = fakePro();
+        const t = start([pro]);
+        await t.hp.linkJoyconsRemembered('pro');
+        for (const k of PRO_PAD_KEYS) expect(t.hp.excludedKeys()).toContain(k);
+        expect(PRO_PAD_KEYS).toContain('usb:057e:2009');
+        expect(t.hp.excludedKeys()).not.toContain('usb:057e:200e'); // not the Joy-Cons' pads
+        t.hid.unplug(pro);
+        expect(events.at(-1)).toEqual({ type: 'detached', slot: 0, side: 'both' });
+        expect(t.hp.excludedKeys()).toEqual([]);
     });
 });

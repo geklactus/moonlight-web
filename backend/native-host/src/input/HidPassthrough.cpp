@@ -143,7 +143,8 @@ struct HidPassthrough::Slot
     {
         return sameAs(other.name, other.vendorId, other.productId, other.version,
                       other.descriptor) &&
-               identity.uniq == other.uniq && identity.phys == other.phys;
+               identity.uniq == other.uniq && identity.phys == other.phys &&
+               identity.bus == other.bus;
     }
 };
 
@@ -554,6 +555,7 @@ std::string HidPassthrough::attach(int slot, const HidDeviceInfo& device)
         want.descriptor = descriptor;
         want.uniq = device.uniq;
         want.phys = device.phys;
+        want.bus = device.bus;
         std::lock_guard<std::mutex> lock(m_mutex);
         auto it = m_slots.find(slot);
         if (it != m_slots.end() && it->second && it->second->sameAs(want)) {
@@ -590,6 +592,7 @@ std::string HidPassthrough::attach(int slot, const HidDeviceInfo& device)
         s->identity.descriptor = descriptor;
         s->identity.uniq = device.uniq;
         s->identity.phys = device.phys;
+        s->identity.bus = device.bus;
         s->restWhenSilent = device.restWhenSilent;
         s->pidFirstId = pidId;
         s->describe(descriptor);

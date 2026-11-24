@@ -26,11 +26,23 @@ namespace {
 
 // What the page reads, in words a player understands (spec §7). The log gets
 // the technical reason beside them.
-const char* const kNotHere = "A Wii Remote or Joy-Cons can't be connected to this stream.";
-const char* const kNoBackend = "This host can't take a Wii Remote or Joy-Cons right now.";
-const char* const kNotReady = "The game isn't ready for a Wii Remote or Joy-Cons yet.";
-const char* const kNotAllowed = "Only Wii Remotes and Joy-Cons can be connected to this game.";
-const char* const kOneOnly = "This game takes one Wii Remote or one pair of Joy-Cons per player.";
+const char* const kNotHere = "A Wii Remote or a Switch controller can't be connected to this stream.";
+const char* const kNoBackend = "This host can't take a Wii Remote or a Switch controller right now.";
+const char* const kNotReady = "The game isn't ready for a Wii Remote or a Switch controller yet.";
+const char* const kNotAllowed =
+    "Only Wii Remotes, Joy-Cons and Pro Controllers can be connected to this game.";
+const char* const kOneOnly =
+    "This game takes one Wii Remote, one pair of Joy-Cons or one Pro Controller per player.";
+
+// Linux's BUS_I2C (<linux/input.h>). A Pro Controller's copy says it's on that
+// bus: the host's own hid-nintendo matches 057e:2009 on USB and on Bluetooth
+// (for the Joy-Cons on Bluetooth only), and would bind a USB copy and start its
+// own conversation with the controller through the page. On I2C hid-generic
+// takes it and its hidraw node is there for the game; SDL's hidapi, which Eden's
+// Joy-Con driver enumerates with, lists I2C devices as it lists USB ones (its
+// linux/hid.c keeps USB, Bluetooth, I2C and SPI). Checked on LOLA 2026-11-23
+// with a uhid copy: hid-generic, a hidraw node, InputPlumber skipping it.
+constexpr uint16_t kBusI2c = 0x18;
 
 } // namespace
 
@@ -39,12 +51,14 @@ const std::vector<GameStreamHid::Model>& GameStreamHid::allowList()
     // A Wii Remote reports only when something changes: never put to rest, a
     // made-up report would be a false answer to the game (spec §4). The same
     // for a Joy-Con: its reports carry a counter and its motion, which the
-    // game's driver reads as the Joy-Con's own.
+    // game's driver reads as the Joy-Con's own. A Pro Controller speaks the
+    // Joy-Con's protocol, both halves in one device.
     static const std::vector<Model> kList = {
         {0x057e, 0x0306, "Nintendo RVL-CNT-01 (Wii Remote)", false, Kind::Wiimote},
         {0x057e, 0x0330, "Nintendo RVL-CNT-01-TR (Wii Remote Plus)", false, Kind::Wiimote},
         {0x057e, 0x2006, "Joy-Con (L)", false, Kind::JoyconLeft},
         {0x057e, 0x2007, "Joy-Con (R)", false, Kind::JoyconRight},
+        {0x057e, 0x2009, "Pro Controller", false, Kind::ProController},
     };
     return kList;
 }
@@ -52,8 +66,8 @@ const std::vector<GameStreamHid::Model>& GameStreamHid::allowList()
 bool GameStreamHid::fits(Kind kind, const std::vector<Kind>& have)
 {
     if (have.empty()) return true;
-    // A Wii Remote is alone; a Joy-Con joins only its other half.
-    if (kind == Kind::Wiimote || have.size() > 1) return false;
+    // A Wii Remote or a Pro Controller is alone; a Joy-Con joins only its other half.
+    if (kind == Kind::Wiimote || kind == Kind::ProController || have.size() > 1) return false;
     return (kind == Kind::JoyconLeft && have[0] == Kind::JoyconRight) ||
            (kind == Kind::JoyconRight && have[0] == Kind::JoyconLeft);
 }
@@ -183,6 +197,7 @@ QString GameStreamHid::attach(int slot, const QJsonObject& message)
     device.productId = productId;
     device.uniq = uniqFor(m_sessionId, slot);
     device.phys = kPhys;
+    if (model->kind == Kind::ProController) device.bus = kBusI2c;
     device.restWhenSilent = model->restWhenSilent;
 
     if (!m_hid) m_hid = std::make_unique<mw::native::HidPassthrough>(m_onRequest, m_factory);

@@ -49,6 +49,9 @@ struct VirtualHidIdentity
     /// here, so a service on that host can tell whose they are.
     std::string uniq;
     std::string phys;
+    /// The bus it says it's on (Linux's BUS_* numbers: uhid's bus); 0: the
+    /// backend's default (USB on Linux). Other backends ignore it.
+    uint16_t bus = 0;
 };
 
 class IVirtualHid

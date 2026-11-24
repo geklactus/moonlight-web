@@ -63,7 +63,7 @@ public:
         }
         c.rd_size = static_cast<__u16>(id.descriptor.size());
         std::memcpy(c.rd_data, id.descriptor.data(), id.descriptor.size());
-        c.bus = BUS_USB;
+        c.bus = id.bus ? id.bus : BUS_USB;
         c.vendor = id.vendorId;
         c.product = id.productId;
         c.version = id.version;

@@ -132,6 +132,10 @@ struct HidDeviceInfo
     /// backend's defaults.
     std::string uniq;
     std::string phys;
+    /// The bus the recreated device says it's on (Linux's BUS_* numbers, uhid's
+    /// bus); 0: the backend's default (USB). A Pro Controller goes on BUS_I2C,
+    /// a bus the host's own hid-nintendo doesn't match (GameStreamHid).
+    uint16_t bus = 0;
     /// Whether a silence puts its input reports back to rest (kSilenceMs).
     /// Off for a device that is quiet on purpose — a Wii Remote reports only
     /// on change, and a made-up report would be a false answer to the game.

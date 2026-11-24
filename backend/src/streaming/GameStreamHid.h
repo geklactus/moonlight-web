@@ -66,7 +66,8 @@ public:
     {
         Wiimote,
         JoyconLeft,
-        JoyconRight
+        JoyconRight,
+        ProController
     };
 
     /// A device model this passthrough recreates.
@@ -80,10 +81,10 @@ public:
         Kind kind;
     };
 
-    /// What it recreates, and nothing else: Wii Remotes and Joy-Cons. Not the
-    /// Switch Pro Controller: this machine's own kernel driver (hid-nintendo)
-    /// would take a copy of it on any bus it matches (geklactus/lola
-    /// docs/joycon/plan.md).
+    /// What it recreates, and nothing else: Wii Remotes, Joy-Cons and the
+    /// Switch Pro Controller. The Pro Controller's copy goes on the I2C bus:
+    /// this machine's own kernel driver (hid-nintendo) would take one on USB
+    /// or Bluetooth (geklactus/lola docs/joycon/plan.md).
     static const std::vector<Model>& allowList();
     static const Model* allowed(uint16_t vendorId, uint16_t productId);
 
