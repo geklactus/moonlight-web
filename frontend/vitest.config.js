@@ -69,6 +69,7 @@ export default defineConfig({
                 'js/ui/Toast.js',
                 'js/ui/RemoteNav.js',
                 'js/stream/CongestionMonitor.js',
+                'js/stream/QualityLadder.js',
             ],
             thresholds: {
                 lines: 70,
