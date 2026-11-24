@@ -32,7 +32,7 @@ declare module '../ui/StreamView.js' {
         onFirstFrame: (() => void) | null;
         /** Fired when the user initiates a quit, before teardown starts. */
         onQuitStart: (() => void) | null;
-        /** Fired on every individual congestion hint (IDR/PLI/drops). */
+        /** Fired on every counted congestion event (one per loss episode). */
         onCongestionSignal: (() => void) | null;
         /** Suppress the one-shot gesture-hint slide on the next activation. */
         _suppressShortcutsSlide: boolean;

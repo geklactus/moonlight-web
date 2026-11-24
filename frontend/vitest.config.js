@@ -68,6 +68,7 @@ export default defineConfig({
                 'js/ui/HidHelpDialog.js',
                 'js/ui/Toast.js',
                 'js/ui/RemoteNav.js',
+                'js/stream/CongestionMonitor.js',
             ],
             thresholds: {
                 lines: 70,
