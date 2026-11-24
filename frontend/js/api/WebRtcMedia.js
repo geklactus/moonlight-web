@@ -30,6 +30,12 @@ import {
     isBindRefusedClose,
 } from '../util/pairingCrypto.js';
 import { defaultIceServers } from './IceServers.js';
+import {
+    SIGNALING_ERROR,
+    SIGNALING_LOST,
+    SIGNALING_TLS_FAILED,
+    SIGNALING_UNREACHABLE,
+} from './transportErrors.js';
 import { NETWORK_SETTLE_MS, pathDown } from '../stream/Reattach.js';
 import { isViewMessage } from './hostMessages.js';
 import { setAudioJitterBufferTarget } from '../util/AudioJitter.js';
@@ -285,7 +291,7 @@ export class WebRtcMedia {
                 // Let onclose handle the user-facing error (it has the code).
                 // Only trigger now if we were already connected (runtime error).
                 if (this._wsHadOpen) {
-                    this._onError('Erreur de connexion au serveur de streaming');
+                    this._onError(SIGNALING_ERROR);
                 }
             }
         };
@@ -325,17 +331,11 @@ export class WebRtcMedia {
                     // signature here (see IDENTITY_REFUSED).
                     this._onError(IDENTITY_REFUSED);
                 } else if (evt.code === 1015) {
-                    this._onError(
-                        'Erreur de securite TLS. ' + "Verifiez la date et l'heure du systeme.",
-                    );
+                    this._onError(SIGNALING_TLS_FAILED);
                 } else if (evt.code === 1006 || !this._wsHadOpen) {
-                    this._onError(
-                        'Connexion au serveur de streaming impossible. ' +
-                            'Verifiez votre pare-feu, antivirus (HTTPS Scanning), ' +
-                            'ou proxy.',
-                    );
+                    this._onError(SIGNALING_UNREACHABLE);
                 } else {
-                    this._onError('Connexion au serveur de streaming interrompue');
+                    this._onError(SIGNALING_LOST);
                 }
             }
         };
