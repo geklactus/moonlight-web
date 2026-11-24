@@ -19,6 +19,7 @@
 #include "AnnexBFiller.h"
 #include "GameStreamHid.h"
 #include "InputWatchdog.h"
+#include "LogRepeatLimiter.h"
 
 #include "common/MacActivity.h"
 
@@ -33,8 +34,10 @@ extern "C" {
 #include <QMutexLocker>
 #include <QSet>
 #include <QTimer>
+#include <chrono>
 #include <cstring>
 #include <cstdarg>
+#include <mutex>
 
 #ifdef Q_OS_WIN
 #define NOMINMAX
@@ -670,12 +673,31 @@ void MoonlightShim::clConnectionTerminated(int errorCode)
 
 void MoonlightShim::clLogMessage(const char* format, ...)
 {
+    // A line logged once per packet or frame while the stream is in trouble
+    // ("Waiting for IDR frame", "Failed to decrypt control packet") is held
+    // back past a few per 10 s, and the count is written with the next one
+    // that prints (LogRepeatLimiter).
+    static std::mutex limiterLock;
+    static LogRepeatLimiter limiter;
+    LogRepeatLimiter::Verdict verdict;
+    {
+        const int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                  std::chrono::steady_clock::now().time_since_epoch())
+                                  .count();
+        std::lock_guard<std::mutex> guard(limiterLock);
+        verdict = limiter.admit(format, nowMs);
+    }
+    if (!verdict.print) return;
+
     char buffer[512];
     va_list args;
     va_start(args, format);
     vsnprintf(buffer, sizeof(buffer), format, args);
     va_end(args);
     // No fflush: stderr is unbuffered by default and this path can be hot.
+    if (verdict.heldBack > 0)
+        fprintf(stderr, "[moonlight] (%d more lines like the next one were held back)\n",
+                verdict.heldBack);
     fprintf(stderr, "[moonlight] %s", buffer);
 }
 
