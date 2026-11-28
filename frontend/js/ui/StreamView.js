@@ -29,6 +29,7 @@ import { Toast } from './Toast.js';
 import { StatsGraph } from './StatsGraph.js';
 import { AudioPipeline } from '../audio/AudioPipeline.js';
 import * as streamVolume from '../audio/streamVolume.js';
+import { StreamLeveler, isOn as levelOn, setOn as setLevelOn } from '../audio/streamLeveler.js';
 import { MicUplink, micSupported } from '../audio/MicUplink.js';
 import { JitterController } from '../stream/JitterController.js';
 import { FramePacer } from '../stream/FramePacer.js';
@@ -584,6 +585,31 @@ export function mwsrSplitLabel(view) {
         halves: 'left | right',
     };
     return `Split ${n}/${MWSR_SPLIT_VIEWS.length} · ${what[view]}`;
+}
+
+// "Even out the sound" in LOLA's Controls (pad.js's page rows: window.lolaPadRows
+// and window.lolaPadRow), on a desktop stream. A quality or transport switch
+// has two views for a moment (the live one and its standby); the row stays as
+// long as one of them is there, and the switch reaches both.
+/** @type {Set<any>} */
+const levelViews = new Set();
+/** @param {any} view */
+function registerLevelRow(view) {
+    levelViews.add(view);
+    if (window.__mwLevelRow) return;
+    window.__mwLevelRow = true;
+    const rows = window.lolaPadRows;
+    const pressed = window.lolaPadRow;
+    window.lolaPadRows = () => [
+        ...(typeof rows === 'function' ? rows() || [] : []),
+        ...(levelViews.size ? [{ id: 'level', label: t('stream.evenSound'), on: levelOn() }] : []),
+    ];
+    window.lolaPadRow = (/** @type {string} */ id) => {
+        if (id === 'level') {
+            setLevelOn(!levelOn());
+            for (const v of levelViews) if (v._leveler) v._leveler.changed();
+        } else if (typeof pressed === 'function') pressed(id);
+    };
 }
 
 export class StreamView {
@@ -1167,6 +1193,10 @@ export class StreamView {
         // MoonlightApp can relaunch with the next transport (no in-session WS
         // reroute). WebRtcMedia ignores this flag (no in-session WS fallback).
         this.webrtc._chainFallback = true;
+        // The RTP track, once it plays on the view's element: the leveler listens to it.
+        this.webrtc.onAudioStream = (stream) => {
+            if (this._leveler) this._leveler.attachStream(stream);
+        };
         // A share-link guest was never paired with this host: no MW-BIND.
         this.webrtc._unpairedGuest = this._playerMode;
 
@@ -1432,6 +1462,13 @@ export class StreamView {
         this.audioPipeline = this._nativeAudio
             ? null
             : new AudioPipeline({ timeStretch: this._audioTimeStretch });
+        // Even out the sound (audio/streamLeveler.js): desktop only, as the
+        // header's volume is; it only listens, and turns that volume down.
+        /** @type {StreamLeveler|null} */
+        this._leveler = IS_MOBILE_OR_TABLET
+            ? null
+            : new StreamLeveler({ onGain: () => this._applyLevel() });
+        if (this._leveler) registerLevelRow(this);
         this._audioLogged = false;
 
         // WebCodecs
@@ -2233,6 +2270,8 @@ export class StreamView {
         const ok = await this.audioPipeline.init();
         if (ok) {
             console.log('[StreamView] AudioPipeline ready');
+            if (this._leveler && this.audioPipeline.node)
+                this._leveler.attachNode(this.audioPipeline.node);
             // Resume if the context was suspended (autoplay policy).
             // StreamView is created after a user click, so this usually succeeds.
             if (this.audioPipeline.context && this.audioPipeline.context.state === 'suspended') {
@@ -7017,8 +7056,7 @@ export class StreamView {
     /** Send the stream volume to whatever plays this view's audio, and redraw the control. */
     _applyVolume() {
         const out = streamVolume.outputLevel();
-        if (this.audioEl) this.audioEl.volume = out;
-        if (this.audioPipeline) this.audioPipeline.setVolume(out);
+        this._applyLevel();
         // A phone or a tablet has no control to redraw, but the shortcut
         // still mutes it (a keyboard paired to a tablet).
         const ctl = this._volumeCtl;
@@ -7035,6 +7073,17 @@ export class StreamView {
         btn.title = action;
         btn.setAttribute('aria-label', action);
         ctl.classList.toggle('is-muted', out === 0);
+    }
+
+    /**
+     * What plays this view's audio, at the stream volume times the leveler's
+     * (1 when it's off or not listening). The control shows the stream volume
+     * alone: the leveler's part is its own, and changes ten times a second.
+     */
+    _applyLevel() {
+        const out = streamVolume.outputLevel() * (this._leveler ? this._leveler.gain() : 1);
+        if (this.audioEl) this.audioEl.volume = Math.max(0, Math.min(1, out));
+        if (this.audioPipeline) this.audioPipeline.setVolume(out);
     }
 
     // ── Mouse-gaming-mode exit reminder ──────────────────────────────────
@@ -14295,6 +14344,10 @@ export class StreamView {
         this.stopRenderLoop();
         this.unbindEvents();
         if (this._mic) this._mic.close();
+        if (this._leveler) {
+            this._leveler.close();
+            levelViews.delete(this);
+        }
         this.webrtc.close();
         if (this._latencyProbe) {
             this._latencyProbe.stop();

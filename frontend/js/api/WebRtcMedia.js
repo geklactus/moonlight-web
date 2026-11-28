@@ -136,6 +136,8 @@ export class WebRtcMedia {
         this.videoElement = options.videoElement || null;
         // Audio element for native decoding of the RTP Opus track. Set by StreamView.
         this.audioElement = options.audioElement || null;
+        /** @type {((stream: MediaStream) => void)|null} The track's stream once it plays (StreamView's leveler). */
+        this.onAudioStream = null;
         // Cleanup for the autoplay gesture retry, when play() was rejected.
         this._audioRetryCleanup = null;
 
@@ -684,6 +686,15 @@ export class WebRtcMedia {
                 if (!iosAudioUnlock.playStream(stream) && this.audioElement) {
                     this.audioElement.srcObject = stream;
                     const p = this.audioElement.play();
+                    // The leveler listens on the side (audio/streamLeveler.js): the stream
+                    // still plays on this element alone, as it did.
+                    if (typeof this.onAudioStream === 'function') {
+                        try {
+                            this.onAudioStream(stream);
+                        } catch {
+                            /* the sound plays regardless */
+                        }
+                    }
                     if (p && p.catch)
                         p.catch((e) => {
                             // Autoplay policy rejected it (cold Media Engagement
