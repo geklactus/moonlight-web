@@ -588,24 +588,26 @@ export function mwsrSplitLabel(view) {
 }
 
 // "Even out the sound" in LOLA's Controls (pad.js's page rows: window.lolaPadRows
-// and window.lolaPadRow), on a desktop stream: the view whose leveler it is.
-/** @type {any} */
-let levelView = null;
+// and window.lolaPadRow), on a desktop stream. A quality or transport switch
+// has two views for a moment (the live one and its standby); the row stays as
+// long as one of them is there, and the switch reaches both.
+/** @type {Set<any>} */
+const levelViews = new Set();
 /** @param {any} view */
 function registerLevelRow(view) {
-    levelView = view;
+    levelViews.add(view);
     if (window.__mwLevelRow) return;
     window.__mwLevelRow = true;
     const rows = window.lolaPadRows;
     const pressed = window.lolaPadRow;
     window.lolaPadRows = () => [
         ...(typeof rows === 'function' ? rows() || [] : []),
-        ...(levelView ? [{ id: 'level', label: t('stream.evenSound'), on: levelOn() }] : []),
+        ...(levelViews.size ? [{ id: 'level', label: t('stream.evenSound'), on: levelOn() }] : []),
     ];
     window.lolaPadRow = (/** @type {string} */ id) => {
         if (id === 'level') {
             setLevelOn(!levelOn());
-            if (levelView && levelView._leveler) levelView._leveler.changed();
+            for (const v of levelViews) if (v._leveler) v._leveler.changed();
         } else if (typeof pressed === 'function') pressed(id);
     };
 }
@@ -14344,7 +14346,7 @@ export class StreamView {
         if (this._mic) this._mic.close();
         if (this._leveler) {
             this._leveler.close();
-            if (levelView === this) levelView = null;
+            levelViews.delete(this);
         }
         this.webrtc.close();
         if (this._latencyProbe) {
