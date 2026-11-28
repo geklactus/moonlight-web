@@ -135,6 +135,10 @@ interface RTCRtpReceiver {
 }
 
 interface Window {
+    /** LOLA's pad.js page rows: switches a page adds to its Controls. */
+    lolaPadRows?: () => Array<{ id: string; label: string; on?: boolean }>;
+    lolaPadRow?: (id: string) => void;
+    __mwLevelRow?: boolean;
     /** Legacy constructor still required to unlock audio on older iOS Safari. */
     webkitAudioContext?: typeof AudioContext;
     /** Click-to-photon probe of the visible stream (debug builds, Windows host). */

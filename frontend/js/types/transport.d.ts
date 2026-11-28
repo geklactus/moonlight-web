@@ -56,4 +56,6 @@ export type StreamTransport = (WebRtcDataChannel | WebRtcMedia) & {
     _chainFallback?: boolean;
     /** A share-link guest, never paired with the host: no MW-BIND hello. */
     _unpairedGuest?: boolean;
+    /** The RTP audio track's stream once it plays (the leveler listens to it). */
+    onAudioStream?: ((stream: MediaStream) => void) | null;
 };

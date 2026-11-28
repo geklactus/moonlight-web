@@ -851,6 +851,7 @@
         "iosFullscreenHint": "Pour un vrai plein écran : Partager → Sur l'écran d'accueil, puis lancez Moonlight depuis l'icône.",
         "exitFullscreenHint": "Appuyez sur {{combo}} pour quitter le plein écran",
         "volume": "Volume",
+        "evenSound": "Égaliser le volume",
         "micMute": "Couper mon micro",
         "micUnmute": "Réactiver mon micro",
         "micDenied": "Micro bloqué : autorisez-le pour ce site dans le navigateur pour envoyer votre voix.",

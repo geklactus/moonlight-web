@@ -851,6 +851,7 @@
         "iosFullscreenHint": "For true fullscreen: Share → Add to Home Screen, then launch Moonlight from the icon.",
         "exitFullscreenHint": "Press {{combo}} to exit fullscreen",
         "volume": "Volume",
+        "evenSound": "Even out the sound",
         "mute": "Mute",
         "micMute": "Mute my microphone",
         "micUnmute": "Unmute my microphone",
