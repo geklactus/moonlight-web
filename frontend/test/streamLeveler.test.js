@@ -60,6 +60,20 @@ afterEach(() => {
     vi.useRealTimers();
 });
 
+describe('step: the start of a sound', () => {
+    it('a first block caught half silent does not hold the level low', () => {
+        // The block the sound starts in is half silence (3 dB under); then a steady -8 dBFS.
+        let s = step({ power: 0, gain: 1 }, sinePower(-11), true);
+        for (let i = 0; i < 1000 / TICK_MS; i++) s = step(s, sinePower(-8), true);
+        expect(Math.abs(powerDb(s.power) + 8)).toBeLessThan(0.5);
+    });
+
+    it('silence between sounds is not counted', () => {
+        const s = step(step({ power: 0, gain: 1 }, sinePower(-8), true), 0, true);
+        expect(s.n).toBe(1);
+    });
+});
+
 describe('step (pure)', () => {
     it('brings a game louder than the target down to it', () => {
         const s = settle(-8, 15);

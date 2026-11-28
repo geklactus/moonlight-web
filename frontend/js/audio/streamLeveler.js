@@ -81,16 +81,21 @@ export function setOn(on) {
 /**
  * One tick of the leveler, pure: the averaged power after this block, and the
  * gain the volume heads for.
- * @param {{power: number, gain: number}} state
+ * The first blocks are a plain mean, then the running average takes over: a
+ * block caught as the sound starts (part silence) would otherwise hold the
+ * level low for seconds. Firefox and WebKit both caught such a block in tests.
+ * @param {{power: number, gain: number, n?: number}} state  n: blocks counted
  * @param {number} blockPower mean square of the last block heard
  * @param {boolean} on
- * @returns {{power: number, gain: number}}
+ * @returns {{power: number, gain: number, n: number}}
  */
 export function step(state, blockPower, on) {
     let power = state.power;
+    let n = state.n || 0;
     if (powerDb(blockPower) >= SILENT_DB) {
-        const a = TICK_MS / 1000 / LEVEL_SECONDS;
-        power = power > 0 ? power + (blockPower - power) * a : blockPower;
+        n += 1;
+        const a = Math.max(1 / n, TICK_MS / 1000 / LEVEL_SECONDS);
+        power = power + (blockPower - power) * a;
     }
     const want =
         !on || !(power > 0)
@@ -98,12 +103,12 @@ export function step(state, blockPower, on) {
             : Math.max(dbToGain(-MAX_DOWN_DB), Math.min(1, dbToGain(TARGET_DB - powerDb(power))));
     const k = 1 - Math.exp(-(TICK_MS / 1000) / GLIDE_SECONDS);
     const gain = state.gain + (want - state.gain) * k;
-    return { power, gain: Math.abs(gain - want) < 1e-4 ? want : gain };
+    return { power, gain: Math.abs(gain - want) < 1e-4 ? want : gain, n };
 }
 
 // The volume carried from one view to the next (a quality or transport switch
 // replaces the StreamView mid-session; the game is as loud as it was).
-let carried = { power: 0, gain: 1 };
+let carried = { power: 0, gain: 1, n: 0 };
 
 export class StreamLeveler {
     /**
